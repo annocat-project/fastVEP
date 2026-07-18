@@ -3,7 +3,9 @@
 //! dbNSFP provides pre-computed functional predictions (SIFT, PolyPhen,
 //! REVEL, CADD, etc.) for all possible missense variants.
 //!
-//! This parser extracts SIFT and PolyPhen predictions specifically.
+//! This parser currently extracts SIFT and PolyPhen predictions specifically.
+//! Its iterator API keeps memory bounded so additional configured fields can be
+//! added without reverting to whole-file buffering.
 
 use crate::common::AnnotationRecord;
 use anyhow::{Context, Result};
@@ -21,48 +23,81 @@ pub fn parse_dbnsfp<R: BufRead>(
     reader: R,
     chrom_to_idx: &HashMap<String, u16>,
 ) -> Result<Vec<AnnotationRecord>> {
-    let mut records = Vec::new();
-    let mut col_indices: Option<DbNsfpColumns> = None;
+    let mut records: Vec<_> = iter_dbnsfp(reader, chrom_to_idx).collect::<Result<_>>()?;
+    records.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
+    Ok(records)
+}
 
-    for line in reader.lines() {
-        let line = line.context("Reading dbNSFP line")?;
+/// Stream coordinate-sorted dbNSFP rows without buffering the input.
+///
+/// Production dbNSFP chromosome files are already coordinate sorted. The OSA
+/// writer validates ordering and fails closed if a caller supplies unsorted
+/// input. `parse_dbnsfp` remains as a small-fixture compatibility helper.
+pub fn iter_dbnsfp<'a, R: BufRead>(
+    reader: R,
+    chrom_to_idx: &'a HashMap<String, u16>,
+) -> DbNsfpRecordIter<'a, R> {
+    DbNsfpRecordIter {
+        lines: reader.lines(),
+        chrom_to_idx,
+        col_indices: None,
+    }
+}
 
-        if line.starts_with('#') || line.starts_with("chr\t") {
-            // Parse header to find column indices
-            let header = line.trim_start_matches('#');
-            col_indices = Some(DbNsfpColumns::from_header(header)?);
-            continue;
-        }
+pub struct DbNsfpRecordIter<'a, R: BufRead> {
+    lines: std::io::Lines<R>,
+    chrom_to_idx: &'a HashMap<String, u16>,
+    col_indices: Option<DbNsfpColumns>,
+}
 
-        if line.is_empty() {
-            continue;
-        }
+impl<R: BufRead> Iterator for DbNsfpRecordIter<'_, R> {
+    type Item = Result<AnnotationRecord>;
 
-        let cols = match &col_indices {
-            Some(c) => c,
-            None => continue,
-        };
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let line = match self.lines.next()? {
+                Ok(line) => line,
+                Err(error) => return Some(Err(error).context("Reading dbNSFP line")),
+            };
 
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() <= cols.max_idx() {
-            continue;
-        }
+            if line.starts_with('#') || line.starts_with("chr\t") {
+                let header = line.trim_start_matches('#');
+                match DbNsfpColumns::from_header(header) {
+                    Ok(columns) => self.col_indices = Some(columns),
+                    Err(error) => return Some(Err(error)),
+                }
+                continue;
+            }
 
-        let chrom = normalize_chrom(fields[cols.chr]);
-        let chrom_idx = match chrom_to_idx.get(&chrom) {
-            Some(&idx) => idx,
-            None => continue,
-        };
+            if line.is_empty() {
+                continue;
+            }
 
-        let pos: u32 = match fields[cols.pos].parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+            let cols = match &self.col_indices {
+                Some(columns) => columns,
+                None => continue,
+            };
 
-        let ref_allele = fields[cols.ref_col].to_string();
-        let alt_allele = fields[cols.alt].to_string();
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() <= cols.max_idx() {
+                continue;
+            }
 
-        let mut parts = Vec::new();
+            let chrom = normalize_chrom(fields[cols.chr]);
+            let chrom_idx = match self.chrom_to_idx.get(&chrom) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+
+            let pos: u32 = match fields[cols.pos].parse() {
+                Ok(position) => position,
+                Err(_) => continue,
+            };
+
+            let ref_allele = fields[cols.ref_col].to_string();
+            let alt_allele = fields[cols.alt].to_string();
+
+            let mut parts = Vec::new();
 
         // SIFT
         if let Some(idx) = cols.sift_score {
@@ -114,21 +149,19 @@ pub fn parse_dbnsfp<R: BufRead>(
             }
         }
 
-        if parts.is_empty() {
-            continue;
+            if parts.is_empty() {
+                continue;
+            }
+
+            return Some(Ok(AnnotationRecord {
+                chrom_idx,
+                position: pos,
+                ref_allele,
+                alt_allele,
+                json: format!("{{{}}}", parts.join(",")),
+            }));
         }
-
-        records.push(AnnotationRecord {
-            chrom_idx,
-            position: pos,
-            ref_allele,
-            alt_allele,
-            json: format!("{{{}}}", parts.join(",")),
-        });
     }
-
-    records.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
-    Ok(records)
 }
 
 struct DbNsfpColumns {

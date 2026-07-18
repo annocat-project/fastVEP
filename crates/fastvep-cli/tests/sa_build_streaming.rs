@@ -30,6 +30,18 @@ chr1\t500\t.\tA\tG\t.\tPASS\tAF=0.01;AN=1000
 chr1\t100\t.\tC\tT\t.\tPASS\tAF=0.02;AN=1000
 ";
 
+const DBNSFP_SORTED: &str = "\
+#chr\tpos(1-based)\tref\talt\tSIFT_score\tSIFT_pred\tPolyphen2_HDIV_score\tPolyphen2_HDIV_pred
+1\t100\tA\tG\t0.032\tD\t0.998\tD
+1\t200\tC\tT\t0.450\tT\t0.100\tB
+";
+
+const DBNSFP_UNSORTED: &str = "\
+#chr\tpos(1-based)\tref\talt\tSIFT_score\tSIFT_pred\tPolyphen2_HDIV_score\tPolyphen2_HDIV_pred
+1\t500\tA\tG\t0.032\tD\t0.998\tD
+1\t100\tC\tT\t0.450\tT\t0.100\tB
+";
+
 fn gzip(data: &str) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
@@ -104,6 +116,61 @@ fn streaming_build_detects_gzip_by_magic_bytes_not_extension() {
         plain_osa, gz_osa,
         "gzip-by-magic build must match the plain-text build"
     );
+}
+
+#[test]
+fn dbnsfp_build_streams_to_a_loadable_osa() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("dbnsfp.tsv");
+    let out = tmp.path().join("dbnsfp");
+    fs::write(&src, DBNSFP_SORTED).unwrap();
+
+    run_sa_build(
+        "dbnsfp",
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "GRCh38",
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let reader = SaReader::open(&out.with_extension("osa")).unwrap();
+    let hit = reader
+        .annotate_position("chr1", 100, "A", "G")
+        .unwrap()
+        .expect("dbNSFP allele should be present");
+    match hit {
+        AnnotationValue::Json(json) => {
+            assert!(json.contains("deleterious(0.032)"));
+            assert!(json.contains("probably_damaging(0.998)"));
+        }
+        other => panic!("expected allele-specific dbNSFP JSON, got {other:?}"),
+    }
+}
+
+#[test]
+fn dbnsfp_stream_rejects_unsorted_input_without_partial_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("dbnsfp.tsv");
+    let out = tmp.path().join("dbnsfp");
+    fs::write(&src, DBNSFP_UNSORTED).unwrap();
+
+    let error = run_sa_build(
+        "dbnsfp",
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "GRCh38",
+        None,
+        &[],
+        false,
+    )
+    .expect_err("unsorted dbNSFP input must fail");
+
+    assert!(error.to_string().contains("not sorted"));
+    assert!(!out.with_extension("osa").exists());
+    assert!(!out.with_extension("osa.idx").exists());
 }
 
 /// PhyloP/GERP are per-base genome-wide sources and must build via the
