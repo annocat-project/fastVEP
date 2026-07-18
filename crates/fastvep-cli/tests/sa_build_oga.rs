@@ -265,6 +265,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -365,6 +366,7 @@ chr1\t26011\t2.71
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -444,6 +446,7 @@ fn annotate_vcf_replaces_existing_fastvep_info() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -508,6 +511,7 @@ fn annotate_vcf_emits_fastsa_projection_for_gnomad() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -575,6 +579,7 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -694,6 +699,7 @@ fn sa_only_vcf_omits_csq_and_default_pipeline() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -755,6 +761,7 @@ fn sa_only_tab_emits_minimal_columns() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -819,6 +826,7 @@ fn sa_only_json_omits_transcript_consequences() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -910,6 +918,7 @@ fn sa_only_requires_sa_dir() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .expect_err("--sa-only without --sa-dir must error");
@@ -978,6 +987,7 @@ fn sa_only_multi_allelic_emits_per_alt_rows_with_independent_sa_columns() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -1049,6 +1059,7 @@ fn sa_only_strips_preexisting_csq_from_input_info() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -1119,6 +1130,7 @@ fn sa_only_strips_csq_when_in_middle_of_info_field() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -1205,6 +1217,7 @@ fn intergenic_variant_with_sa_dir_in_default_mode_emits_fv_clinvar() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -1265,6 +1278,7 @@ fn annotate_tab_gene_list_filters_to_panel_genes() {
         gene_list: Some(panel.to_string_lossy().into_owned()),
         explicit_alleles: false,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -1317,6 +1331,7 @@ fn annotate_tab_explicit_alleles_inserts_ref_column() {
         gene_list: None,
         explicit_alleles: true,
         qc_rules: None,
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();
@@ -1401,6 +1416,7 @@ min_dp = 8
         gene_list: None,
         explicit_alleles: false,
         qc_rules: Some(qc_rules_path.to_string_lossy().into_owned()),
+        structured_output: None,
         show_progress: false,
     })
     .unwrap();

@@ -129,6 +129,10 @@ enum Commands {
         #[arg(long)]
         qc_rules: Option<String>,
 
+        /// Also write the complete structured JSON annotations in the same pass
+        #[arg(long)]
+        structured_output: Option<String>,
+
         /// Suppress periodic progress output
         #[arg(long, default_value_t = false)]
         no_progress: bool,
@@ -280,6 +284,7 @@ fn main() -> Result<()> {
             gene_list,
             explicit_alleles,
             qc_rules,
+            structured_output,
             no_progress,
         } => {
             pipeline::run_annotate(pipeline::AnnotateConfig {
@@ -303,6 +308,7 @@ fn main() -> Result<()> {
                 gene_list,
                 explicit_alleles,
                 qc_rules,
+                structured_output,
                 show_progress: !no_progress,
             })?;
         }

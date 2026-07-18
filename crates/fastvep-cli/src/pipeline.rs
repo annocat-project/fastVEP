@@ -87,6 +87,10 @@ pub struct AnnotateConfig {
     /// Path to a QC rules TOML file. When set, tab output gains a
     /// `QC_CLASS` column.
     pub qc_rules: Option<String>,
+    /// Optional JSON sidecar containing the complete structured annotations.
+    /// This is written from the already-annotated batch, so it does not repeat
+    /// consequence prediction or supplementary lookups.
+    pub structured_output: Option<String>,
     /// Show periodic progress output.
     pub show_progress: bool,
 }
@@ -472,6 +476,15 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     // the number of syscalls on a typical VCF (millions of variants) by
     // roughly two orders of magnitude.
     let mut writer = BufWriter::with_capacity(1 << 20, output_writer);
+    let mut structured_writer = config
+        .structured_output
+        .as_ref()
+        .map(|path| {
+            File::create(path)
+                .with_context(|| format!("Creating structured output: {}", path))
+                .map(|file| BufWriter::with_capacity(1 << 20, file))
+        })
+        .transpose()?;
     let sa_json_keys: Vec<String> = sa_providers
         .iter()
         .map(|sa| sa.json_key().to_string())
@@ -1337,6 +1350,11 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
 
         // Phase 3: Write output sequentially (preserves VCF order)
         for (vf, _) in &batch {
+            if let Some(sidecar) = structured_writer.as_mut() {
+                let json = output::format_json(vf, sa_only);
+                serde_json::to_writer(&mut *sidecar, &json)?;
+                writeln!(sidecar)?;
+            }
             match config.output_format.as_str() {
                 "vcf" => write_vcf_line(&mut writer, vf, sa_only)?,
                 "tab" => {
@@ -1391,6 +1409,9 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     // Close JSON array
     if config.output_format == "json" {
         writeln!(writer, "\n]")?;
+    }
+    if let Some(sidecar) = structured_writer.as_mut() {
+        sidecar.flush()?;
     }
 
     writer.flush()?;
