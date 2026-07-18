@@ -256,6 +256,7 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
                     &info_map,
                     i,
                     field_names,
+                    fields[6],
                 );
                 self.pending.push_back(AnnotationRecord {
                     chrom_idx,
@@ -277,6 +278,7 @@ fn build_gnomad_json(
     info_map: &HashMap<String, String>,
     allele_idx: usize,
     field_names: &FieldNames,
+    filter: &str,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -306,6 +308,37 @@ fn build_gnomad_json(
             if let Some(af_str) = vals.get(allele_idx) {
                 if let Ok(f) = af_str.parse::<f64>() {
                     parts.push(format!("\"{}Af\":{:.6e}", pop, f));
+                }
+            }
+        }
+    }
+
+    if filter != "." && filter != "PASS" {
+        parts.push(format!(
+            "\"filters\":{}",
+            serde_json::to_string(filter).unwrap()
+        ));
+    }
+    for (info_field, output_field) in [
+        ("faf95", "faf95"),
+        ("faf99", "faf99"),
+        ("AF_grpmax", "grpmaxAf"),
+        ("grpmax", "grpmaxPopulation"),
+    ] {
+        if let Some(value) = info_map.get(info_field) {
+            let values = split_info_values(Some(value));
+            let value = values.get(allele_idx).or_else(|| values.first());
+            if let Some(value) = value {
+                if let Ok(number) = value.parse::<f64>() {
+                    if number.is_finite() {
+                        parts.push(format!("\"{}\":{}", output_field, number));
+                    }
+                } else if !value.is_empty() && value != "." {
+                    parts.push(format!(
+                        "\"{}\":{}",
+                        output_field,
+                        serde_json::to_string(value).unwrap()
+                    ));
                 }
             }
         }

@@ -2302,12 +2302,14 @@ fn open_sa_input(input: &str, byte_counter: Option<std::sync::Arc<std::sync::ato
 /// streaming iterator; all callers must yield records in `(chrom_idx, position)`
 /// order because the writer streams blocks and rejects out-of-order input.
 fn run_streaming_sa_build<'a, I>(
+    source: &str,
     input: &str,
     output: &str,
     header: fastvep_sa::index::IndexHeader,
     chrom_map: &'a std::collections::HashMap<String, u16>,
     chrom_list: &[String],
     show_progress: bool,
+    selected_fields: Option<&std::collections::HashSet<String>>,
     make_iter: impl FnOnce(
         io::BufReader<Box<dyn io::Read>>,
         &'a std::collections::HashMap<String, u16>,
@@ -2334,6 +2336,9 @@ where
     };
 
     let records = make_iter(buf_reader, chrom_map).map(|record| {
+        let record = record.and_then(|record| {
+            filter_supplementary_record(source, record, selected_fields)
+        });
         if record.is_ok() {
             meter.update();
         }
@@ -2360,6 +2365,119 @@ where
     );
 
     Ok(())
+}
+
+fn supplementary_field_allowlist(source: &str) -> Option<&'static [&'static str]> {
+    match source {
+        "clinvar" => Some(&[
+            "significance", "reviewStatus", "phenotypes", "variantClass", "soAccession",
+            "afExac", "afTgp", "afEsp", "geneInfo", "diseaseDatabases",
+            "molecularConsequences", "origin", "conflictingSignificance",
+        ]),
+        "gnomad" => Some(&[
+            "allAf", "allAn", "allAc", "allHc", "afrAf", "amrAf", "asjAf", "easAf",
+            "finAf", "midAf", "nfeAf", "othAf", "remainingAf", "sasAf", "filters",
+            "faf95", "faf99", "grpmaxAf", "grpmaxPopulation",
+        ]),
+        "dbsnp" => Some(&["id", "globalMaf", "variantType", "common"]),
+        "phylop" => Some(&["score"]),
+        "cadd" => Some(&["raw", "phred"]),
+        "spliceai" => Some(&[
+            "gene", "dsAg", "dsAl", "dsDg", "dsDl", "dpAg", "dpAl", "dpDg", "dpDl",
+        ]),
+        "revel" => Some(&["score", "transcriptId", "aaRef", "aaAlt"]),
+        _ => None,
+    }
+}
+
+fn annocat_selected_source_fields(
+    source: &str,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let Some(allowed) = supplementary_field_allowlist(source) else {
+        return Ok(None);
+    };
+    let Ok(encoded) = std::env::var("ANNOCAT_SOURCE_FIELDS") else {
+        return Ok(None);
+    };
+    let requested = serde_json::from_str::<Vec<String>>(&encoded)
+        .context("ANNOCAT_SOURCE_FIELDS must be a JSON string array")?;
+    if requested.is_empty()
+        || requested.len() > allowed.len()
+        || requested
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != requested.len()
+        || requested
+            .iter()
+            .any(|field| !allowed.contains(&field.as_str()))
+    {
+        anyhow::bail!(
+            "ANNOCAT_SOURCE_FIELDS contains an empty, duplicate, or unsupported field selection for {source}"
+        );
+    }
+    Ok(Some(requested.into_iter().collect()))
+}
+
+fn filter_supplementary_record(
+    source: &str,
+    mut record: fastvep_sa::common::AnnotationRecord,
+    selected_fields: Option<&std::collections::HashSet<String>>,
+) -> Result<fastvep_sa::common::AnnotationRecord> {
+    let Some(selected) = selected_fields else {
+        return Ok(record);
+    };
+    if matches!(source, "phylop" | "gerp" | "dann") {
+        return Ok(record);
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&record.json)
+        .with_context(|| format!("Filtering {source} supplementary fields"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{source} annotation is not a JSON object"))?;
+    object.retain(|field, _| selected.contains(field));
+    record.json = serde_json::to_string(&value)?;
+    Ok(record)
+}
+
+#[cfg(test)]
+mod supplementary_field_tests {
+    use super::*;
+
+    #[test]
+    fn supported_selection_filters_json_without_renaming_fields() {
+        let selected = ["phred".to_string()].into_iter().collect();
+        let record = fastvep_sa::common::AnnotationRecord {
+            chrom_idx: 0,
+            position: 1,
+            ref_allele: "A".into(),
+            alt_allele: "G".into(),
+            json: r#"{"raw":0.2,"phred":12.3}"#.into(),
+        };
+        let filtered = filter_supplementary_record("cadd", record, Some(&selected)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&filtered.json).unwrap(),
+            serde_json::json!({"phred": 12.3})
+        );
+    }
+
+    #[test]
+    fn every_configurable_source_has_a_strict_allowlist() {
+        for source in [
+            "clinvar", "gnomad", "dbsnp", "phylop", "cadd", "spliceai", "revel",
+        ] {
+            let fields = supplementary_field_allowlist(source).unwrap();
+            assert!(!fields.is_empty());
+            assert_eq!(
+                fields
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                fields.len()
+            );
+        }
+    }
 }
 
 /// PhyloP comes in two on-disk formats: UCSC fixed-step wig (`fixedStep
@@ -2401,6 +2519,7 @@ pub fn run_sa_build(
 ) -> Result<()> {
     use fastvep_sa::index::IndexHeader;
     use fastvep_sa::writer::SaWriter;
+    let selected_fields = annocat_selected_source_fields(source)?;
 
     // Gene-level sources (.oga) — dispatched separately from variant-level (.osa).
     if matches!(source, "omim" | "gnomad_genes" | "gnomad_gene" | "clinvar_protein") {
@@ -2594,60 +2713,70 @@ pub fn run_sa_build(
     match source {
         "spliceai" => {
             return run_streaming_sa_build(
-                input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::spliceai::iter_spliceai_vcf(r, m),
             );
         }
         "gnomad" => {
             return run_streaming_sa_build(
-                input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::gnomad::iter_gnomad_vcf(r, m),
             );
         }
         "dbnsfp" => {
             return run_streaming_sa_build(
-                input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::dbnsfp::iter_dbnsfp(r, m),
             );
         }
         "cadd" => {
             return run_streaming_sa_build(
+                source,
                 input,
                 output,
                 header,
                 &chrom_map,
                 &chrom_list,
                 show_progress,
+                selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::cadd::iter_cadd(r, m),
             );
         }
         "revel" => {
             return run_streaming_sa_build(
-                input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::revel::iter_revel(r, m, 2),
             );
         }
         "dbsnp" => {
             return run_streaming_sa_build(
-                input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::dbsnp::iter_dbsnp_vcf(r, m),
             );
         }
         "topmed" => {
             return run_streaming_sa_build(
-                input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::topmed::iter_topmed_vcf(r, m),
             );
         }
         "phylop" => {
             return run_streaming_sa_build(
-                input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                selected_fields.as_ref(),
                 |r, m| iter_phylop_auto(r, m),
             );
         }
         "gerp" | "dann" => {
             return run_streaming_sa_build(
-                input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::scores::iter_score_tsv(r, m, false),
             );
         }
@@ -2671,6 +2800,10 @@ pub fn run_sa_build(
         "primateai" => fastvep_sa::sources::primateai::parse_primateai(buf_reader, &chrom_map)?,
         _ => unreachable!(),
     };
+    let records = records
+        .into_iter()
+        .map(|record| filter_supplementary_record(source, record, selected_fields.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
 
     let n = records.len() as u64;
     if records.is_empty() {

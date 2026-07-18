@@ -15,7 +15,7 @@ use std::io::BufRead;
 /// Fields retained by AnnoCat's `dbnsfp-4.9a-annocat-core-v1` contract.
 /// Coordinate columns are used as OSA keys and therefore are not duplicated in
 /// each record's JSON payload.
-const CURATED_FIELDS: &[&str] = &[
+pub const CURATED_FIELDS: &[&str] = &[
     "aaref",
     "aaalt",
     "aapos",

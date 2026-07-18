@@ -75,7 +75,12 @@ impl<R: BufRead> Iterator for RevelRecordIter<'_, R> {
                 position,
                 ref_allele: fields[3].to_string(),
                 alt_allele: fields[4].to_string(),
-                json: serde_json::json!({"score": score, "transcriptId": transcript_id}).to_string(),
+                json: serde_json::json!({
+                    "score": score,
+                    "transcriptId": transcript_id,
+                    "aaRef": fields.get(5).copied().unwrap_or_default(),
+                    "aaAlt": fields.get(6).copied().unwrap_or_default(),
+                }).to_string(),
             }));
         }
     }

@@ -74,6 +74,7 @@ impl<R: BufRead> Iterator for DbsnpRecordIter<'_, R> {
             let info = fields[7];
 
             let info_map = parse_info(info);
+            let common = info.split(';').any(|item| item == "COMMON");
 
             let rs_id = if id.starts_with("rs") {
                 id.to_string()
@@ -102,6 +103,15 @@ impl<R: BufRead> Iterator for DbsnpRecordIter<'_, R> {
                 let mut parts = vec![format!("\"id\":\"{}\"", rs_id)];
                 if let Some(f) = freq {
                     parts.push(format!("\"globalMaf\":{:.6e}", f));
+                }
+                if let Some(variant_type) = info_map.get("VC") {
+                    parts.push(format!(
+                        "\"variantType\":{}",
+                        serde_json::to_string(variant_type).unwrap()
+                    ));
+                }
+                if common {
+                    parts.push("\"common\":true".into());
                 }
                 self.pending.push_back(AnnotationRecord {
                     chrom_idx,

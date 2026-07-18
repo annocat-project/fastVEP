@@ -32,17 +32,26 @@ chr1\t500\t.\tA\tG\t.\tPASS\tAF=0.01;AN=1000
 chr1\t100\t.\tC\tT\t.\tPASS\tAF=0.02;AN=1000
 ";
 
-const DBNSFP_SORTED: &str = "\
-#chr\tpos(1-based)\tref\talt\tSIFT_score\tSIFT_pred\tPolyphen2_HDIV_score\tPolyphen2_HDIV_pred
-1\t100\tA\tG\t0.032\tD\t0.998\tD
-1\t200\tC\tT\t0.450\tT\t0.100\tB
-";
-
-const DBNSFP_UNSORTED: &str = "\
-#chr\tpos(1-based)\tref\talt\tSIFT_score\tSIFT_pred\tPolyphen2_HDIV_score\tPolyphen2_HDIV_pred
-1\t500\tA\tG\t0.032\tD\t0.998\tD
-1\t100\tC\tT\t0.450\tT\t0.100\tB
-";
+fn dbnsfp_fixture(positions: [u32; 2]) -> String {
+    let mut header = vec!["#chr", "pos(1-based)", "ref", "alt"];
+    header.extend_from_slice(fastvep_sa::sources::dbnsfp::CURATED_FIELDS);
+    let field_index = |name: &str| header.iter().position(|field| *field == name).unwrap();
+    let mut rows = Vec::new();
+    for (index, position) in positions.into_iter().enumerate() {
+        let mut row = vec![".".to_string(); header.len()];
+        row[0] = "1".into();
+        row[1] = position.to_string();
+        row[2] = if index == 0 { "A" } else { "C" }.into();
+        row[3] = if index == 0 { "G" } else { "T" }.into();
+        row[field_index("SIFT_score")] = if index == 0 { "0.032" } else { "0.450" }.into();
+        row[field_index("SIFT_pred")] = if index == 0 { "D" } else { "T" }.into();
+        row[field_index("Polyphen2_HDIV_score")] =
+            if index == 0 { "0.998" } else { "0.100" }.into();
+        row[field_index("Polyphen2_HDIV_pred")] = if index == 0 { "D" } else { "B" }.into();
+        rows.push(row.join("\t"));
+    }
+    format!("{}\n{}\n", header.join("\t"), rows.join("\n"))
+}
 
 fn gzip(data: &str) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
@@ -156,7 +165,7 @@ fn dbnsfp_build_streams_to_a_loadable_osa() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("dbnsfp.tsv");
     let out = tmp.path().join("dbnsfp");
-    fs::write(&src, DBNSFP_SORTED).unwrap();
+    fs::write(&src, dbnsfp_fixture([100, 200])).unwrap();
 
     run_sa_build(
         "dbnsfp",
@@ -176,8 +185,10 @@ fn dbnsfp_build_streams_to_a_loadable_osa() {
         .expect("dbNSFP allele should be present");
     match hit {
         AnnotationValue::Json(json) => {
-            assert!(json.contains("deleterious(0.032)"));
-            assert!(json.contains("probably_damaging(0.998)"));
+            assert!(json.contains("\"SIFT_score\":\"0.032\""));
+            assert!(json.contains("\"SIFT_pred\":\"D\""));
+            assert!(json.contains("\"Polyphen2_HDIV_score\":\"0.998\""));
+            assert!(json.contains("\"Polyphen2_HDIV_pred\":\"D\""));
         }
         other => panic!("expected allele-specific dbNSFP JSON, got {other:?}"),
     }
@@ -188,7 +199,7 @@ fn dbnsfp_stream_rejects_unsorted_input_without_partial_files() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("dbnsfp.tsv");
     let out = tmp.path().join("dbnsfp");
-    fs::write(&src, DBNSFP_UNSORTED).unwrap();
+    fs::write(&src, dbnsfp_fixture([500, 100])).unwrap();
 
     let error = run_sa_build(
         "dbnsfp",

@@ -83,6 +83,7 @@ pub fn parse_clinvar_vcf<R: BufRead>(
                 af_exac,
                 af_tgp,
                 af_esp,
+                &info_map,
             );
 
             records.push(AnnotationRecord {
@@ -111,6 +112,7 @@ fn build_clinvar_json(
     af_exac: Option<f64>,
     af_tgp: Option<f64>,
     af_esp: Option<f64>,
+    info_map: &HashMap<String, String>,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -158,6 +160,18 @@ fn build_clinvar_json(
     }
     if let Some(af) = af_esp {
         parts.push(format!("\"afEsp\":{}", af));
+    }
+
+    for (info_field, output_field) in [
+        ("GENEINFO", "geneInfo"),
+        ("CLNDISDB", "diseaseDatabases"),
+        ("MC", "molecularConsequences"),
+        ("ORIGIN", "origin"),
+        ("CLNSIGCONF", "conflictingSignificance"),
+    ] {
+        if let Some(value) = info_map.get(info_field).filter(|value| !value.is_empty()) {
+            parts.push(format!("\"{}\":\"{}\"", output_field, escape_json(value)));
+        }
     }
 
     format!("{{{}}}", parts.join(","))
