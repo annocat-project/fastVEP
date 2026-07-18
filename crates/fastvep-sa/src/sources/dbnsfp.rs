@@ -149,6 +149,35 @@ const CURATED_FIELDS: &[&str] = &[
     "Interpro_domain",
 ];
 
+fn selected_fields_from(encoded: Option<&str>) -> Result<Vec<&'static str>> {
+    let Some(encoded) = encoded else {
+        return Ok(CURATED_FIELDS.to_vec());
+    };
+    let requested: Vec<String> = serde_json::from_str(&encoded)
+        .context("ANNOCAT_DBNSFP_FIELDS must be a JSON string array")?;
+    if requested.is_empty() || requested.len() > CURATED_FIELDS.len() {
+        anyhow::bail!("ANNOCAT_DBNSFP_FIELDS has an invalid field count");
+    }
+    let requested = requested.into_iter().collect::<std::collections::HashSet<_>>();
+    if requested.len() > CURATED_FIELDS.len()
+        || requested
+            .iter()
+            .any(|field| !CURATED_FIELDS.contains(&field.as_str()))
+    {
+        anyhow::bail!("ANNOCAT_DBNSFP_FIELDS contains an unknown field");
+    }
+    Ok(CURATED_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| requested.contains(*field))
+        .collect())
+}
+
+fn selected_fields() -> Result<Vec<&'static str>> {
+    let encoded = std::env::var("ANNOCAT_DBNSFP_FIELDS").ok();
+    selected_fields_from(encoded.as_deref())
+}
+
 /// Parse a dbNSFP TSV file using the curated 4.9a schema.
 ///
 /// The header must contain every curated field. This intentionally fails closed
@@ -282,9 +311,9 @@ impl DbNsfpColumns {
             })
         };
 
-        let curated = CURATED_FIELDS
-            .iter()
-            .map(|&name| {
+        let curated = selected_fields()?
+            .into_iter()
+            .map(|name| {
                 fields
                     .iter()
                     .position(|field| *field == name)
@@ -364,5 +393,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("missing curated field 'aaref'"));
+    }
+
+    #[test]
+    fn configured_subset_is_validated_and_keeps_contract_order() {
+        let fields = selected_fields_from(Some(r#"["REVEL_score","SIFT_score"]"#)).unwrap();
+        assert_eq!(fields, vec!["SIFT_score", "REVEL_score"]);
+        assert!(selected_fields_from(Some(r#"["not_a_dbnsfp_field"]"#)).is_err());
     }
 }

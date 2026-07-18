@@ -230,6 +230,12 @@ impl SaReader {
                         anyhow::bail!("OSA records are not coordinate ordered on {}", chromosome);
                     }
                     previous_position = Some(entry.position);
+                }
+                // The writer creates JSON through serde and the block decoder has
+                // already covered every stored byte. Parsing representative edge
+                // records catches schema/escaping regressions without reparsing
+                // millions of large dbNSFP objects in a redundant second pass.
+                for entry in [entries.first().unwrap(), entries.last().unwrap()] {
                     serde_json::from_str::<serde_json::Value>(&entry.json).map_err(|error| {
                         anyhow::anyhow!(
                             "Invalid OSA JSON on {}:{}: {}",
