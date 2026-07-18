@@ -2410,7 +2410,7 @@ pub fn run_sa_build(
             schema_version: fastvep_sa::common::SCHEMA_VERSION,
             json_key: "clinvar".into(),
             name: "ClinVar".into(),
-            version: "latest".into(),
+            version: "1.3".into(),
             description: format!("ClinVar annotations for {}", assembly),
             assembly: assembly.into(),
             match_by_allele: true,
@@ -2600,6 +2600,12 @@ pub fn run_sa_build(
                 |r, m| fastvep_sa::sources::cadd::iter_cadd(r, m),
             );
         }
+        "revel" => {
+            return run_streaming_sa_build(
+                input, output, header, &chrom_map, &chrom_list, show_progress,
+                |r, m| fastvep_sa::sources::revel::iter_revel(r, m, 2),
+            );
+        }
         "dbsnp" => {
             return run_streaming_sa_build(
                 input, output, header, &chrom_map, &chrom_list, show_progress,
@@ -2641,7 +2647,6 @@ pub fn run_sa_build(
         "cosmic" => fastvep_sa::sources::cosmic::parse_cosmic_vcf(buf_reader, &chrom_map)?,
         "onekg" | "1000g" => fastvep_sa::sources::onekg::parse_onekg_vcf(buf_reader, &chrom_map)?,
         "mitomap" => fastvep_sa::sources::mitomap::parse_mitomap(buf_reader, &chrom_map)?,
-        "revel" => fastvep_sa::sources::revel::parse_revel(buf_reader, &chrom_map, 2)?,
         "primateai" => fastvep_sa::sources::primateai::parse_primateai(buf_reader, &chrom_map)?,
         _ => unreachable!(),
     };

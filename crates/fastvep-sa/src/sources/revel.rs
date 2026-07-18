@@ -4,7 +4,7 @@
 //! Input format: CSV with columns chr, hg19_pos, grch38_pos, ref, alt, REVEL.
 
 use crate::common::AnnotationRecord;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::io::BufRead;
 
@@ -17,52 +17,68 @@ pub fn parse_revel<R: BufRead>(
     chrom_to_idx: &HashMap<String, u16>,
     pos_column: usize,
 ) -> Result<Vec<AnnotationRecord>> {
-    let mut records = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.context("Reading REVEL line")?;
-        if line.starts_with("chr,") || line.starts_with('#') || line.is_empty() {
-            continue; // Skip header
-        }
-
-        let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() < 8 {
-            continue;
-        }
-
-        let chrom = normalize_chrom(fields[0]);
-        let chrom_idx = match chrom_to_idx.get(&chrom) {
-            Some(&idx) => idx,
-            None => continue,
-        };
-
-        let pos: u32 = match fields[pos_column].parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let ref_allele = fields[3].to_string();
-        let alt_allele = fields[4].to_string();
-
-        let score: f64 = match fields[7].trim().parse() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let json = format!(r#"{{"score":{:.4}}}"#, score)
-            .replace(".0000}", ".0}");
-
-        records.push(AnnotationRecord {
-            chrom_idx,
-            position: pos,
-            ref_allele,
-            alt_allele,
-            json,
-        });
-    }
+    let mut records = iter_revel(reader, chrom_to_idx, pos_column).collect::<Result<Vec<_>>>()?;
 
     records.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
     Ok(records)
+}
+
+/// Stream coordinate-sorted REVEL CSV rows without retaining a chromosome in memory.
+pub fn iter_revel<'a, R: BufRead>(
+    reader: R,
+    chrom_to_idx: &'a HashMap<String, u16>,
+    pos_column: usize,
+) -> RevelRecordIter<'a, R> {
+    RevelRecordIter { lines: reader.lines(), chrom_to_idx, pos_column, line_number: 0 }
+}
+
+pub struct RevelRecordIter<'a, R: BufRead> {
+    lines: std::io::Lines<R>,
+    chrom_to_idx: &'a HashMap<String, u16>,
+    pos_column: usize,
+    line_number: u64,
+}
+
+impl<R: BufRead> Iterator for RevelRecordIter<'_, R> {
+    type Item = Result<AnnotationRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let line = match self.lines.next()? {
+                Ok(line) => line,
+                Err(error) => return Some(Err(error).context("Reading REVEL line")),
+            };
+            self.line_number += 1;
+            if line.starts_with("chr,") || line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let fields = line.split(',').collect::<Vec<_>>();
+            if fields.len() < 8 {
+                return Some(Err(anyhow!("REVEL line {} has fewer than eight columns", self.line_number)));
+            }
+            let chrom = normalize_chrom(fields[0]);
+            let Some(&chrom_idx) = self.chrom_to_idx.get(&chrom) else { continue; };
+            let position = match fields.get(self.pos_column).and_then(|value| value.parse::<u32>().ok()) {
+                Some(position) if position > 0 => position,
+                _ => return Some(Err(anyhow!("REVEL line {} has an invalid GRCh38 position", self.line_number))),
+            };
+            if fields[3].is_empty() || fields[4].is_empty() {
+                return Some(Err(anyhow!("REVEL line {} has an empty allele", self.line_number)));
+            }
+            let score = match fields[7].trim().parse::<f64>() {
+                Ok(score) if score.is_finite() && (0.0..=1.0).contains(&score) => score,
+                _ => return Some(Err(anyhow!("REVEL line {} has an invalid score", self.line_number))),
+            };
+            let transcript_id = fields.get(8).copied().unwrap_or_default();
+            return Some(Ok(AnnotationRecord {
+                chrom_idx,
+                position,
+                ref_allele: fields[3].to_string(),
+                alt_allele: fields[4].to_string(),
+                json: serde_json::json!({"score": score, "transcriptId": transcript_id}).to_string(),
+            }));
+        }
+    }
 }
 
 fn normalize_chrom(chrom: &str) -> String {
@@ -96,5 +112,12 @@ chr,hg19_pos,grch38_pos,ref,alt,aaref,aaalt,REVEL
         assert!(records[0].json.contains("0.027"));
         assert_eq!(records[2].position, 35143);
         assert!(records[2].json.contains("0.842"));
+    }
+
+    #[test]
+    fn malformed_rows_fail_closed() {
+        let map = HashMap::from([("chr1".to_string(), 0)]);
+        assert!(iter_revel(&b"1,1,bad,G,A,T,M,0.2,ENST1\n"[..], &map, 2)
+            .next().unwrap().is_err());
     }
 }
