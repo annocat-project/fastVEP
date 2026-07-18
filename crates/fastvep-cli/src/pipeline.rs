@@ -17,7 +17,7 @@ use fastvep_io::vcf::VcfParser;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2188,33 +2188,41 @@ fn standard_chrom_map(assembly: &str) -> (Vec<String>, std::collections::HashMap
     (chroms, map)
 }
 
-/// Open an `sa-build` input file and transparently decompress gzip/bgzip.
+/// Open an `sa-build` input file (or stdin when `input == "-"`) and
+/// transparently decompress gzip/bgzip.
 ///
 /// Detection is by the gzip magic bytes (`0x1f 0x8b`) first, falling back to the
 /// `.gz`/`.bgz` extension — mirroring `wrap_maybe_gzip_reader` on the annotate
 /// path so a bgzipped source with a non-standard name (e.g. `gnomad.sites.vcf`)
 /// still decodes instead of silently parsing to zero records. The file is
-/// seekable, so we sniff and rewind rather than chaining the peeked bytes.
+/// Sniffing uses `BufReader::fill_buf` without consuming bytes. This works for
+/// both seekable files and non-seekable stdin/pipe input, and avoids exposing a
+/// synthetic two-byte read that can confuse downstream format detection.
 ///
 /// When `byte_counter` is supplied the raw (still-compressed) file is wrapped in
 /// a `CountingReader` *before* decompression, so progress reflects compressed
 /// bytes consumed against the on-disk file size.
 fn open_sa_input(input: &str, byte_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> Result<Box<dyn io::Read>> {
-    let mut file = File::open(input).with_context(|| format!("Opening input file: {}", input))?;
-    let mut magic = [0u8; 2];
-    let n = file.read(&mut magic)?;
-    file.seek(SeekFrom::Start(0))?;
-    let is_gzip =
-        (n == 2 && magic == [0x1f, 0x8b]) || input.ends_with(".gz") || input.ends_with(".bgz");
-
-    let raw: Box<dyn io::Read> = match byte_counter {
-        Some(bytes) => Box::new(crate::progress::CountingReader { inner: file, bytes }),
-        None => Box::new(file),
-    };
-    if is_gzip {
-        Ok(Box::new(MultiGzDecoder::new(raw)))
+    let source: Box<dyn io::Read> = if input == "-" {
+        Box::new(io::stdin())
     } else {
-        Ok(raw)
+        Box::new(File::open(input).with_context(|| format!("Opening input file: {}", input))?)
+    };
+
+    // Count compressed bytes before sniffing/decompression so stdin progress
+    // and integrity accounting include every byte received.
+    let raw: Box<dyn io::Read> = match byte_counter {
+        Some(bytes) => Box::new(crate::progress::CountingReader { inner: source, bytes }),
+        None => source,
+    };
+    let mut buffered = io::BufReader::new(raw);
+    let prefix = buffered.fill_buf()?;
+    let is_gzip =
+        prefix.starts_with(&[0x1f, 0x8b]) || input.ends_with(".gz") || input.ends_with(".bgz");
+    if is_gzip {
+        Ok(Box::new(MultiGzDecoder::new(buffered)))
+    } else {
+        Ok(Box::new(buffered))
     }
 }
 
