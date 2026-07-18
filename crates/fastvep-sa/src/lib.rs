@@ -22,6 +22,7 @@ pub mod interval;
 pub mod kmer16;
 pub mod reader;
 pub mod reader_v2;
+pub mod sharded;
 pub mod sources;
 pub mod var32;
 pub mod writer;

@@ -1229,6 +1229,18 @@ pub fn load_sa_providers(
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
 
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(fastvep_sa::sharded::SHARD_MANIFEST_SUFFIX))
+        {
+            let reader = fastvep_sa::sharded::ShardedSaReader::open(&path)
+                .with_context(|| format!("Loading required OSA shard manifest {}", path.display()))?;
+            tracing::info!("Loaded sharded SA: {} ({})", reader.name(), path.display());
+            providers.push(Mutex::new(Box::new(reader)));
+            continue;
+        }
+
         match ext {
             Some("osa2") => match Osa2Reader::open(&path) {
                 Ok(reader) => {
