@@ -17,6 +17,19 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaVerificationReport {
+    pub name: String,
+    pub version: String,
+    pub assembly: String,
+    pub json_key: String,
+    pub chromosomes: Vec<String>,
+    pub block_count: u64,
+    pub record_count: u64,
+    pub lookup_count: u64,
+}
+
 /// Default per-reader byte budget for the decompressed-block cache (32 MiB).
 ///
 /// Block sizes vary a lot by data source — clinvar/gnomad/spliceai are
@@ -167,6 +180,86 @@ impl SaReader {
             index,
             metadata,
             block_cache: Mutex::new(BlockCache::new(cache_bytes_per_reader())),
+        })
+    }
+
+    /// Reopen and fully validate every indexed OSA block.
+    pub fn verify(&self, expected_chromosome: Option<&str>) -> Result<SaVerificationReport> {
+        let mut chromosomes: Vec<_> = self.index.chromosomes.keys().cloned().collect();
+        chromosomes.sort();
+        if chromosomes.is_empty() {
+            anyhow::bail!("OSA index contains no chromosomes");
+        }
+        if let Some(expected) = expected_chromosome {
+            let expected_aliases = chrom_aliases(expected);
+            if chromosomes.iter().any(|chromosome| !expected_aliases.contains(chromosome)) {
+                anyhow::bail!(
+                    "OSA index contains chromosomes outside expected shard '{}': {:?}",
+                    expected, chromosomes
+                );
+            }
+        }
+
+        let mut block_count = 0_u64;
+        let mut record_count = 0_u64;
+        let mut lookup_count = 0_u64;
+        for chromosome in &chromosomes {
+            let blocks = &self.index.chromosomes[chromosome];
+            if blocks.is_empty() {
+                anyhow::bail!("OSA index chromosome '{}' contains no blocks", chromosome);
+            }
+            let mut previous_end = None;
+            for block in blocks {
+                if block.start_pos > block.end_pos {
+                    anyhow::bail!("OSA block has inverted coordinate bounds on {}", chromosome);
+                }
+                if previous_end.is_some_and(|end| end > block.start_pos) {
+                    anyhow::bail!("OSA blocks are not coordinate ordered on {}", chromosome);
+                }
+                previous_end = Some(block.end_pos);
+                let entries = self.decompress_block(block.file_offset, block.compressed_len)?;
+                if entries.is_empty() {
+                    anyhow::bail!("OSA block is empty on {}", chromosome);
+                }
+                let mut previous_position = None;
+                for entry in &entries {
+                    if entry.position < block.start_pos || entry.position > block.end_pos {
+                        anyhow::bail!("OSA record falls outside its indexed block on {}", chromosome);
+                    }
+                    if previous_position.is_some_and(|position| position > entry.position) {
+                        anyhow::bail!("OSA records are not coordinate ordered on {}", chromosome);
+                    }
+                    previous_position = Some(entry.position);
+                    serde_json::from_str::<serde_json::Value>(&entry.json).map_err(|error| {
+                        anyhow::anyhow!(
+                            "Invalid OSA JSON on {}:{}: {}",
+                            chromosome, entry.position, error
+                        )
+                    })?;
+                }
+                for entry in [entries.first().unwrap(), entries.last().unwrap()] {
+                    if self.query(chromosome, entry.position, &entry.ref_allele, &entry.alt_allele)?.is_none() {
+                        anyhow::bail!(
+                            "OSA deterministic lookup failed on {}:{}",
+                            chromosome, entry.position
+                        );
+                    }
+                    lookup_count += 1;
+                }
+                block_count += 1;
+                record_count += entries.len() as u64;
+            }
+        }
+
+        Ok(SaVerificationReport {
+            name: self.metadata.name.clone(),
+            version: self.metadata.version.clone(),
+            assembly: self.metadata.assembly.clone(),
+            json_key: self.metadata.json_key.clone(),
+            chromosomes,
+            block_count,
+            record_count,
+            lookup_count,
         })
     }
 

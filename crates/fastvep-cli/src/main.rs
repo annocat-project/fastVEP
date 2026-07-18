@@ -219,6 +219,21 @@ enum Commands {
         no_progress: bool,
     },
 
+    /// Reopen and fully validate an OSA database and index.
+    SaVerify {
+        /// Input .osa data file; the sibling .osa.idx is opened automatically.
+        #[arg(short, long)]
+        input: String,
+
+        /// Require every indexed chromosome to match this shard chromosome.
+        #[arg(long)]
+        chromosome: Option<String>,
+
+        /// Require the OSA metadata to declare this assembly.
+        #[arg(long, default_value = "GRCh38")]
+        assembly: String,
+    },
+
     /// Filter annotated VEP output
     Filter {
         /// Input file (VEP-annotated VCF)
@@ -315,6 +330,22 @@ fn main() -> Result<()> {
                 &info_fields,
                 !no_progress,
             )?;
+        }
+        Commands::SaVerify {
+            input,
+            chromosome,
+            assembly,
+        } => {
+            let reader = fastvep_sa::reader::SaReader::open(std::path::Path::new(&input))?;
+            let report = reader.verify(chromosome.as_deref())?;
+            if report.assembly != assembly {
+                anyhow::bail!(
+                    "OSA assembly mismatch: expected {}, found {}",
+                    assembly,
+                    report.assembly
+                );
+            }
+            println!("{}", serde_json::to_string(&report)?);
         }
         Commands::Filter {
             input,
