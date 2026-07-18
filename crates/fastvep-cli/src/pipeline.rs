@@ -1918,6 +1918,13 @@ pub fn run_cache_build(
     output_path: &str,
     show_progress: bool,
 ) -> Result<()> {
+    // A full Ensembl cache build can use several GiB while sequences are in
+    // memory. Keep the lock in the output staging directory so independently
+    // launched fastVEP/AnnoCat processes cannot build the same cache at once.
+    // The zero-byte lock file is intentionally retained; the OS lock, not file
+    // existence, owns exclusivity and is released if a process exits or aborts.
+    let _cache_build_lock = acquire_cache_build_lock(output_path)?;
+
     if gff3_paths.is_empty() {
         return Err(anyhow::anyhow!("`fastvep cache` requires at least one --gff3"));
     }
@@ -2043,6 +2050,43 @@ pub fn run_cache_build(
     fastvep_cache::transcript_cache::save_cache(&transcripts, Path::new(output_path))?;
     eprintln!("Saved transcript cache to {}", output_path);
     Ok(())
+}
+
+fn acquire_cache_build_lock(output_path: &str) -> Result<File> {
+    let lock_path = Path::new(output_path).with_extension("cache.build.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Creating cache build directory: {}", parent.display()))?;
+    }
+    let cache_build_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Opening cache build lock: {}", lock_path.display()))?;
+    cache_build_lock.try_lock().with_context(|| {
+        format!(
+            "Another fastVEP process is already building this transcript cache: {}",
+            output_path
+        )
+    })?;
+    Ok(cache_build_lock)
+}
+
+#[cfg(test)]
+mod cache_build_lock_tests {
+    use super::acquire_cache_build_lock;
+
+    #[test]
+    fn rejects_a_second_builder_for_the_same_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("ensembl.cache");
+        let output = output.to_str().unwrap();
+        let first = acquire_cache_build_lock(output).unwrap();
+        assert!(acquire_cache_build_lock(output).is_err());
+        drop(first);
+        assert!(acquire_cache_build_lock(output).is_ok());
+    }
 }
 
 /// Quick VCF pre-scan to collect variant regions for indexed GFF3 loading.
