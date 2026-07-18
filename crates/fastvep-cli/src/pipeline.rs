@@ -2702,14 +2702,9 @@ fn run_custom_vcf_build(
         is_positional: false,
     };
 
-    let file = File::open(input)
-        .with_context(|| format!("Opening input file: {}", input))?;
-    let reader: Box<dyn io::Read> = if input.ends_with(".gz") || input.ends_with(".bgz") {
-        Box::new(flate2::read::MultiGzDecoder::new(file))
-    } else {
-        Box::new(file)
-    };
-    let buf_reader = io::BufReader::new(reader);
+    // Use the same magic-sniffing reader as built-in VCF sources so explicit
+    // `custom_vcf --input -` supports plain or gzip/BGZF stdin as promised.
+    let buf_reader = io::BufReader::new(open_sa_input(input, None)?);
 
     let records = fastvep_sa::custom::parse_custom_vcf(
         buf_reader,

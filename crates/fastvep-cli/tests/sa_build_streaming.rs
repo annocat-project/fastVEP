@@ -10,6 +10,8 @@ use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue};
 use fastvep_cli::pipeline::run_sa_build;
 use fastvep_sa::reader::SaReader;
 use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 const GNOMAD_SORTED: &str = "\
 ##fileformat=VCFv4.2
@@ -116,6 +118,37 @@ fn streaming_build_detects_gzip_by_magic_bytes_not_extension() {
         plain_osa, gz_osa,
         "gzip-by-magic build must match the plain-text build"
     );
+}
+
+#[test]
+fn custom_vcf_build_accepts_plain_and_gzip_stdin() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (label, input) in [
+        ("plain", GNOMAD_SORTED.as_bytes().to_vec()),
+        ("gzip", gzip(GNOMAD_SORTED)),
+    ] {
+        let output = tmp.path().join(label);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fastvep"))
+            .args([
+                "sa-build", "--source", "custom_vcf", "--input", "-", "--output",
+                output.to_str().unwrap(), "--assembly", "GRCh38", "--name", "fixture",
+                "--no-progress",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{label} stdin failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(output.with_extension("osa").is_file());
+        assert!(output.with_extension("osa.idx").is_file());
+    }
 }
 
 #[test]
