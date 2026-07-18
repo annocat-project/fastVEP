@@ -2460,6 +2460,17 @@ pub fn run_sa_build(
                 is_positional: true,
             }
         },
+        "cadd" => IndexHeader {
+            schema_version: fastvep_sa::common::SCHEMA_VERSION,
+            json_key: "cadd".into(),
+            name: "CADD".into(),
+            version: "1.7".into(),
+            description: format!("CADD raw and PHRED scores for {}", assembly),
+            assembly: assembly.into(),
+            match_by_allele: true,
+            is_array: false,
+            is_positional: false,
+        },
         "revel" => IndexHeader {
             schema_version: fastvep_sa::common::SCHEMA_VERSION,
             json_key: "revel".into(),
@@ -2549,7 +2560,7 @@ pub fn run_sa_build(
             is_positional: false,
         },
         _ => anyhow::bail!(
-            "Unknown source: {}. Supported: clinvar, gnomad, dbsnp, cosmic, onekg, topmed, mitomap, phylop, gerp, dann, revel, spliceai, primateai, dbnsfp, omim, gnomad_genes, clinvar_protein, custom_vcf, custom_bed, custom",
+            "Unknown source: {}. Supported: clinvar, gnomad, dbsnp, cosmic, onekg, topmed, mitomap, phylop, gerp, dann, cadd, revel, spliceai, primateai, dbnsfp, omim, gnomad_genes, clinvar_protein, custom_vcf, custom_bed, custom",
             source
         ),
     };
@@ -2576,6 +2587,17 @@ pub fn run_sa_build(
             return run_streaming_sa_build(
                 input, output, header, &chrom_map, &chrom_list, show_progress,
                 |r, m| fastvep_sa::sources::dbnsfp::iter_dbnsfp(r, m),
+            );
+        }
+        "cadd" => {
+            return run_streaming_sa_build(
+                input,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                |r, m| fastvep_sa::sources::cadd::iter_cadd(r, m),
             );
         }
         "dbsnp" => {
