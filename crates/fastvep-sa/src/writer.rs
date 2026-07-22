@@ -119,11 +119,12 @@ impl SaWriter {
             json: record.json,
         };
 
-        if !self.block.add(entry.clone()) {
-            // Block is full, flush and retry
+        if !self.block.can_add(&entry) {
+            // Check by reference so every source record's owned strings are
+            // moved exactly once instead of cloned on the normal hot path.
             self.flush_block(data_writer)?;
-            assert!(self.block.add(entry), "Single entry exceeds block size");
         }
+        assert!(self.block.add(entry), "Single entry exceeds block size");
 
         Ok(())
     }

@@ -2267,7 +2267,11 @@ fn standard_chrom_map(assembly: &str) -> (Vec<String>, std::collections::HashMap
 /// When `byte_counter` is supplied the raw (still-compressed) file is wrapped in
 /// a `CountingReader` *before* decompression, so progress reflects compressed
 /// bytes consumed against the on-disk file size.
-fn open_sa_input(input: &str, byte_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> Result<Box<dyn io::Read>> {
+fn open_sa_input(
+    input: &str,
+    byte_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    skip_bytes: u64,
+) -> Result<Box<dyn io::Read>> {
     let source: Box<dyn io::Read> = if input == "-" {
         Box::new(io::stdin())
     } else {
@@ -2284,10 +2288,103 @@ fn open_sa_input(input: &str, byte_counter: Option<std::sync::Arc<std::sync::ato
     let prefix = buffered.fill_buf()?;
     let is_gzip =
         prefix.starts_with(&[0x1f, 0x8b]) || input.ends_with(".gz") || input.ends_with(".bgz");
-    if is_gzip {
-        Ok(Box::new(MultiGzDecoder::new(buffered)))
+    let mut decoded: Box<dyn io::Read> = if is_gzip {
+        Box::new(MultiGzDecoder::new(buffered))
     } else {
-        Ok(Box::new(buffered))
+        Box::new(buffered)
+    };
+    if skip_bytes > 0 {
+        let skipped = io::copy(&mut decoded.by_ref().take(skip_bytes), &mut io::sink())?;
+        if skipped != skip_bytes {
+            anyhow::bail!(
+                "Input ended after skipping {skipped} of {skip_bytes} requested uncompressed bytes"
+            );
+        }
+    }
+    Ok(decoded)
+}
+
+/// Merge already-sorted source artifacts without asking the caller to decode,
+/// inspect, or rewrite their rows. This is used for logical sources such as
+/// CADD whose SNV and indel artifacts are independently coordinate sorted.
+struct MergedRecordIter<I> {
+    iterators: Vec<I>,
+    heads: Vec<Option<Result<fastvep_sa::common::AnnotationRecord>>>,
+    chromosome: Option<u16>,
+    failed: bool,
+}
+
+impl<I> MergedRecordIter<I>
+where
+    I: Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>>,
+{
+    fn new(mut iterators: Vec<I>, chromosome: Option<u16>) -> Self {
+        let heads = iterators.iter_mut().map(Iterator::next).collect();
+        Self {
+            iterators,
+            heads,
+            chromosome,
+            failed: false,
+        }
+    }
+
+    fn advance_past_other_chromosomes(&mut self, index: usize) {
+        while self.heads[index]
+            .as_ref()
+            .and_then(|item| item.as_ref().ok())
+            .is_some_and(|record| Some(record.chrom_idx) != self.chromosome)
+            && self.chromosome.is_some()
+        {
+            self.heads[index] = self.iterators[index].next();
+        }
+    }
+}
+
+impl<I> Iterator for MergedRecordIter<I>
+where
+    I: Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>>,
+{
+    type Item = Result<fastvep_sa::common::AnnotationRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        for index in 0..self.heads.len() {
+            self.advance_past_other_chromosomes(index);
+            if self.heads[index].as_ref().is_some_and(Result::is_err) {
+                self.failed = true;
+                return self.heads[index].take();
+            }
+        }
+
+        let mut selected: Option<usize> = None;
+        for index in 0..self.heads.len() {
+            let Some(Ok(candidate)) = self.heads[index].as_ref() else {
+                continue;
+            };
+            let replace = selected.map_or(true, |current| {
+                let current = self.heads[current].as_ref().unwrap().as_ref().unwrap();
+                (
+                    candidate.chrom_idx,
+                    candidate.position,
+                    candidate.ref_allele.as_str(),
+                    candidate.alt_allele.as_str(),
+                ) < (
+                    current.chrom_idx,
+                    current.position,
+                    current.ref_allele.as_str(),
+                    current.alt_allele.as_str(),
+                )
+            });
+            if replace {
+                selected = Some(index);
+            }
+        }
+        let selected = selected?;
+        let result = self.heads[selected].take();
+        self.heads[selected] = self.iterators[selected].next();
+        result
     }
 }
 
@@ -2303,14 +2400,16 @@ fn open_sa_input(input: &str, byte_counter: Option<std::sync::Arc<std::sync::ato
 /// order because the writer streams blocks and rejects out-of-order input.
 fn run_streaming_sa_build<'a, I>(
     source: &str,
-    input: &str,
+    inputs: &[String],
+    input_skips: &[u64],
+    chromosome: Option<u16>,
     output: &str,
     header: fastvep_sa::index::IndexHeader,
     chrom_map: &'a std::collections::HashMap<String, u16>,
     chrom_list: &[String],
     show_progress: bool,
     selected_fields: Option<&std::collections::HashSet<String>>,
-    make_iter: impl FnOnce(
+    mut make_iter: impl FnMut(
         io::BufReader<Box<dyn io::Read>>,
         &'a std::collections::HashMap<String, u16>,
     ) -> I,
@@ -2324,10 +2423,17 @@ where
     let output_path = Path::new(output);
     let mut writer = fastvep_sa::writer::SaWriter::new(header);
 
-    let file_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
+    let file_size = inputs
+        .iter()
+        .filter_map(|input| std::fs::metadata(input).ok())
+        .map(|metadata| metadata.len())
+        .sum();
     let byte_counter = Arc::new(AtomicU64::new(0));
-    let reader = open_sa_input(input, Some(Arc::clone(&byte_counter)))?;
-    let buf_reader = io::BufReader::new(reader);
+    let mut iterators = Vec::with_capacity(inputs.len());
+    for (input, skip) in inputs.iter().zip(input_skips) {
+        let reader = open_sa_input(input, Some(Arc::clone(&byte_counter)), *skip)?;
+        iterators.push(make_iter(io::BufReader::new(reader), chrom_map));
+    }
 
     let mut meter = if show_progress && file_size > 0 {
         crate::progress::ProgressMeter::with_progress(true, file_size, byte_counter)
@@ -2335,7 +2441,7 @@ where
         crate::progress::ProgressMeter::new(show_progress)
     };
 
-    let records = make_iter(buf_reader, chrom_map).map(|record| {
+    let records = MergedRecordIter::new(iterators, chromosome).map(|record| {
         let record = record.and_then(|record| {
             filter_supplementary_record(source, record, selected_fields)
         });
@@ -2517,12 +2623,60 @@ pub fn run_sa_build(
     info_fields: &[String],
     show_progress: bool,
 ) -> Result<()> {
+    run_sa_build_inputs(
+        source,
+        &[input.to_string()],
+        &[0],
+        None,
+        output,
+        assembly,
+        name,
+        info_fields,
+        show_progress,
+    )
+}
+
+/// Build one logical supplementary source from one or more raw artifacts.
+/// Artifact decompression, row parsing, chromosome normalization, filtering,
+/// and sorted merging all remain inside fastVEP.
+pub fn run_sa_build_inputs(
+    source: &str,
+    inputs: &[String],
+    input_skips: &[u64],
+    chromosome: Option<&str>,
+    output: &str,
+    assembly: &str,
+    name: Option<&str>,
+    info_fields: &[String],
+    show_progress: bool,
+) -> Result<()> {
     use fastvep_sa::index::IndexHeader;
     use fastvep_sa::writer::SaWriter;
+    if inputs.is_empty() || inputs.iter().any(|input| input.is_empty()) {
+        anyhow::bail!("sa-build requires at least one non-empty input");
+    }
+    if inputs.len() > 1 && inputs.iter().any(|input| input == "-") {
+        anyhow::bail!("stdin may only be used as a single sa-build input");
+    }
+    let normalized_skips = if input_skips.is_empty() {
+        vec![0; inputs.len()]
+    } else {
+        if input_skips.len() != inputs.len() {
+            anyhow::bail!("--input-skip must be omitted or supplied once per input");
+        }
+        input_skips.to_vec()
+    };
+    let input = inputs[0].as_str();
     let selected_fields = annocat_selected_source_fields(source)?;
+    let framed_input = inputs.len() != 1
+        || normalized_skips.iter().any(|skip| *skip != 0)
+        || chromosome.is_some();
 
     // Gene-level sources (.oga) — dispatched separately from variant-level (.osa).
     if matches!(source, "omim" | "gnomad_genes" | "gnomad_gene" | "clinvar_protein") {
+        if framed_input {
+            anyhow::bail!("gene source '{source}' requires one complete input");
+        }
         return run_oga_build(source, input, output, assembly);
     }
 
@@ -2531,6 +2685,9 @@ pub fn run_sa_build(
     // these before the built-in header-lookup so they don't have to thread
     // through every `match source` arm below.
     if matches!(source, "custom_vcf" | "custom_bed" | "custom") {
+        if framed_input {
+            anyhow::bail!("custom source '{source}' requires one complete input");
+        }
         let resolved = if source == "custom" {
             classify_custom_input(input)?
         } else {
@@ -2544,6 +2701,17 @@ pub fn run_sa_build(
     }
 
     let (chrom_list, chrom_map) = standard_chrom_map(assembly);
+    let chromosome_idx = chromosome
+        .map(|value| {
+            let stripped = value.strip_prefix("chr").unwrap_or(value);
+            chrom_map
+                .get(value)
+                .or_else(|| chrom_map.get(stripped))
+                .or_else(|| chrom_map.get(&format!("chr{stripped}")))
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("unsupported {assembly} chromosome '{value}'"))
+        })
+        .transpose()?;
 
     let header = match source {
         "clinvar" => IndexHeader {
@@ -2705,7 +2873,12 @@ pub fn run_sa_build(
         ),
     };
 
-    eprintln!("Building {} .osa: {} -> {}", source, input, Path::new(output).with_extension("osa").display());
+    eprintln!(
+        "Building {} .osa: {} -> {}",
+        source,
+        inputs.join(", "),
+        Path::new(output).with_extension("osa").display()
+    );
 
     // Large, coordinate-sorted population/score sources stream straight into
     // the writer instead of buffering every record (issue #55). They share one
@@ -2713,21 +2886,21 @@ pub fn run_sa_build(
     match source {
         "spliceai" => {
             return run_streaming_sa_build(
-                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::spliceai::iter_spliceai_vcf(r, m),
             );
         }
         "gnomad" => {
             return run_streaming_sa_build(
-                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::gnomad::iter_gnomad_vcf(r, m),
             );
         }
         "dbnsfp" => {
             return run_streaming_sa_build(
-                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::dbnsfp::iter_dbnsfp(r, m),
             );
@@ -2735,7 +2908,9 @@ pub fn run_sa_build(
         "cadd" => {
             return run_streaming_sa_build(
                 source,
-                input,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
                 output,
                 header,
                 &chrom_map,
@@ -2747,35 +2922,35 @@ pub fn run_sa_build(
         }
         "revel" => {
             return run_streaming_sa_build(
-                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::revel::iter_revel(r, m, 2),
             );
         }
         "dbsnp" => {
             return run_streaming_sa_build(
-                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::dbsnp::iter_dbsnp_vcf(r, m),
             );
         }
         "topmed" => {
             return run_streaming_sa_build(
-                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::topmed::iter_topmed_vcf(r, m),
             );
         }
         "phylop" => {
             return run_streaming_sa_build(
-                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
                 selected_fields.as_ref(),
                 |r, m| iter_phylop_auto(r, m),
             );
         }
         "gerp" | "dann" => {
             return run_streaming_sa_build(
-                source, input, output, header, &chrom_map, &chrom_list, show_progress,
+                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::scores::iter_score_tsv(r, m, false),
             );
@@ -2783,7 +2958,10 @@ pub fn run_sa_build(
         _ => {}
     }
 
-    let buf_reader = io::BufReader::new(open_sa_input(input, None)?);
+    if inputs.len() != 1 || normalized_skips[0] != 0 || chromosome.is_some() {
+        anyhow::bail!("source '{source}' does not support framed or multiple inputs");
+    }
+    let buf_reader = io::BufReader::new(open_sa_input(input, None, 0)?);
 
     eprintln!(
         "INFO  ProgressMeter - Parsing '{}': {} -> {}",
@@ -2929,7 +3107,7 @@ fn run_custom_vcf_build(
 
     // Use the same magic-sniffing reader as built-in VCF sources so explicit
     // `custom_vcf --input -` supports plain or gzip/BGZF stdin as promised.
-    let buf_reader = io::BufReader::new(open_sa_input(input, None)?);
+    let buf_reader = io::BufReader::new(open_sa_input(input, None, 0)?);
 
     let records = fastvep_sa::custom::parse_custom_vcf(
         buf_reader,

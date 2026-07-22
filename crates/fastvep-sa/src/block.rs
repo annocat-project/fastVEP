@@ -40,13 +40,23 @@ impl SaBlock {
 
     /// Try to add an entry. Returns `false` if the block is full (entry not added).
     pub fn add(&mut self, entry: BlockEntry) -> bool {
-        let entry_size = 4 + 2 + entry.ref_allele.len() + 2 + entry.alt_allele.len() + 4 + entry.json.len();
-        if !self.entries.is_empty() && self.uncompressed_size + entry_size > self.max_size {
+        let entry_size = Self::entry_size(&entry);
+        if !self.can_add(&entry) {
             return false;
         }
         self.uncompressed_size += entry_size;
         self.entries.push(entry);
         true
+    }
+
+    /// Check whether an entry fits without cloning its owned strings.
+    pub fn can_add(&self, entry: &BlockEntry) -> bool {
+        self.entries.is_empty()
+            || self.uncompressed_size + Self::entry_size(entry) <= self.max_size
+    }
+
+    fn entry_size(entry: &BlockEntry) -> usize {
+        4 + 2 + entry.ref_allele.len() + 2 + entry.alt_allele.len() + 4 + entry.json.len()
     }
 
     /// Returns true if the block has no entries.
@@ -69,20 +79,16 @@ impl SaBlock {
         self.entries.len()
     }
 
-    /// Serialize and compress the block. Entries are sorted by position before
-    /// compression to enable binary search on decompressed data.
+    /// Serialize and compress a position-sorted block. `SaWriter` rejects
+    /// out-of-order input before entries reach the block, so sorting again here
+    /// only wastes CPU and memory on very large source builds.
     pub fn compress(&self) -> Result<Vec<u8>> {
-        // Sort entries by position for binary search support
-        let mut sorted: Vec<usize> = (0..self.entries.len()).collect();
-        sorted.sort_by_key(|&i| self.entries[i].position);
-
         let mut raw = Vec::with_capacity(self.uncompressed_size);
 
         // Write number of entries
         raw.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
 
-        for &idx in &sorted {
-            let entry = &self.entries[idx];
+        for entry in &self.entries {
             // Position (4 bytes)
             raw.extend_from_slice(&entry.position.to_le_bytes());
             // Ref allele (2-byte length + data)

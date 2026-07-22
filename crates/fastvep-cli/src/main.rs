@@ -191,9 +191,24 @@ enum Commands {
         #[arg(long)]
         source: String,
 
-        /// Input file (VCF, typically gzipped)
-        #[arg(short, long)]
-        input: String,
+        /// Input file(s), typically gzip/BGZF compressed. Repeat for sorted
+        /// source artifacts that form one logical database (for example CADD
+        /// SNVs and indels). Use "-" for a single stdin stream.
+        #[arg(short, long, required = true, num_args = 1..)]
+        input: Vec<String>,
+
+        /// Uncompressed bytes to skip after opening each input. This permits a
+        /// caller to pass a complete BGZF block range beginning at a tabix
+        /// virtual offset without decoding or rewriting rows itself. Omit for
+        /// zero; otherwise provide one value per input.
+        #[arg(long, value_delimiter = ',')]
+        input_skip: Vec<u64>,
+
+        /// Keep only records for this chromosome after the source parser has
+        /// normalized its native contig names. Intended for indexed BGZF
+        /// chromosome ranges whose final block may contain the next contig.
+        #[arg(long)]
+        chromosome: Option<String>,
 
         /// Output base path (will create .osa and .osa.idx, or .osi for BED)
         #[arg(short, long)]
@@ -321,15 +336,19 @@ fn main() -> Result<()> {
         Commands::SaBuild {
             source,
             input,
+            input_skip,
+            chromosome,
             output,
             assembly,
             name,
             info_fields,
             no_progress,
         } => {
-            pipeline::run_sa_build(
+            pipeline::run_sa_build_inputs(
                 &source,
                 &input,
+                &input_skip,
+                chromosome.as_deref(),
                 &output,
                 &assembly,
                 name.as_deref(),

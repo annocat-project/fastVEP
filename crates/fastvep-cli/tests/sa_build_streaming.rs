@@ -7,7 +7,7 @@
 //!     no corrupt partial `.osa`/`.osa.idx` behind.
 
 use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue};
-use fastvep_cli::pipeline::run_sa_build;
+use fastvep_cli::pipeline::{run_sa_build, run_sa_build_inputs};
 use fastvep_sa::reader::SaReader;
 use std::fs;
 use std::io::Write;
@@ -293,4 +293,87 @@ chr1\t200\t-0.5
         AnnotationValue::Positional(v) => assert!(v.contains("1.234"), "unexpected GERP value: {v}"),
         other => panic!("expected a positional GERP value, got {other:?}"),
     }
+}
+
+#[test]
+fn fastvep_merges_multiple_raw_cadd_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snv = tmp.path().join("snv.part");
+    let indel = tmp.path().join("indel.part");
+    let out = tmp.path().join("cadd");
+    fs::write(
+        &snv,
+        "#Chrom\tPos\tRef\tAlt\tRawScore\tPHRED\n1\t100\tA\tG\t0.1\t10.0\n1\t200\tC\tT\t0.3\t30.0\n",
+    )
+    .unwrap();
+    fs::write(
+        &indel,
+        "#Chrom\tPos\tRef\tAlt\tRawScore\tPHRED\n1\t150\tAT\tA\t0.2\t20.0\n",
+    )
+    .unwrap();
+
+    run_sa_build_inputs(
+        "cadd",
+        &[
+            snv.to_string_lossy().into_owned(),
+            indel.to_string_lossy().into_owned(),
+        ],
+        &[0, 0],
+        Some("1"),
+        out.to_str().unwrap(),
+        "GRCh38",
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let reader = SaReader::open(&out.with_extension("osa")).unwrap();
+    for (position, reference, alternate) in
+        [(100, "A", "G"), (150, "AT", "A"), (200, "C", "T")]
+    {
+        assert!(
+            reader
+                .annotate_position("chr1", position, reference, alternate)
+                .unwrap()
+                .is_some(),
+            "merged CADD cache is missing {position}:{reference}>{alternate}"
+        );
+    }
+}
+
+#[test]
+fn fastvep_owns_range_skip_and_chromosome_filtering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("range.part");
+    let output = tmp.path().join("gnomad_chr1");
+    let prefix = "discard this decompressed prefix\n";
+    fs::write(&input, gzip(&format!("{prefix}{GNOMAD_SORTED}"))).unwrap();
+
+    run_sa_build_inputs(
+        "gnomad",
+        &[input.to_string_lossy().into_owned()],
+        &[prefix.len() as u64],
+        Some("chr1"),
+        output.to_str().unwrap(),
+        "GRCh38",
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let reader = SaReader::open(&output.with_extension("osa")).unwrap();
+    assert!(
+        reader
+            .annotate_position("chr1", 100, "A", "G")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reader
+            .annotate_position("chr2", 150, "G", "A")
+            .unwrap()
+            .is_none()
+    );
 }
