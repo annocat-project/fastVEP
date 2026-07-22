@@ -299,9 +299,12 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     };
 
     // Build sequences for coding transcripts from FASTA (skip if loaded from cache with sequences)
-    let needs_seq_build = transcripts
-        .iter()
-        .any(|t| t.is_coding() && t.spliced_seq.is_none());
+    let needs_seq_build = should_build_missing_sequences(
+        config.transcript_cache.is_some(),
+        transcripts
+            .iter()
+            .any(|t| t.is_coding() && t.spliced_seq.is_none()),
+    );
     if needs_seq_build {
         if let Some(ref sp) = seq_provider {
             let built = AtomicUsize::new(0);
@@ -334,7 +337,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     // isn't tied to one of N inputs.
     if needs_seq_build {
         if let Some(ref cp) = cache_path {
-            if single_gff3.is_some() || config.transcript_cache.is_some() {
+            if single_gff3.is_some() {
                 if let Err(e) = fastvep_cache::transcript_cache::save_cache(&transcripts, cp) {
                     eprintln!("Warning: could not save cache: {}", e);
                 } else {
@@ -2172,9 +2175,16 @@ fn acquire_cache_build_lock(output_path: &str) -> Result<File> {
     Ok(cache_build_lock)
 }
 
+fn should_build_missing_sequences(
+    explicit_cache: bool,
+    has_missing_sequences: bool,
+) -> bool {
+    !explicit_cache && has_missing_sequences
+}
+
 #[cfg(test)]
 mod cache_build_lock_tests {
-    use super::acquire_cache_build_lock;
+    use super::{acquire_cache_build_lock, should_build_missing_sequences};
 
     #[test]
     fn rejects_a_second_builder_for_the_same_output() {
@@ -2185,6 +2195,13 @@ mod cache_build_lock_tests {
         assert!(acquire_cache_build_lock(output).is_err());
         drop(first);
         assert!(acquire_cache_build_lock(output).is_ok());
+    }
+
+    #[test]
+    fn explicit_transcript_cache_is_read_only_during_annotation() {
+        assert!(!should_build_missing_sequences(true, true));
+        assert!(should_build_missing_sequences(false, true));
+        assert!(!should_build_missing_sequences(false, false));
     }
 }
 
