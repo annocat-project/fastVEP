@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use flate2::read::MultiGzDecoder;
 use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, GeneAnnotationProvider};
 use fastvep_cache::fasta::FastaReader;
 use fastvep_cache::gff::parse_gff3_with_source;
@@ -14,6 +13,7 @@ use fastvep_hgvs;
 use fastvep_io::output;
 use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
 use fastvep_io::vcf::VcfParser;
+use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
@@ -27,16 +27,16 @@ fn open_vcf_input_reader(input: &str) -> Result<Box<dyn io::Read>> {
     let reader: Box<dyn io::Read> = if input == "-" {
         Box::new(io::stdin())
     } else {
-        Box::new(
-            File::open(input)
-                .with_context(|| format!("Opening input file: {}", input))?,
-        )
+        Box::new(File::open(input).with_context(|| format!("Opening input file: {}", input))?)
     };
 
     wrap_maybe_gzip_reader(reader, input)
 }
 
-fn wrap_maybe_gzip_reader(mut reader: Box<dyn io::Read>, source: &str) -> Result<Box<dyn io::Read>> {
+fn wrap_maybe_gzip_reader(
+    mut reader: Box<dyn io::Read>,
+    source: &str,
+) -> Result<Box<dyn io::Read>> {
     let mut prefix = [0u8; 2];
     let bytes_read = reader.read(&mut prefix)?;
     let looks_like_gzip = bytes_read == 2 && prefix == [0x1f, 0x8b];
@@ -123,10 +123,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     }
 
     // Parse `LABEL=path` syntax up front so a typo fails before we touch IO.
-    let gff3_specs: Vec<Gff3Spec> = config.gff3
-        .iter()
-        .map(|s| parse_gff3_arg(s))
-        .collect();
+    let gff3_specs: Vec<Gff3Spec> = config.gff3.iter().map(|s| parse_gff3_arg(s)).collect();
 
     // Load transcript models: try binary cache first, fall back to GFF3.
     // The auto-managed sidecar cache only kicks in for a single GFF3 — with
@@ -142,105 +139,136 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     let cache_path = if sa_only {
         None
     } else {
-        config.transcript_cache.as_ref().map(|p| Path::new(p).to_path_buf())
-            .or_else(|| single_gff3.map(|s| fastvep_cache::transcript_cache::default_cache_path(Path::new(&s.path))))
+        config
+            .transcript_cache
+            .as_ref()
+            .map(|p| Path::new(p).to_path_buf())
+            .or_else(|| {
+                single_gff3.map(|s| {
+                    fastvep_cache::transcript_cache::default_cache_path(Path::new(&s.path))
+                })
+            })
     };
 
-    let mut transcripts = if sa_only { Vec::new() } else { 'load: {
-        // Cache-load gating:
-        //
-        // * Sidecar cache (`cache_path` derived from a single `--gff3`):
-        //   always considered authoritative when fresh against its source
-        //   GFF3. Re-stamp the source label so the user's current
-        //   --gff3 label/auto-detection wins over whatever was on disk.
-        //
-        // * Explicit `--transcript-cache <path>`: the *user* told us where
-        //   transcripts live. Honour the cache contents verbatim (do NOT
-        //   re-stamp), and for multi-GFF3 invocations be explicit that the
-        //   --gff3 arguments are being ignored. Without this, a user
-        //   running `--gff3 ens.gff3 --gff3 refseq.gff3 --transcript-cache
-        //   old_ens_only.cache` would silently get Ensembl-only output
-        //   and never know.
-        let explicit_cache = config.transcript_cache.is_some();
-        if let Some(ref cp) = cache_path {
-            if cp.exists() {
-                // Freshness check: only sidecar-cache mode does it (the
-                // user-provided --transcript-cache is always trusted).
-                let is_fresh = if explicit_cache {
-                    true
-                } else {
-                    single_gff3
-                        .map(|s| fastvep_cache::transcript_cache::cache_is_fresh(cp, Path::new(&s.path)))
-                        .unwrap_or(true)
-                };
-                if is_fresh {
-                    match fastvep_cache::transcript_cache::load_cache(cp) {
-                        Ok(mut trs) => {
-                            // Re-stamp only in sidecar-cache + single-GFF3
-                            // mode. For explicit --transcript-cache we
-                            // preserve the on-disk labels so a merged
-                            // cache built via `fastvep cache --gff3 ens
-                            // --gff3 refseq -o combined.cache` survives
-                            // round-tripping with the merged distinction
-                            // intact.
-                            if !explicit_cache {
-                                if let Some(spec) = single_gff3 {
-                                    for tr in &mut trs {
-                                        tr.source = Some(spec.source.clone());
+    let mut transcripts = if sa_only {
+        Vec::new()
+    } else {
+        'load: {
+            // Cache-load gating:
+            //
+            // * Sidecar cache (`cache_path` derived from a single `--gff3`):
+            //   always considered authoritative when fresh against its source
+            //   GFF3. Re-stamp the source label so the user's current
+            //   --gff3 label/auto-detection wins over whatever was on disk.
+            //
+            // * Explicit `--transcript-cache <path>`: the *user* told us where
+            //   transcripts live. Honour the cache contents verbatim (do NOT
+            //   re-stamp), and for multi-GFF3 invocations be explicit that the
+            //   --gff3 arguments are being ignored. Without this, a user
+            //   running `--gff3 ens.gff3 --gff3 refseq.gff3 --transcript-cache
+            //   old_ens_only.cache` would silently get Ensembl-only output
+            //   and never know.
+            let explicit_cache = config.transcript_cache.is_some();
+            if let Some(ref cp) = cache_path {
+                if cp.exists() {
+                    // Freshness check: only sidecar-cache mode does it (the
+                    // user-provided --transcript-cache is always trusted).
+                    let is_fresh = if explicit_cache {
+                        true
+                    } else {
+                        single_gff3
+                            .map(|s| {
+                                fastvep_cache::transcript_cache::cache_is_fresh(
+                                    cp,
+                                    Path::new(&s.path),
+                                )
+                            })
+                            .unwrap_or(true)
+                    };
+                    if is_fresh {
+                        match fastvep_cache::transcript_cache::load_cache(cp) {
+                            Ok(mut trs) => {
+                                // Re-stamp only in sidecar-cache + single-GFF3
+                                // mode. For explicit --transcript-cache we
+                                // preserve the on-disk labels so a merged
+                                // cache built via `fastvep cache --gff3 ens
+                                // --gff3 refseq -o combined.cache` survives
+                                // round-tripping with the merged distinction
+                                // intact.
+                                if !explicit_cache {
+                                    if let Some(spec) = single_gff3 {
+                                        for tr in &mut trs {
+                                            tr.source = Some(spec.source.clone());
+                                        }
                                     }
-                                }
-                            } else if !gff3_specs.is_empty() {
-                                // Loud warning: user-supplied --gff3
-                                // alongside --transcript-cache means the
-                                // GFF3 arguments are ignored.
-                                eprintln!(
+                                } else if !gff3_specs.is_empty() {
+                                    // Loud warning: user-supplied --gff3
+                                    // alongside --transcript-cache means the
+                                    // GFF3 arguments are ignored.
+                                    eprintln!(
                                     "warning: --transcript-cache {} takes precedence over --gff3 {:?}; the GFF3 file(s) will NOT be parsed. Drop --transcript-cache to load from GFF3 instead, or remove the --gff3 flags to silence this warning.",
                                     cp.display(),
                                     gff3_specs.iter().map(|s| s.path.as_str()).collect::<Vec<_>>(),
                                 );
+                                }
+                                eprintln!(
+                                    "Loaded {} transcripts from cache {}",
+                                    trs.len(),
+                                    cp.display()
+                                );
+                                break 'load trs;
                             }
-                            eprintln!("Loaded {} transcripts from cache {}", trs.len(), cp.display());
-                            break 'load trs;
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: cache load failed ({}), falling back to GFF3",
+                                    e
+                                );
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("Warning: cache load failed ({}), falling back to GFF3", e);
-                        }
+                    } else {
+                        eprintln!("Cache is stale, rebuilding from GFF3");
                     }
-                } else {
-                    eprintln!("Cache is stale, rebuilding from GFF3");
                 }
             }
-        }
 
-        // Fall back to GFF3 parsing. With multiple sources, load each one and
-        // concatenate — IndexedTranscriptProvider sorts and indexes by chrom,
-        // and the consequence predictor doesn't require globally-unique
-        // stable_ids, so Ensembl + RefSeq can simply coexist.
-        if gff3_specs.is_empty() {
-            eprintln!("Warning: No GFF3 file provided. Only intergenic variants will be annotated.");
-            Vec::new()
-        } else {
-            let mut all: Vec<fastvep_genome::Transcript> = Vec::new();
-            for spec in &gff3_specs {
-                let trs = load_one_gff3(spec, &config.input, config.distance)?;
+            // Fall back to GFF3 parsing. With multiple sources, load each one and
+            // concatenate — IndexedTranscriptProvider sorts and indexes by chrom,
+            // and the consequence predictor doesn't require globally-unique
+            // stable_ids, so Ensembl + RefSeq can simply coexist.
+            if gff3_specs.is_empty() {
                 eprintln!(
-                    "Loaded {} transcripts from {} (source label: {})",
-                    trs.len(), spec.path, spec.source
+                    "Warning: No GFF3 file provided. Only intergenic variants will be annotated."
                 );
-                all.extend(trs);
-            }
-            if all.is_empty() {
-                return Err(anyhow::anyhow!(
+                Vec::new()
+            } else {
+                let mut all: Vec<fastvep_genome::Transcript> = Vec::new();
+                for spec in &gff3_specs {
+                    let trs = load_one_gff3(spec, &config.input, config.distance)?;
+                    eprintln!(
+                        "Loaded {} transcripts from {} (source label: {})",
+                        trs.len(),
+                        spec.path,
+                        spec.source
+                    );
+                    all.extend(trs);
+                }
+                if all.is_empty() {
+                    return Err(anyhow::anyhow!(
                     "GFF3 source(s) [{}] produced 0 transcripts — likely malformed, truncated, or unrecognized format. Refusing to continue with empty transcript set.",
                     gff3_specs.iter().map(|s| s.path.as_str()).collect::<Vec<_>>().join(", ")
                 ));
+                }
+                if gff3_specs.len() > 1 {
+                    eprintln!(
+                        "Merged {} GFF3 sources into {} total transcripts",
+                        gff3_specs.len(),
+                        all.len()
+                    );
+                }
+                all
             }
-            if gff3_specs.len() > 1 {
-                eprintln!("Merged {} GFF3 sources into {} total transcripts", gff3_specs.len(), all.len());
-            }
-            all
         }
-    }};
+    };
 
     // Load FASTA reference (prefer mmap with .fai index, fall back to in-memory).
     // Skipped in --sa-only mode.
@@ -250,8 +278,13 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
         let fai_path = format!("{}.fai", fasta_path);
         if Path::new(&fai_path).exists() {
             let reader = fastvep_cache::fasta::MmapFastaReader::open(Path::new(fasta_path))?;
-            eprintln!("Memory-mapped reference FASTA from {} (using .fai index)", fasta_path);
-            Some(Box::new(fastvep_cache::providers::MmapFastaSequenceProvider::new(reader)))
+            eprintln!(
+                "Memory-mapped reference FASTA from {} (using .fai index)",
+                fasta_path
+            );
+            Some(Box::new(
+                fastvep_cache::providers::MmapFastaSequenceProvider::new(reader),
+            ))
         } else {
             let fasta_file = File::open(fasta_path)
                 .with_context(|| format!("Opening FASTA file: {}", fasta_path))?;
@@ -264,7 +297,9 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     };
 
     // Build sequences for coding transcripts from FASTA (skip if loaded from cache with sequences)
-    let needs_seq_build = transcripts.iter().any(|t| t.is_coding() && t.spliced_seq.is_none());
+    let needs_seq_build = transcripts
+        .iter()
+        .any(|t| t.is_coding() && t.spliced_seq.is_none());
     if needs_seq_build {
         if let Some(ref sp) = seq_provider {
             let built = AtomicUsize::new(0);
@@ -274,13 +309,19 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                         sp.fetch_sequence(chrom, start, end)
                             .map_err(|e| e.to_string())
                     }) {
-                        eprintln!("Warning: could not build sequences for {}: {}", tr.stable_id, e);
+                        eprintln!(
+                            "Warning: could not build sequences for {}: {}",
+                            tr.stable_id, e
+                        );
                     } else {
                         built.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });
-            eprintln!("Built sequences for {} coding transcripts", built.load(Ordering::Relaxed));
+            eprintln!(
+                "Built sequences for {} coding transcripts",
+                built.load(Ordering::Relaxed)
+            );
         }
     }
 
@@ -313,7 +354,9 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             .with_context(|| format!("Reading cache info: {}", info_path.display()))?;
         eprintln!(
             "Loaded VEP cache info: species={}, assembly={}, {} variation columns",
-            cache_info.species, cache_info.assembly, cache_info.variation_cols.len()
+            cache_info.species,
+            cache_info.assembly,
+            cache_info.variation_cols.len()
         );
         Some(TabixVariationProvider::new(Path::new(dir), &cache_info)?)
     } else {
@@ -352,9 +395,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             let oga_count = std::fs::read_dir(Path::new(dir))
                 .map(|it| {
                     it.flatten()
-                        .filter(|e| {
-                            e.path().extension().and_then(|s| s.to_str()) == Some("oga")
-                        })
+                        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("oga"))
                         .count()
                 })
                 .unwrap_or(0);
@@ -494,12 +535,15 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
         .map(|gp| gp.json_key().to_string())
         .collect();
     let owned_vcf_info_ids = output::vcf_owned_info_ids(&sa_json_keys, &gene_json_keys);
-    let generated_vcf_headers =
-        output::vcf_info_header_lines(&sa_json_keys, &gene_json_keys, output::DEFAULT_CSQ_FIELDS, sa_only);
+    let generated_vcf_headers = output::vcf_info_header_lines(
+        &sa_json_keys,
+        &gene_json_keys,
+        output::DEFAULT_CSQ_FIELDS,
+        sa_only,
+    );
     // Precompute the loaded-source lookup once so the per-row tab writer
     // doesn't redo an O(specs × keys) membership scan for every variant.
-    let supplementary_specs =
-        output::LoadedSupplementarySpecs::new(&sa_json_keys, &gene_json_keys);
+    let supplementary_specs = output::LoadedSupplementarySpecs::new(&sa_json_keys, &gene_json_keys);
 
     // Write headers based on output format
     match config.output_format.as_str() {
@@ -562,7 +606,8 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
 
     loop {
         // Phase 1: Read a batch of variants (sequential - VCF parser is not Sync)
-        let mut batch: Vec<(VariationFeature, HashMap<String, Vec<MatchedVariant>>)> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<(VariationFeature, HashMap<String, Vec<MatchedVariant>>)> =
+            Vec::with_capacity(BATCH_SIZE);
         for _ in 0..BATCH_SIZE {
             match vcf_parser.next_variant()? {
                 Some(mut vf) => {
@@ -573,13 +618,15 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                             for alt in &vf.alt_alleles {
                                 let alt_str = alt.to_string();
                                 let ref_str = vf.ref_allele.to_string();
-                                let matches = vp.get_matched_variants(
-                                    &vf.position.chromosome,
-                                    vf.position.start,
-                                    vf.position.end,
-                                    &ref_str,
-                                    &alt_str,
-                                ).unwrap_or_default();
+                                let matches = vp
+                                    .get_matched_variants(
+                                        &vf.position.chromosome,
+                                        vf.position.start,
+                                        vf.position.end,
+                                        &ref_str,
+                                        &alt_str,
+                                    )
+                                    .unwrap_or_default();
                                 if !matches.is_empty() {
                                     by_allele.insert(alt_str, matches);
                                 }
@@ -593,17 +640,18 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                     for matches in matched_by_allele.values() {
                         for m in matches {
                             if !vf.existing_variants.iter().any(|kv| kv.name == m.name) {
-                                vf.existing_variants.push(fastvep_io::variant::KnownVariant {
-                                    name: m.name.clone(),
-                                    allele_string: None,
-                                    minor_allele: m.minor_allele.clone(),
-                                    minor_allele_freq: m.minor_allele_freq,
-                                    clinical_significance: m.clin_sig.clone(),
-                                    somatic: m.somatic,
-                                    phenotype_or_disease: m.phenotype_or_disease,
-                                    pubmed: m.pubmed.clone(),
-                                    frequencies: m.frequencies.clone(),
-                                });
+                                vf.existing_variants
+                                    .push(fastvep_io::variant::KnownVariant {
+                                        name: m.name.clone(),
+                                        allele_string: None,
+                                        minor_allele: m.minor_allele.clone(),
+                                        minor_allele_freq: m.minor_allele_freq,
+                                        clinical_significance: m.clin_sig.clone(),
+                                        somatic: m.somatic,
+                                        phenotype_or_disease: m.phenotype_or_disease,
+                                        pubmed: m.pubmed.clone(),
+                                        frequencies: m.frequencies.clone(),
+                                    });
                             }
                         }
                     }
@@ -623,9 +671,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             // Collect all positions in this batch, grouped by chromosome
             let mut chrom_positions: HashMap<&str, Vec<u64>> = HashMap::new();
             for (vf, _) in &batch {
-                let positions = chrom_positions
-                    .entry(&vf.position.chromosome)
-                    .or_default();
+                let positions = chrom_positions.entry(&vf.position.chromosome).or_default();
                 positions.push(vf.position.start);
                 if let Some(vcf) = &vf.vcf_fields {
                     if vcf.pos != vf.position.start {
@@ -1382,12 +1428,9 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                         explicit_ref: config.explicit_alleles,
                         qc_class: qc_label,
                     };
-                    for line in output::format_tab_line_with(
-                        vf,
-                        &supplementary_specs,
-                        sa_only,
-                        opts,
-                    ) {
+                    for line in
+                        output::format_tab_line_with(vf, &supplementary_specs, sa_only, opts)
+                    {
                         writeln!(writer, "{}", line)?;
                     }
                 }
@@ -1449,7 +1492,11 @@ fn pick_key(tv: &TranscriptVariation) -> (bool, bool, bool, u8, u8, u8, bool, u3
         !tv.canonical,
         appris_rank(tv.appris.as_deref()),
         tv.tsl.unwrap_or(u8::MAX),
-        if tv.biotype.as_ref() == "protein_coding" { 0 } else { 1 },
+        if tv.biotype.as_ref() == "protein_coding" {
+            0
+        } else {
+            1
+        },
         tv.ccds.is_none(),
         most_severe_rank,
         tv.transcript_id.as_ref(),
@@ -1476,7 +1523,11 @@ fn appris_rank(appris: Option<&str>) -> u8 {
         return u8::MAX - 1;
     };
     let n: u8 = digits.parse().unwrap_or(9);
-    if is_alt { 5u8.saturating_add(n) } else { n }
+    if is_alt {
+        5u8.saturating_add(n)
+    } else {
+        n
+    }
 }
 
 /// Extract trio genotype information from a VariationFeature's VCF sample columns (CLI path).
@@ -1506,8 +1557,7 @@ fn extract_trio_genotypes_cli(
     let format_str = &vcf_fields.rest[0];
     let sample_strs: Vec<&str> = vcf_fields.rest[1..].iter().map(|s| s.as_str()).collect();
 
-    let samples =
-        fastvep_io::sample::parse_samples(format_str, &sample_strs, sample_names);
+    let samples = fastvep_io::sample::parse_samples(format_str, &sample_strs, sample_names);
 
     let proband_gt = samples
         .iter()
@@ -1542,9 +1592,7 @@ fn sample_data_to_genotype_info_cli(
     let is_missing = gt.map_or(true, |g| g.is_missing());
     let is_phased = gt.map_or(false, |g| g.phased);
 
-    let alt_allele_index = gt.and_then(|g| {
-        g.alleles.iter().filter_map(|a| *a).find(|&a| a > 0)
-    });
+    let alt_allele_index = gt.and_then(|g| g.alleles.iter().filter_map(|a| *a).find(|&a| a > 0));
 
     fastvep_classification::GenotypeInfo {
         is_het,
@@ -1795,8 +1843,14 @@ fn write_vcf_line(writer: &mut impl Write, vf: &VariationFeature, sa_only: bool)
         write!(
             writer,
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            fields.chrom, fields.pos, fields.id, fields.ref_allele, fields.alt,
-            fields.qual, fields.filter, info
+            fields.chrom,
+            fields.pos,
+            fields.id,
+            fields.ref_allele,
+            fields.alt,
+            fields.qual,
+            fields.filter,
+            info
         )?;
 
         for rest_field in &fields.rest {
@@ -1807,7 +1861,6 @@ fn write_vcf_line(writer: &mut impl Write, vf: &VariationFeature, sa_only: bool)
 
     Ok(())
 }
-
 
 use serde_json;
 
@@ -1857,7 +1910,12 @@ pub fn run_filter(input: &str, output_path: &str, filter_expr: &str) -> Result<(
                     eprintln!(
                         "[filter] CSQ format: {} fields ({})",
                         csq_fields.len(),
-                        csq_fields.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                        csq_fields
+                            .iter()
+                            .take(5)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
             }
@@ -1947,13 +2005,15 @@ pub fn run_cache_build(
     let _cache_build_lock = acquire_cache_build_lock(output_path)?;
 
     if gff3_paths.is_empty() {
-        return Err(anyhow::anyhow!("`fastvep cache` requires at least one --gff3"));
+        return Err(anyhow::anyhow!(
+            "`fastvep cache` requires at least one --gff3"
+        ));
     }
     let specs: Vec<Gff3Spec> = gff3_paths.iter().map(|s| parse_gff3_arg(s)).collect();
     let mut transcripts: Vec<fastvep_genome::Transcript> = Vec::new();
     for spec in &specs {
-        let gff_file = File::open(&spec.path)
-            .with_context(|| format!("Opening GFF3 file: {}", spec.path))?;
+        let gff_file =
+            File::open(&spec.path).with_context(|| format!("Opening GFF3 file: {}", spec.path))?;
         // Auto-decompress .gz / .bgz GFF3 inputs. Without this we'd silently
         // produce a 0-transcript cache.
         let trs = if spec.path.ends_with(".gz") || spec.path.ends_with(".bgz") {
@@ -1963,18 +2023,28 @@ pub fn run_cache_build(
         };
         eprintln!(
             "Loaded {} transcripts from {} (source label: {})",
-            trs.len(), spec.path, spec.source
+            trs.len(),
+            spec.path,
+            spec.source
         );
         transcripts.extend(trs);
     }
     if transcripts.is_empty() {
         return Err(anyhow::anyhow!(
             "GFF3 source(s) [{}] produced 0 transcripts — refusing to write an empty cache.",
-            specs.iter().map(|s| s.path.as_str()).collect::<Vec<_>>().join(", ")
+            specs
+                .iter()
+                .map(|s| s.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if specs.len() > 1 {
-        eprintln!("Merged {} GFF3 sources into {} total transcripts", specs.len(), transcripts.len());
+        eprintln!(
+            "Merged {} GFF3 sources into {} total transcripts",
+            specs.len(),
+            transcripts.len()
+        );
     }
 
     // Chromosome synonyms (VEP `chr_synonyms.txt`). An empty table still
@@ -1990,8 +2060,8 @@ pub fn run_cache_build(
     };
 
     if let Some(fasta) = fasta_path {
-        let fasta_file = File::open(fasta)
-            .with_context(|| format!("Opening FASTA file: {}", fasta))?;
+        let fasta_file =
+            File::open(fasta).with_context(|| format!("Opening FASTA file: {}", fasta))?;
         let reader = FastaReader::from_reader(fasta_file)?;
         eprintln!("Loaded reference FASTA from {}", fasta);
 
@@ -2001,8 +2071,11 @@ pub fn run_cache_build(
         // `annotate` matches a VCF regardless of which GFF3 the transcript
         // came from. RefSeq accessions only resolve when a synonyms file maps
         // them; chr↔bare / mito resolve with no synonyms file at all.
-        let contigs: std::collections::HashSet<String> =
-            reader.sequence_names().into_iter().map(|s| s.to_string()).collect();
+        let contigs: std::collections::HashSet<String> = reader
+            .sequence_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut resolved: HashMap<String, Option<std::sync::Arc<str>>> = HashMap::new();
         let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tr in &mut transcripts {
@@ -2055,7 +2128,10 @@ pub fn run_cache_build(
                     sp.fetch_sequence(chrom, start, end)
                         .map_err(|e| e.to_string())
                 }) {
-                    eprintln!("Warning: could not build sequences for {}: {}", tr.stable_id, e);
+                    eprintln!(
+                        "Warning: could not build sequences for {}: {}",
+                        tr.stable_id, e
+                    );
                 } else {
                     meter.update();
                 }
@@ -2169,11 +2245,15 @@ fn load_one_gff3(
 
     if spec.path.ends_with(".gz") && Path::new(&tbi_path).exists() {
         let regions = prescan_vcf_regions(vcf_input, distance)?;
-        eprintln!("Pre-scanned {} variant regions for {}", regions.len(), spec.path);
+        eprintln!(
+            "Pre-scanned {} variant regions for {}",
+            regions.len(),
+            spec.path
+        );
         fastvep_cache::gff::parse_gff3_indexed_with_source(gff_path, &regions, &spec.source)
     } else {
-        let gff_file = File::open(&spec.path)
-            .with_context(|| format!("Opening GFF3 file: {}", spec.path))?;
+        let gff_file =
+            File::open(&spec.path).with_context(|| format!("Opening GFF3 file: {}", spec.path))?;
         if spec.path.ends_with(".gz") || spec.path.ends_with(".bgz") {
             parse_gff3_with_source(flate2::read::MultiGzDecoder::new(gff_file), &spec.source)
         } else {
@@ -2191,10 +2271,18 @@ fn prescan_vcf_regions(vcf_path: &str, distance: u64) -> Result<Vec<(String, u64
 
     for line in reader.lines() {
         let line = line?;
-        if line.starts_with('#') || line.is_empty() { continue; }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
         let mut fields = line.split('\t');
-        let chrom = match fields.next() { Some(c) => c.to_string(), None => continue };
-        let pos: u64 = match fields.next().and_then(|p| p.parse().ok()) { Some(p) => p, None => continue };
+        let chrom = match fields.next() {
+            Some(c) => c.to_string(),
+            None => continue,
+        };
+        let pos: u64 = match fields.next().and_then(|p| p.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
         let start = pos.saturating_sub(distance);
         let end = pos + distance;
 
@@ -2203,7 +2291,10 @@ fn prescan_vcf_regions(vcf_path: &str, distance: u64) -> Result<Vec<(String, u64
         entry.1 = entry.1.max(end);
     }
 
-    Ok(regions.into_iter().map(|(chrom, (s, e))| (chrom, s, e)).collect())
+    Ok(regions
+        .into_iter()
+        .map(|(chrom, (s, e))| (chrom, s, e))
+        .collect())
 }
 
 // =============================================================================
@@ -2281,7 +2372,10 @@ fn open_sa_input(
     // Count compressed bytes before sniffing/decompression so stdin progress
     // and integrity accounting include every byte received.
     let raw: Box<dyn io::Read> = match byte_counter {
-        Some(bytes) => Box::new(crate::progress::CountingReader { inner: source, bytes }),
+        Some(bytes) => Box::new(crate::progress::CountingReader {
+            inner: source,
+            bytes,
+        }),
         None => source,
     };
     let mut buffered = io::BufReader::new(raw);
@@ -2481,8 +2575,8 @@ fn run_streaming_sa_build<'a, I>(
 where
     I: Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>>,
 {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
 
     let output_path = Path::new(output);
     let mut writer = fastvep_sa::writer::SaWriter::new(header);
@@ -2501,7 +2595,10 @@ where
         } else {
             reader
         };
-        iterators.push(make_iter(io::BufReader::new(reader), chrom_map));
+        iterators.push(make_iter(
+            io::BufReader::with_capacity(1024 * 1024, reader),
+            chrom_map,
+        ));
     }
 
     let mut meter = if show_progress && file_size > 0 {
@@ -2511,9 +2608,8 @@ where
     };
 
     let records = MergedRecordIter::new(iterators, chromosome).map(|record| {
-        let record = record.and_then(|record| {
-            filter_supplementary_record(source, record, selected_fields)
-        });
+        let record =
+            record.and_then(|record| filter_supplementary_record(source, record, selected_fields));
         if record.is_ok() {
             meter.update();
         }
@@ -2545,14 +2641,40 @@ where
 fn supplementary_field_allowlist(source: &str) -> Option<&'static [&'static str]> {
     match source {
         "clinvar" => Some(&[
-            "significance", "reviewStatus", "phenotypes", "variantClass", "soAccession",
-            "afExac", "afTgp", "afEsp", "geneInfo", "diseaseDatabases",
-            "molecularConsequences", "origin", "conflictingSignificance",
+            "significance",
+            "reviewStatus",
+            "phenotypes",
+            "variantClass",
+            "soAccession",
+            "afExac",
+            "afTgp",
+            "afEsp",
+            "geneInfo",
+            "diseaseDatabases",
+            "molecularConsequences",
+            "origin",
+            "conflictingSignificance",
         ]),
         "gnomad" => Some(&[
-            "allAf", "allAn", "allAc", "allHc", "afrAf", "amrAf", "asjAf", "easAf",
-            "finAf", "midAf", "nfeAf", "othAf", "remainingAf", "sasAf", "filters",
-            "faf95", "faf99", "grpmaxAf", "grpmaxPopulation",
+            "allAf",
+            "allAn",
+            "allAc",
+            "allHc",
+            "afrAf",
+            "amrAf",
+            "asjAf",
+            "easAf",
+            "finAf",
+            "midAf",
+            "nfeAf",
+            "othAf",
+            "remainingAf",
+            "sasAf",
+            "filters",
+            "faf95",
+            "faf99",
+            "grpmaxAf",
+            "grpmaxPopulation",
         ]),
         "dbsnp" => Some(&["id", "globalMaf", "variantType", "common"]),
         "phylop" => Some(&["score"]),
@@ -2605,6 +2727,10 @@ fn filter_supplementary_record(
     if matches!(source, "phylop" | "gerp" | "dann") {
         return Ok(record);
     }
+    if supplementary_field_allowlist(source).is_some_and(|allowed| selected.len() == allowed.len())
+    {
+        return Ok(record);
+    }
     let mut value: serde_json::Value = serde_json::from_str(&record.json)
         .with_context(|| format!("Filtering {source} supplementary fields"))?;
     let object = value
@@ -2653,6 +2779,25 @@ mod supplementary_field_tests {
             );
         }
     }
+
+    #[test]
+    fn selecting_every_field_preserves_adapter_json_bytes() {
+        let selected = supplementary_field_allowlist("spliceai")
+            .unwrap()
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect();
+        let record = fastvep_sa::common::AnnotationRecord {
+            chrom_idx: 0,
+            position: 1,
+            ref_allele: "A".into(),
+            alt_allele: "G".into(),
+            json: r#"{"gene":"GENE1","dsAg":0.1}"#.into(),
+        };
+        let original = record.json.clone();
+        let filtered = filter_supplementary_record("spliceai", record, Some(&selected)).unwrap();
+        assert_eq!(filtered.json, original);
+    }
 }
 
 /// PhyloP comes in two on-disk formats: UCSC fixed-step wig (`fixedStep
@@ -2678,7 +2823,11 @@ fn iter_phylop_auto<'a, R: BufRead + 'a>(
     if prefix.trim_start().starts_with("fixedStep") {
         Box::new(fastvep_sa::sources::scores::iter_wigfix(buf, chrom_to_idx))
     } else {
-        Box::new(fastvep_sa::sources::scores::iter_score_tsv(buf, chrom_to_idx, false))
+        Box::new(fastvep_sa::sources::scores::iter_score_tsv(
+            buf,
+            chrom_to_idx,
+            false,
+        ))
     }
 }
 
@@ -2737,12 +2886,14 @@ pub fn run_sa_build_inputs(
     };
     let input = inputs[0].as_str();
     let selected_fields = annocat_selected_source_fields(source)?;
-    let framed_input = inputs.len() != 1
-        || normalized_skips.iter().any(|skip| *skip != 0)
-        || chromosome.is_some();
+    let framed_input =
+        inputs.len() != 1 || normalized_skips.iter().any(|skip| *skip != 0) || chromosome.is_some();
 
     // Gene-level sources (.oga) — dispatched separately from variant-level (.osa).
-    if matches!(source, "omim" | "gnomad_genes" | "gnomad_gene" | "clinvar_protein") {
+    if matches!(
+        source,
+        "omim" | "gnomad_genes" | "gnomad_gene" | "clinvar_protein"
+    ) {
         if framed_input {
             anyhow::bail!("gene source '{source}' requires one complete input");
         }
@@ -2955,21 +3106,57 @@ pub fn run_sa_build_inputs(
     match source {
         "spliceai" => {
             return run_streaming_sa_build(
-                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
-                selected_fields.as_ref(),
-                |r, m| fastvep_sa::sources::spliceai::iter_spliceai_vcf(r, m),
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                None,
+                |r, m| {
+                    fastvep_sa::sources::spliceai::iter_spliceai_vcf_selected(
+                        r,
+                        m,
+                        selected_fields.as_ref(),
+                    )
+                },
             );
         }
         "gnomad" => {
             return run_streaming_sa_build(
-                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
-                selected_fields.as_ref(),
-                |r, m| fastvep_sa::sources::gnomad::iter_gnomad_vcf(r, m),
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                None,
+                |r, m| {
+                    fastvep_sa::sources::gnomad::iter_gnomad_vcf_selected(
+                        r,
+                        m,
+                        selected_fields.as_ref(),
+                    )
+                },
             );
         }
         "dbnsfp" => {
             return run_streaming_sa_build(
-                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::dbnsfp::iter_dbnsfp(r, m),
             );
@@ -2985,41 +3172,96 @@ pub fn run_sa_build_inputs(
                 &chrom_map,
                 &chrom_list,
                 show_progress,
-                selected_fields.as_ref(),
-                |r, m| fastvep_sa::sources::cadd::iter_cadd(r, m),
+                None,
+                |r, m| {
+                    fastvep_sa::sources::cadd::iter_cadd_selected(r, m, selected_fields.as_ref())
+                },
             );
         }
         "revel" => {
             return run_streaming_sa_build(
-                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
-                selected_fields.as_ref(),
-                |r, m| fastvep_sa::sources::revel::iter_revel(r, m, 2),
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                None,
+                |r, m| {
+                    fastvep_sa::sources::revel::iter_revel_selected(
+                        r,
+                        m,
+                        2,
+                        selected_fields.as_ref(),
+                    )
+                },
             );
         }
         "dbsnp" => {
             return run_streaming_sa_build(
-                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
-                selected_fields.as_ref(),
-                |r, m| fastvep_sa::sources::dbsnp::iter_dbsnp_vcf(r, m),
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                None,
+                |r, m| {
+                    fastvep_sa::sources::dbsnp::iter_dbsnp_vcf_selected(
+                        r,
+                        m,
+                        selected_fields.as_ref(),
+                    )
+                },
             );
         }
         "topmed" => {
             return run_streaming_sa_build(
-                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::topmed::iter_topmed_vcf(r, m),
             );
         }
         "phylop" => {
             return run_streaming_sa_build(
-                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
                 selected_fields.as_ref(),
                 |r, m| iter_phylop_auto(r, m),
             );
         }
         "gerp" | "dann" => {
             return run_streaming_sa_build(
-                source, inputs, &normalized_skips, chromosome_idx, output, header, &chrom_map, &chrom_list, show_progress,
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
                 selected_fields.as_ref(),
                 |r, m| fastvep_sa::sources::scores::iter_score_tsv(r, m, false),
             );
@@ -3030,26 +3272,34 @@ pub fn run_sa_build_inputs(
     if inputs.len() != 1 || normalized_skips[0] != 0 || chromosome.is_some() {
         anyhow::bail!("source '{source}' does not support framed or multiple inputs");
     }
-    let buf_reader = io::BufReader::new(open_sa_input(input, None, 0)?);
+    let buf_reader = io::BufReader::with_capacity(1024 * 1024, open_sa_input(input, None, 0)?);
 
     eprintln!(
         "INFO  ProgressMeter - Parsing '{}': {} -> {}",
-        source, input,
+        source,
+        input,
         Path::new(output).with_extension("osa").display()
     );
     let t_parse = std::time::Instant::now();
 
     let records = match source {
-        "clinvar" => fastvep_sa::sources::clinvar::parse_clinvar_vcf(buf_reader, &chrom_map)?,
+        "clinvar" => fastvep_sa::sources::clinvar::parse_clinvar_vcf_selected(
+            buf_reader,
+            &chrom_map,
+            selected_fields.as_ref(),
+        )?,
         "cosmic" => fastvep_sa::sources::cosmic::parse_cosmic_vcf(buf_reader, &chrom_map)?,
         "onekg" | "1000g" => fastvep_sa::sources::onekg::parse_onekg_vcf(buf_reader, &chrom_map)?,
         "mitomap" => fastvep_sa::sources::mitomap::parse_mitomap(buf_reader, &chrom_map)?,
         "primateai" => fastvep_sa::sources::primateai::parse_primateai(buf_reader, &chrom_map)?,
         _ => unreachable!(),
     };
+    let remaining_filter = (source != "clinvar")
+        .then_some(selected_fields.as_ref())
+        .flatten();
     let records = records
         .into_iter()
-        .map(|record| filter_supplementary_record(source, record, selected_fields.as_ref()))
+        .map(|record| filter_supplementary_record(source, record, remaining_filter))
         .collect::<Result<Vec<_>>>()?;
 
     let n = records.len() as u64;
@@ -3159,7 +3409,11 @@ fn run_custom_vcf_build(
         "Building custom_vcf .osa from: {} (name={}, info_fields={})",
         input,
         resolved_name,
-        if info_fields.is_empty() { "<all>".to_string() } else { info_fields.join(",") }
+        if info_fields.is_empty() {
+            "<all>".to_string()
+        } else {
+            info_fields.join(",")
+        }
     );
 
     let header = IndexHeader {
@@ -3176,14 +3430,10 @@ fn run_custom_vcf_build(
 
     // Use the same magic-sniffing reader as built-in VCF sources so explicit
     // `custom_vcf --input -` supports plain or gzip/BGZF stdin as promised.
-    let buf_reader = io::BufReader::new(open_sa_input(input, None, 0)?);
+    let buf_reader = io::BufReader::with_capacity(1024 * 1024, open_sa_input(input, None, 0)?);
 
-    let records = fastvep_sa::custom::parse_custom_vcf(
-        buf_reader,
-        &chrom_map,
-        &header.name,
-        info_fields,
-    )?;
+    let records =
+        fastvep_sa::custom::parse_custom_vcf(buf_reader, &chrom_map, &header.name, info_fields)?;
     if records.is_empty() {
         // Build proceeds (writes an empty .osa rather than failing) so the
         // user can iterate on their filter, but call this out clearly —
@@ -3227,14 +3477,13 @@ fn run_custom_bed_build(
         input, resolved_name
     );
 
-    let file = File::open(input)
-        .with_context(|| format!("Opening input file: {}", input))?;
+    let file = File::open(input).with_context(|| format!("Opening input file: {}", input))?;
     let reader: Box<dyn io::Read> = if input.ends_with(".gz") || input.ends_with(".bgz") {
         Box::new(flate2::read::MultiGzDecoder::new(file))
     } else {
         Box::new(file)
     };
-    let buf_reader = io::BufReader::new(reader);
+    let buf_reader = io::BufReader::with_capacity(1024 * 1024, reader);
 
     let records = fastvep_sa::custom::parse_custom_bed(buf_reader, &chrom_map)?;
     if records.is_empty() {
@@ -3303,14 +3552,13 @@ pub fn run_oga_build(source: &str, input: &str, output: &str, _assembly: &str) -
 
     eprintln!("Building {} .oga from: {}", source, input);
 
-    let file = File::open(input)
-        .with_context(|| format!("Opening input file: {}", input))?;
+    let file = File::open(input).with_context(|| format!("Opening input file: {}", input))?;
     let reader: Box<dyn io::Read> = if input.ends_with(".gz") || input.ends_with(".bgz") {
         Box::new(flate2::read::MultiGzDecoder::new(file))
     } else {
         Box::new(file)
     };
-    let buf_reader = io::BufReader::new(reader);
+    let buf_reader = io::BufReader::with_capacity(1024 * 1024, reader);
 
     let records = match source {
         "omim" => fastvep_sa::sources::omim::parse_omim_genemap(buf_reader)?,
@@ -3417,12 +3665,28 @@ mod pick_tests {
     #[test]
     fn pick_prefers_mane_select_over_canonical() {
         let tvs = vec![
-            make_tv("TX_CANON", true, "protein_coding",
+            make_tv(
+                "TX_CANON",
+                true,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, None, None, None),
-            make_tv("TX_MANE", false, "protein_coding",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_MANE",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                Some("TX_MANE.1"), None, None, None, None),
+                Some("TX_MANE.1"),
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3430,12 +3694,28 @@ mod pick_tests {
     #[test]
     fn pick_prefers_mane_plus_clinical_over_canonical() {
         let tvs = vec![
-            make_tv("TX_CANON", true, "protein_coding",
+            make_tv(
+                "TX_CANON",
+                true,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, None, None, None),
-            make_tv("TX_MANE_PC", false, "protein_coding",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_MANE_PC",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, Some("TX_MANE_PC.1"), None, None, None),
+                None,
+                Some("TX_MANE_PC.1"),
+                None,
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3443,12 +3723,28 @@ mod pick_tests {
     #[test]
     fn pick_prefers_mane_select_over_mane_plus_clinical() {
         let tvs = vec![
-            make_tv("TX_MANE_PC", true, "protein_coding",
+            make_tv(
+                "TX_MANE_PC",
+                true,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, Some("TX_MANE_PC.1"), None, None, None),
-            make_tv("TX_MANE", false, "protein_coding",
+                None,
+                Some("TX_MANE_PC.1"),
+                None,
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_MANE",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                Some("TX_MANE.1"), None, None, None, None),
+                Some("TX_MANE.1"),
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3456,12 +3752,28 @@ mod pick_tests {
     #[test]
     fn pick_falls_back_to_canonical_when_no_mane() {
         let tvs = vec![
-            make_tv("TX_NONCAN", false, "protein_coding",
+            make_tv(
+                "TX_NONCAN",
+                false,
+                "protein_coding",
                 vec![Consequence::StopGained],
-                None, None, None, None, None),
-            make_tv("TX_CANON", true, "protein_coding",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_CANON",
+                true,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, None, None, None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         // Canonical wins even though TX_NONCAN has a more severe consequence.
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
@@ -3470,12 +3782,28 @@ mod pick_tests {
     #[test]
     fn pick_prefers_protein_coding_biotype() {
         let tvs = vec![
-            make_tv("TX_NONCODING", false, "lncRNA",
+            make_tv(
+                "TX_NONCODING",
+                false,
+                "lncRNA",
                 vec![Consequence::MissenseVariant],
-                None, None, None, None, None),
-            make_tv("TX_PC", false, "protein_coding",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_PC",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, None, None, None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3483,12 +3811,28 @@ mod pick_tests {
     #[test]
     fn pick_uses_severity_when_other_fields_equal() {
         let tvs = vec![
-            make_tv("TX_A", false, "protein_coding",
+            make_tv(
+                "TX_A",
+                false,
+                "protein_coding",
                 vec![Consequence::SynonymousVariant],
-                None, None, None, None, None),
-            make_tv("TX_B", false, "protein_coding",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_B",
+                false,
+                "protein_coding",
                 vec![Consequence::StopGained],
-                None, None, None, None, None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3496,12 +3840,28 @@ mod pick_tests {
     #[test]
     fn pick_tie_breaks_alphabetically_on_transcript_id() {
         let tvs = vec![
-            make_tv("TX_Z", false, "protein_coding",
+            make_tv(
+                "TX_Z",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, None, None, None),
-            make_tv("TX_A", false, "protein_coding",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_A",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, None, None, None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3509,12 +3869,28 @@ mod pick_tests {
     #[test]
     fn pick_prefers_lower_tsl() {
         let tvs = vec![
-            make_tv("TX_TSL5", false, "protein_coding",
+            make_tv(
+                "TX_TSL5",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, None, Some(5), None),
-            make_tv("TX_TSL1", false, "protein_coding",
+                None,
+                None,
+                None,
+                Some(5),
+                None,
+            ),
+            make_tv(
+                "TX_TSL1",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, None, Some(1), None),
+                None,
+                None,
+                None,
+                Some(1),
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3524,12 +3900,28 @@ mod pick_tests {
         // P1 should beat P3 even though both are APPRIS-tagged — would fail
         // if APPRIS were compared by presence-only.
         let tvs = vec![
-            make_tv("TX_P3", false, "protein_coding",
+            make_tv(
+                "TX_P3",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, Some("P3"), None, None),
-            make_tv("TX_P1", false, "protein_coding",
+                None,
+                None,
+                Some("P3"),
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_P1",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, Some("P1"), None, None),
+                None,
+                None,
+                Some("P1"),
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3537,12 +3929,28 @@ mod pick_tests {
     #[test]
     fn pick_prefers_principal_over_alternative_appris() {
         let tvs = vec![
-            make_tv("TX_A1", false, "protein_coding",
+            make_tv(
+                "TX_A1",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, Some("A1"), None, None),
-            make_tv("TX_P5", false, "protein_coding",
+                None,
+                None,
+                Some("A1"),
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_P5",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, Some("P5"), None, None),
+                None,
+                None,
+                Some("P5"),
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3551,12 +3959,28 @@ mod pick_tests {
     fn pick_accepts_long_form_appris_tags() {
         // Ensembl GFF3 sometimes uses "principal1" / "alternative2".
         let tvs = vec![
-            make_tv("TX_ALT", false, "protein_coding",
+            make_tv(
+                "TX_ALT",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, Some("alternative2"), None, None),
-            make_tv("TX_PRINC", false, "protein_coding",
+                None,
+                None,
+                Some("alternative2"),
+                None,
+                None,
+            ),
+            make_tv(
+                "TX_PRINC",
+                false,
+                "protein_coding",
                 vec![Consequence::MissenseVariant],
-                None, None, Some("principal1"), None, None),
+                None,
+                None,
+                Some("principal1"),
+                None,
+                None,
+            ),
         ];
         assert_eq!(pick_best_transcript_idx(&tvs), Some(1));
     }
@@ -3822,7 +4246,15 @@ mod custom_source_tests {
         )
         .expect_err("must error on unknown source");
         let msg = format!("{}", err);
-        assert!(msg.contains("custom_vcf"), "error message must mention custom_vcf: {}", msg);
-        assert!(msg.contains("custom_bed"), "error message must mention custom_bed: {}", msg);
+        assert!(
+            msg.contains("custom_vcf"),
+            "error message must mention custom_vcf: {}",
+            msg
+        );
+        assert!(
+            msg.contains("custom_bed"),
+            "error message must mention custom_bed: {}",
+            msg
+        );
     }
 }

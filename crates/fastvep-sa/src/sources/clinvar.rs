@@ -5,7 +5,7 @@
 
 use crate::common::{escape_json, AnnotationRecord};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
 /// Parse a ClinVar VCF file and produce sorted `AnnotationRecord`s.
@@ -16,10 +16,28 @@ pub fn parse_clinvar_vcf<R: BufRead>(
     reader: R,
     chrom_to_idx: &HashMap<String, u16>,
 ) -> Result<Vec<AnnotationRecord>> {
-    let mut records = Vec::new();
+    parse_clinvar_vcf_selected(reader, chrom_to_idx, None)
+}
 
-    for line in reader.lines() {
-        let line = line.context("Reading ClinVar VCF line")?;
+/// Parse ClinVar while emitting only the requested cache fields.
+pub fn parse_clinvar_vcf_selected<R: BufRead>(
+    mut reader: R,
+    chrom_to_idx: &HashMap<String, u16>,
+    selected_fields: Option<&HashSet<String>>,
+) -> Result<Vec<AnnotationRecord>> {
+    let mut records = Vec::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .context("Reading ClinVar VCF line")?
+            == 0
+        {
+            break;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
         if line.starts_with('#') {
             continue;
         }
@@ -52,12 +70,12 @@ pub fn parse_clinvar_vcf<R: BufRead>(
         let clndn = info_map.get("CLNDN").cloned().unwrap_or_default();
         let clnacc = info_map.get("CLNVC").cloned(); // variant class
         let clnid = info_map.get("CLNVCSO").cloned(); // SO accession
-        // ClinVar-distributed population allele frequencies (ExAC / 1000G / ESP).
-        // Used as a frequency backstop by PM2 when gnomAD has no record. Reject
-        // non-finite values: `f64::from_str` accepts "inf"/"nan", whose Display
-        // form is invalid JSON and would poison the entire record's JSON string
-        // (silently dropping its ClinVar annotation). Real ClinVar AFs are
-        // always finite decimals, so this only guards against malformed input.
+                                                      // ClinVar-distributed population allele frequencies (ExAC / 1000G / ESP).
+                                                      // Used as a frequency backstop by PM2 when gnomAD has no record. Reject
+                                                      // non-finite values: `f64::from_str` accepts "inf"/"nan", whose Display
+                                                      // form is invalid JSON and would poison the entire record's JSON string
+                                                      // (silently dropping its ClinVar annotation). Real ClinVar AFs are
+                                                      // always finite decimals, so this only guards against malformed input.
         let parse_af = |k: &str| {
             info_map
                 .get(k)
@@ -84,6 +102,7 @@ pub fn parse_clinvar_vcf<R: BufRead>(
                 af_tgp,
                 af_esp,
                 &info_map,
+                selected_fields,
             );
 
             records.push(AnnotationRecord {
@@ -97,7 +116,11 @@ pub fn parse_clinvar_vcf<R: BufRead>(
     }
 
     // Sort by (chrom_idx, position) as required by SaWriter
-    records.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
+    records.sort_by(|a, b| {
+        a.chrom_idx
+            .cmp(&b.chrom_idx)
+            .then(a.position.cmp(&b.position))
+    });
 
     Ok(records)
 }
@@ -113,10 +136,12 @@ fn build_clinvar_json(
     af_tgp: Option<f64>,
     af_esp: Option<f64>,
     info_map: &HashMap<String, String>,
+    selected_fields: Option<&HashSet<String>>,
 ) -> String {
     let mut parts = Vec::new();
+    let includes = |field: &str| selected_fields.is_none_or(|fields| fields.contains(field));
 
-    if !clnsig.is_empty() {
+    if includes("significance") && !clnsig.is_empty() {
         let sigs: Vec<String> = clnsig
             .split('|')
             .map(|s| format!("\"{}\"", escape_json(s)))
@@ -124,14 +149,11 @@ fn build_clinvar_json(
         parts.push(format!("\"significance\":[{}]", sigs.join(",")));
     }
 
-    if !clnrevstat.is_empty() {
-        parts.push(format!(
-            "\"reviewStatus\":\"{}\"",
-            escape_json(clnrevstat)
-        ));
+    if includes("reviewStatus") && !clnrevstat.is_empty() {
+        parts.push(format!("\"reviewStatus\":\"{}\"", escape_json(clnrevstat)));
     }
 
-    if !clndn.is_empty() && clndn != "not_provided" {
+    if includes("phenotypes") && !clndn.is_empty() && clndn != "not_provided" {
         let diseases: Vec<String> = clndn
             .split('|')
             .filter(|s| *s != "not_provided")
@@ -142,24 +164,34 @@ fn build_clinvar_json(
         }
     }
 
-    if let Some(vc) = clnvc {
-        parts.push(format!("\"variantClass\":\"{}\"", escape_json(vc)));
+    if includes("variantClass") {
+        if let Some(vc) = clnvc {
+            parts.push(format!("\"variantClass\":\"{}\"", escape_json(vc)));
+        }
     }
 
-    if let Some(vcso) = clnvcso {
-        parts.push(format!("\"soAccession\":\"{}\"", escape_json(vcso)));
+    if includes("soAccession") {
+        if let Some(vcso) = clnvcso {
+            parts.push(format!("\"soAccession\":\"{}\"", escape_json(vcso)));
+        }
     }
 
     // Population AFs are finite floats (parsed via f64::from_str); Display emits
     // plain decimal JSON numbers (never NaN/inf), so this stays valid JSON.
-    if let Some(af) = af_exac {
-        parts.push(format!("\"afExac\":{}", af));
+    if includes("afExac") {
+        if let Some(af) = af_exac {
+            parts.push(format!("\"afExac\":{}", af));
+        }
     }
-    if let Some(af) = af_tgp {
-        parts.push(format!("\"afTgp\":{}", af));
+    if includes("afTgp") {
+        if let Some(af) = af_tgp {
+            parts.push(format!("\"afTgp\":{}", af));
+        }
     }
-    if let Some(af) = af_esp {
-        parts.push(format!("\"afEsp\":{}", af));
+    if includes("afEsp") {
+        if let Some(af) = af_esp {
+            parts.push(format!("\"afEsp\":{}", af));
+        }
     }
 
     for (info_field, output_field) in [
@@ -169,6 +201,9 @@ fn build_clinvar_json(
         ("ORIGIN", "origin"),
         ("CLNSIGCONF", "conflictingSignificance"),
     ] {
+        if !includes(output_field) {
+            continue;
+        }
         if let Some(value) = info_map.get(info_field).filter(|value| !value.is_empty()) {
             parts.push(format!("\"{}\":\"{}\"", output_field, escape_json(value)));
         }
@@ -274,5 +309,21 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&records[0].json).unwrap();
         assert!(v.get("afExac").is_none());
         assert_eq!(v.get("afEsp").and_then(|x| x.as_f64()), Some(0.0016));
+    }
+
+    #[test]
+    fn selected_fields_are_emitted_directly() {
+        let vcf =
+            "1\t12345\trs1\tA\tG\t.\t.\tCLNSIG=Pathogenic;CLNREVSTAT=reviewed;CLNDN=Disease\n";
+        let map = HashMap::from([("chr1".to_string(), 0)]);
+        let selected = ["significance".to_string()].into_iter().collect();
+        let record = parse_clinvar_vcf_selected(vcf.as_bytes(), &map, Some(&selected))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&record.json).unwrap(),
+            serde_json::json!({"significance": ["Pathogenic"]})
+        );
     }
 }

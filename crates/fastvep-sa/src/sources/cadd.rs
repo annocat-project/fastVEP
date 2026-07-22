@@ -2,24 +2,43 @@
 
 use crate::common::AnnotationRecord;
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
 pub fn iter_cadd<'a, R: BufRead>(
     reader: R,
     chrom_to_idx: &'a HashMap<String, u16>,
 ) -> CaddRecordIter<'a, R> {
+    iter_cadd_selected(reader, chrom_to_idx, None)
+}
+
+/// Stream CADD records while constructing only the fields selected by the
+/// caller. Keeping this at the source adapter avoids serializing a complete
+/// JSON object only for the CLI to parse and filter it again.
+pub fn iter_cadd_selected<'a, R: BufRead>(
+    reader: R,
+    chrom_to_idx: &'a HashMap<String, u16>,
+    selected_fields: Option<&HashSet<String>>,
+) -> CaddRecordIter<'a, R> {
+    let include_raw = selected_fields.is_none_or(|fields| fields.contains("raw"));
+    let include_phred = selected_fields.is_none_or(|fields| fields.contains("phred"));
     CaddRecordIter {
-        lines: reader.lines(),
+        reader,
+        line: String::new(),
         chrom_to_idx,
         line_number: 0,
+        include_raw,
+        include_phred,
     }
 }
 
 pub struct CaddRecordIter<'a, R: BufRead> {
-    lines: std::io::Lines<R>,
+    reader: R,
+    line: String,
     chrom_to_idx: &'a HashMap<String, u16>,
     line_number: u64,
+    include_raw: bool,
+    include_phred: bool,
 }
 
 impl<R: BufRead> Iterator for CaddRecordIter<'_, R> {
@@ -27,48 +46,114 @@ impl<R: BufRead> Iterator for CaddRecordIter<'_, R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let line = match self.lines.next()? {
-                Ok(line) => line,
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => return None,
+                Ok(_) => {}
                 Err(error) => return Some(Err(error).context("Reading CADD score line")),
             };
             self.line_number += 1;
+            let line = self.line.trim_end_matches(['\r', '\n']);
             if line.starts_with('#') || line.trim().is_empty() {
                 continue;
             }
-            let fields = line.split('\t').collect::<Vec<_>>();
-            if fields.len() < 6 {
-                return Some(Err(anyhow!("CADD line {} has fewer than six columns", self.line_number)));
-            }
-            let chrom = normalize_chrom(fields[0]);
-            let Some(&chrom_idx) = self.chrom_to_idx.get(&chrom) else { continue; };
-            let position = match fields[1].parse::<u32>() {
+            let mut fields = line.split('\t');
+            let Some(chrom_field) = fields.next() else {
+                continue;
+            };
+            let Some(position_field) = fields.next() else {
+                return Some(Err(anyhow!(
+                    "CADD line {} has fewer than six columns",
+                    self.line_number
+                )));
+            };
+            let Some(ref_allele) = fields.next() else {
+                return Some(Err(anyhow!(
+                    "CADD line {} has fewer than six columns",
+                    self.line_number
+                )));
+            };
+            let Some(alt_allele) = fields.next() else {
+                return Some(Err(anyhow!(
+                    "CADD line {} has fewer than six columns",
+                    self.line_number
+                )));
+            };
+            let Some(raw_field) = fields.next() else {
+                return Some(Err(anyhow!(
+                    "CADD line {} has fewer than six columns",
+                    self.line_number
+                )));
+            };
+            let Some(phred_field) = fields.next() else {
+                return Some(Err(anyhow!(
+                    "CADD line {} has fewer than six columns",
+                    self.line_number
+                )));
+            };
+            let chrom = normalize_chrom(chrom_field);
+            let Some(&chrom_idx) = self.chrom_to_idx.get(&chrom) else {
+                continue;
+            };
+            let position = match position_field.parse::<u32>() {
                 Ok(position) if position > 0 => position,
-                _ => return Some(Err(anyhow!("CADD line {} has an invalid position", self.line_number))),
+                _ => {
+                    return Some(Err(anyhow!(
+                        "CADD line {} has an invalid position",
+                        self.line_number
+                    )))
+                }
             };
-            if fields[2].is_empty() || fields[3].is_empty() {
-                return Some(Err(anyhow!("CADD line {} has an empty allele", self.line_number)));
+            if ref_allele.is_empty() || alt_allele.is_empty() {
+                return Some(Err(anyhow!(
+                    "CADD line {} has an empty allele",
+                    self.line_number
+                )));
             }
-            let raw = match fields[4].parse::<f64>() {
+            let raw = match raw_field.parse::<f64>() {
                 Ok(value) if value.is_finite() => value,
-                _ => return Some(Err(anyhow!("CADD line {} has an invalid raw score", self.line_number))),
+                _ => {
+                    return Some(Err(anyhow!(
+                        "CADD line {} has an invalid raw score",
+                        self.line_number
+                    )))
+                }
             };
-            let phred = match fields[5].parse::<f64>() {
+            let phred = match phred_field.parse::<f64>() {
                 Ok(value) if value.is_finite() => value,
-                _ => return Some(Err(anyhow!("CADD line {} has an invalid PHRED score", self.line_number))),
+                _ => {
+                    return Some(Err(anyhow!(
+                        "CADD line {} has an invalid PHRED score",
+                        self.line_number
+                    )))
+                }
             };
             return Some(Ok(AnnotationRecord {
                 chrom_idx,
                 position,
-                ref_allele: fields[2].to_string(),
-                alt_allele: fields[3].to_string(),
-                json: serde_json::json!({"raw": raw, "phred": phred}).to_string(),
+                ref_allele: ref_allele.to_string(),
+                alt_allele: alt_allele.to_string(),
+                json: match (self.include_raw, self.include_phred) {
+                    // serde_json's default map order is lexical. Preserve the
+                    // existing `phred`, `raw` byte order and serde_json number
+                    // formatting while avoiding the old parse/filter/serialize
+                    // second pass.
+                    (true, true) => serde_json::json!({"phred": phred, "raw": raw}).to_string(),
+                    (true, false) => serde_json::json!({"raw": raw}).to_string(),
+                    (false, true) => serde_json::json!({"phred": phred}).to_string(),
+                    (false, false) => "{}".to_string(),
+                },
             }));
         }
     }
 }
 
 fn normalize_chrom(chrom: &str) -> String {
-    if chrom.starts_with("chr") { chrom.to_string() } else { format!("chr{chrom}") }
+    if chrom.starts_with("chr") {
+        chrom.to_string()
+    } else {
+        format!("chr{chrom}")
+    }
 }
 
 #[cfg(test)]
@@ -79,7 +164,9 @@ mod tests {
     fn streams_raw_and_phred_scores_by_allele() {
         let input = b"#Chrom\tPos\tRef\tAlt\tRawScore\tPHRED\n1\t100\tA\tG\t0.125\t12.4\n";
         let map = HashMap::from([("chr1".to_string(), 0)]);
-        let records = iter_cadd(&input[..], &map).collect::<Result<Vec<_>>>().unwrap();
+        let records = iter_cadd(&input[..], &map)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].ref_allele, "A");
         assert_eq!(records[0].alt_allele, "G");
@@ -91,6 +178,24 @@ mod tests {
     #[test]
     fn malformed_scores_fail_closed() {
         let map = HashMap::from([("chr1".to_string(), 0)]);
-        assert!(iter_cadd(&b"1\t100\tA\tG\tbad\t12\n"[..], &map).next().unwrap().is_err());
+        assert!(iter_cadd(&b"1\t100\tA\tG\tbad\t12\n"[..], &map)
+            .next()
+            .unwrap()
+            .is_err());
+    }
+
+    #[test]
+    fn selected_fields_are_emitted_directly() {
+        let input = b"1\t100\tA\tG\t0.125\t12.4\n";
+        let map = HashMap::from([("chr1".to_string(), 0)]);
+        let selected = HashSet::from(["phred".to_string()]);
+        let record = iter_cadd_selected(&input[..], &map, Some(&selected))
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&record.json).unwrap(),
+            serde_json::json!({"phred": 12.4})
+        );
     }
 }

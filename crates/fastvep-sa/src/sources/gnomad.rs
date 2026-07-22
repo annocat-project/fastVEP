@@ -26,7 +26,16 @@ use std::io::BufRead;
 /// gnomAD v2.1 codes (`oth`) and the v4.1 codes (`mid`, `remaining`); a
 /// missing key is silently skipped per VCF, so listing all is harmless.
 const POPULATIONS: &[&str] = &[
-    "afr", "amr", "asj", "eas", "fin", "mid", "nfe", "oth", "remaining", "sas",
+    "afr",
+    "amr",
+    "asj",
+    "eas",
+    "fin",
+    "mid",
+    "nfe",
+    "oth",
+    "remaining",
+    "sas",
 ];
 
 /// INFO field names for a particular gnomAD release flavor.
@@ -159,7 +168,11 @@ pub fn parse_gnomad_vcf<R: BufRead>(
     chrom_to_idx: &HashMap<String, u16>,
 ) -> Result<Vec<AnnotationRecord>> {
     let mut records: Vec<_> = iter_gnomad_vcf(reader, chrom_to_idx).collect::<Result<_>>()?;
-    records.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
+    records.sort_by(|a, b| {
+        a.chrom_idx
+            .cmp(&b.chrom_idx)
+            .then(a.position.cmp(&b.position))
+    });
     Ok(records)
 }
 
@@ -173,21 +186,34 @@ pub fn iter_gnomad_vcf<'a, R: BufRead>(
     reader: R,
     chrom_to_idx: &'a HashMap<String, u16>,
 ) -> GnomadRecordIter<'a, R> {
+    iter_gnomad_vcf_selected(reader, chrom_to_idx, None)
+}
+
+/// Stream gnomAD while emitting only the requested cache fields.
+pub fn iter_gnomad_vcf_selected<'a, R: BufRead>(
+    reader: R,
+    chrom_to_idx: &'a HashMap<String, u16>,
+    selected_fields: Option<&HashSet<String>>,
+) -> GnomadRecordIter<'a, R> {
     GnomadRecordIter {
-        lines: reader.lines(),
+        reader,
+        line: String::new(),
         chrom_to_idx,
         pending: VecDeque::new(),
         info_ids: HashSet::new(),
         field_names: None,
+        selected_fields: selected_fields.cloned(),
     }
 }
 
 pub struct GnomadRecordIter<'a, R: BufRead> {
-    lines: std::io::Lines<R>,
+    reader: R,
+    line: String,
     chrom_to_idx: &'a HashMap<String, u16>,
     pending: VecDeque<AnnotationRecord>,
     info_ids: HashSet<String>,
     field_names: Option<FieldNames>,
+    selected_fields: Option<HashSet<String>>,
 }
 
 impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
@@ -199,10 +225,13 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
                 return Some(Ok(record));
             }
 
-            let line = match self.lines.next()? {
-                Ok(l) => l,
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => return None,
+                Ok(_) => {}
                 Err(e) => return Some(Err(e).context("Reading gnomAD VCF line")),
-            };
+            }
+            let line = self.line.trim_end_matches(['\r', '\n']);
 
             if line.starts_with('#') {
                 if let Some(id) = parse_info_id(&line) {
@@ -257,6 +286,7 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
                     i,
                     field_names,
                     fields[6],
+                    self.selected_fields.as_ref(),
                 );
                 self.pending.push_back(AnnotationRecord {
                     chrom_idx,
@@ -279,29 +309,42 @@ fn build_gnomad_json(
     allele_idx: usize,
     field_names: &FieldNames,
     filter: &str,
+    selected_fields: Option<&HashSet<String>>,
 ) -> String {
     let mut parts = Vec::new();
+    let includes = |field: &str| selected_fields.is_none_or(|fields| fields.contains(field));
 
-    if let Some(af_str) = af {
-        if let Ok(f) = af_str.parse::<f64>() {
-            parts.push(format!("\"allAf\":{:.6e}", f));
+    if includes("allAf") {
+        if let Some(af_str) = af {
+            if let Ok(f) = af_str.parse::<f64>() {
+                parts.push(format!("\"allAf\":{:.6e}", f));
+            }
         }
     }
 
-    if let Some(an_str) = an {
-        parts.push(format!("\"allAn\":{}", an_str));
+    if includes("allAn") {
+        if let Some(an_str) = an {
+            parts.push(format!("\"allAn\":{}", an_str));
+        }
     }
 
-    if let Some(ac_str) = ac {
-        parts.push(format!("\"allAc\":{}", ac_str));
+    if includes("allAc") {
+        if let Some(ac_str) = ac {
+            parts.push(format!("\"allAc\":{}", ac_str));
+        }
     }
 
-    if let Some(nh) = nhomalt {
-        parts.push(format!("\"allHc\":{}", nh));
+    if includes("allHc") {
+        if let Some(nh) = nhomalt {
+            parts.push(format!("\"allHc\":{}", nh));
+        }
     }
 
     // Per-population AFs
     for pop in POPULATIONS {
+        if !includes(&format!("{pop}Af")) {
+            continue;
+        }
         let key = field_names.pop_key(pop);
         if let Some(val) = info_map.get(&key) {
             let vals = split_info_values(Some(val.as_str()));
@@ -313,7 +356,7 @@ fn build_gnomad_json(
         }
     }
 
-    if filter != "." && filter != "PASS" {
+    if includes("filters") && filter != "." && filter != "PASS" {
         parts.push(format!(
             "\"filters\":{}",
             serde_json::to_string(filter).unwrap()
@@ -325,6 +368,9 @@ fn build_gnomad_json(
         ("AF_grpmax", "grpmaxAf"),
         ("grpmax", "grpmaxPopulation"),
     ] {
+        if !includes(output_field) {
+            continue;
+        }
         if let Some(value) = info_map.get(info_field) {
             let values = split_info_values(Some(value));
             let value = values.get(allele_idx).or_else(|| values.first());
@@ -403,6 +449,27 @@ chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF=0.01,0.005;AN=140000;AC=1400,700;nhomalt=10,
         // Multi-allelic: second alt
         assert_eq!(records[2].position, 20000);
         assert_eq!(records[2].alt_allele, "A");
+    }
+
+    #[test]
+    fn selected_fields_are_emitted_directly() {
+        let vcf = "\
+##fileformat=VCFv4.2
+##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">
+##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
+chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150
+";
+        let map = HashMap::from([("chr1".to_string(), 0)]);
+        let selected = ["allAf".to_string()].into_iter().collect();
+        let record = iter_gnomad_vcf_selected(vcf.as_bytes(), &map, Some(&selected))
+            .next()
+            .unwrap()
+            .unwrap();
+        let value = serde_json::from_str::<serde_json::Value>(&record.json).unwrap();
+        assert!(value.get("allAf").is_some());
+        assert!(value.get("allAn").is_none());
+        assert!(value.get("allAc").is_none());
     }
 
     #[test]
@@ -521,8 +588,7 @@ chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF_joint=0.01,0.005;AN_joint=140000;AC_joint=14
     #[test]
     fn test_parse_info_id_reordered_with_quoted_comma() {
         // Description quoted string contains commas — must not split inside it.
-        let line =
-            "##INFO=<Number=A,Type=Float,Description=\"AF, joint, multi-pop\",ID=AF_joint>";
+        let line = "##INFO=<Number=A,Type=Float,Description=\"AF, joint, multi-pop\",ID=AF_joint>";
         assert_eq!(parse_info_id(line), Some("AF_joint"));
     }
 

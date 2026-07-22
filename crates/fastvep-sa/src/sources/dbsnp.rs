@@ -8,8 +8,9 @@
 
 use crate::common::AnnotationRecord;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write;
 use std::io::BufRead;
 
 /// Stream a coordinate-sorted dbSNP VCF as `AnnotationRecord`s without
@@ -21,17 +22,39 @@ pub fn iter_dbsnp_vcf<'a, R: BufRead>(
     reader: R,
     chrom_to_idx: &'a HashMap<String, u16>,
 ) -> DbsnpRecordIter<'a, R> {
+    iter_dbsnp_vcf_selected(reader, chrom_to_idx, None)
+}
+
+/// Stream dbSNP records while extracting and serializing only the requested
+/// annotation fields. The record identity is still resolved from ID/RS even
+/// when `id` is not retained, preserving the original row-selection behavior.
+pub fn iter_dbsnp_vcf_selected<'a, R: BufRead>(
+    reader: R,
+    chrom_to_idx: &'a HashMap<String, u16>,
+    selected_fields: Option<&HashSet<String>>,
+) -> DbsnpRecordIter<'a, R> {
+    let includes = |field| selected_fields.is_none_or(|fields| fields.contains(field));
     DbsnpRecordIter {
-        lines: reader.lines(),
+        reader,
+        line: String::new(),
         chrom_to_idx,
         pending: VecDeque::new(),
+        include_id: includes("id"),
+        include_global_maf: includes("globalMaf"),
+        include_variant_type: includes("variantType"),
+        include_common: includes("common"),
     }
 }
 
 pub struct DbsnpRecordIter<'a, R: BufRead> {
-    lines: std::io::Lines<R>,
+    reader: R,
+    line: String,
     chrom_to_idx: &'a HashMap<String, u16>,
     pending: VecDeque<AnnotationRecord>,
+    include_id: bool,
+    include_global_maf: bool,
+    include_variant_type: bool,
+    include_common: bool,
 }
 
 impl<R: BufRead> Iterator for DbsnpRecordIter<'_, R> {
@@ -43,82 +66,129 @@ impl<R: BufRead> Iterator for DbsnpRecordIter<'_, R> {
                 return Some(Ok(record));
             }
 
-            let line = match self.lines.next()? {
-                Ok(l) => l,
-                Err(e) => return Some(Err(e).context("Reading dbSNP VCF line")),
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(error) => return Some(Err(error).context("Reading dbSNP VCF line")),
             };
+            let line = self.line.trim_end_matches(['\r', '\n']);
 
             if line.starts_with('#') {
                 continue;
             }
 
-            let fields: Vec<&str> = line.splitn(9, '\t').collect();
-            if fields.len() < 8 {
+            let mut fields = line.splitn(9, '\t');
+            let Some(chrom_field) = fields.next() else {
+                continue;
+            };
+            let Some(position_field) = fields.next() else {
+                continue;
+            };
+            let Some(id) = fields.next() else {
+                continue;
+            };
+            let Some(ref_field) = fields.next() else {
+                continue;
+            };
+            let Some(alt_field) = fields.next() else {
+                continue;
+            };
+            // QUAL and FILTER are not needed, but consuming them keeps INFO at
+            // the same VCF column as the original parser.
+            if fields.next().is_none() || fields.next().is_none() {
                 continue;
             }
+            let Some(info) = fields.next() else {
+                continue;
+            };
 
-            let chrom = normalize_chrom(fields[0]);
+            let chrom = normalize_chrom(chrom_field);
             let chrom_idx = match self.chrom_to_idx.get(&chrom) {
                 Some(&idx) => idx,
                 None => continue,
             };
 
-            let pos: u32 = match fields[1].parse() {
+            let pos: u32 = match position_field.parse() {
                 Ok(p) => p,
                 Err(_) => continue,
             };
 
-            let id = fields[2];
-            let ref_allele = fields[3].to_string();
-            let alt_field = fields[4];
-            let info = fields[7];
-
-            let info_map = parse_info(info);
-            let common = info.split(';').any(|item| item == "COMMON");
-
-            let rs_id = if id.starts_with("rs") {
-                id.to_string()
-            } else {
-                match info_map.get("RS") {
-                    Some(rs) => format!("rs{}", rs),
-                    None => continue,
+            let ref_allele = ref_field.to_string();
+            let id_is_rs = id.starts_with("rs");
+            let mut rs_info = None;
+            let mut caf = None;
+            let mut variant_type = None;
+            let mut common = false;
+            for item in info.split(';') {
+                if self.include_common && item == "COMMON" {
+                    common = true;
+                    continue;
                 }
+                let Some((key, value)) = item.split_once('=') else {
+                    continue;
+                };
+                match key {
+                    "RS" if !id_is_rs => rs_info = Some(value),
+                    "CAF" if self.include_global_maf => caf = Some(value),
+                    "VC" if self.include_variant_type => variant_type = Some(value),
+                    _ => {}
+                }
+            }
+
+            let rs_id = if id_is_rs {
+                Cow::Borrowed(id)
+            } else if let Some(rs) = rs_info {
+                Cow::Owned(format!("rs{rs}"))
+            } else {
+                continue;
             };
 
             // dbSNP's CAF is `ref_freq,alt1_freq,alt2_freq,...` in ALT order
             // (i.e. index i+1 is the frequency for the i-th ALT); index it
             // per-alt below rather than once, or every ALT past the first in
             // a multi-allelic record gets the first ALT's frequency.
-            let caf_parts: Option<Vec<&str>> =
-                info_map.get("CAF").map(|caf| caf.split(',').collect());
+            let mut caf_parts = caf.map(|value| value.split(','));
+            if let Some(parts) = caf_parts.as_mut() {
+                let _ = parts.next(); // CAF starts with the reference frequency.
+            }
 
-            for (i, alt) in alt_field.split(',').enumerate() {
+            for alt in alt_field.split(',') {
+                let freq = caf_parts
+                    .as_mut()
+                    .and_then(|parts| parts.next())
+                    .and_then(|value| value.parse::<f64>().ok());
                 if alt == "." || alt == "*" {
                     continue;
                 }
-                let freq = caf_parts
-                    .as_ref()
-                    .and_then(|parts| parts.get(i + 1))
-                    .and_then(|s| s.parse::<f64>().ok());
-                let mut parts = vec![format!("\"id\":\"{}\"", rs_id)];
-                if let Some(f) = freq {
-                    parts.push(format!("\"globalMaf\":{:.6e}", f));
+                let mut json = String::with_capacity(96);
+                json.push('{');
+                let mut first = true;
+                if self.include_id {
+                    push_json_string(&mut json, "id", &rs_id, &mut first);
                 }
-                if let Some(variant_type) = info_map.get("VC") {
-                    parts.push(format!(
-                        "\"variantType\":{}",
-                        serde_json::to_string(variant_type).unwrap()
-                    ));
+                if self.include_global_maf {
+                    if let Some(freq) = freq {
+                        push_separator(&mut json, &mut first);
+                        let _ = write!(json, "\"globalMaf\":{freq:.6e}");
+                    }
                 }
-                if common {
-                    parts.push("\"common\":true".into());
+                if self.include_variant_type {
+                    if let Some(variant_type) = variant_type {
+                        push_json_string(&mut json, "variantType", variant_type, &mut first);
+                    }
                 }
+                if self.include_common && common {
+                    push_separator(&mut json, &mut first);
+                    json.push_str("\"common\":true");
+                }
+                json.push('}');
                 self.pending.push_back(AnnotationRecord {
                     chrom_idx,
                     position: pos,
                     ref_allele: ref_allele.clone(),
                     alt_allele: alt.to_string(),
-                    json: format!("{{{}}}", parts.join(",")),
+                    json,
                 });
             }
         }
@@ -134,18 +204,25 @@ pub fn parse_dbsnp_vcf<R: BufRead>(
     chrom_to_idx: &HashMap<String, u16>,
 ) -> Result<Vec<AnnotationRecord>> {
     let mut records: Vec<_> = iter_dbsnp_vcf(reader, chrom_to_idx).collect::<Result<_>>()?;
-    records.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
+    records.sort_by(|a, b| {
+        a.chrom_idx
+            .cmp(&b.chrom_idx)
+            .then(a.position.cmp(&b.position))
+    });
     Ok(records)
 }
 
-fn parse_info(info: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for pair in info.split(';') {
-        if let Some((key, value)) = pair.split_once('=') {
-            map.insert(key.to_string(), value.to_string());
-        }
+fn push_separator(json: &mut String, first: &mut bool) {
+    if *first {
+        *first = false;
+    } else {
+        json.push(',');
     }
-    map
+}
+
+fn push_json_string(json: &mut String, key: &str, value: &str, first: &mut bool) {
+    push_separator(json, first);
+    let _ = write!(json, "\"{key}\":{}", serde_json::to_string(value).unwrap());
 }
 
 fn normalize_chrom(chrom: &str) -> String {
@@ -204,10 +281,18 @@ mod tests {
         assert_eq!(records.len(), 2);
 
         let c = records.iter().find(|r| r.alt_allele == "C").unwrap();
-        assert!(c.json.contains("8.000000e-2"), "C should get CAF index 1 (0.08): {}", c.json);
+        assert!(
+            c.json.contains("8.000000e-2"),
+            "C should get CAF index 1 (0.08): {}",
+            c.json
+        );
 
         let t = records.iter().find(|r| r.alt_allele == "T").unwrap();
-        assert!(t.json.contains("2.000000e-2"), "T should get CAF index 2 (0.02), not C's frequency: {}", t.json);
+        assert!(
+            t.json.contains("2.000000e-2"),
+            "T should get CAF index 2 (0.02), not C's frequency: {}",
+            t.json
+        );
     }
 
     #[test]
@@ -231,5 +316,20 @@ NC_000023.11\t100\trs1\tA\tG\t.\t.\tRS=1
         assert!(records[0].json.contains("rs775809821"));
         assert_eq!(records[1].chrom_idx, 22);
         assert!(records[1].json.contains("rs1"));
+    }
+
+    #[test]
+    fn selected_fields_are_extracted_without_post_filtering() {
+        let vcf = "1\t10019\trs1\tA\tC\t.\t.\tRS=1;CAF=0.90,0.10;VC=SNV;COMMON\n";
+        let map = HashMap::from([("chr1".to_string(), 0)]);
+        let selected = HashSet::from(["id".to_string(), "globalMaf".to_string()]);
+        let record = iter_dbsnp_vcf_selected(vcf.as_bytes(), &map, Some(&selected))
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&record.json).unwrap(),
+            serde_json::json!({"id": "rs1", "globalMaf": 0.1})
+        );
     }
 }

@@ -5,8 +5,8 @@
 
 use crate::common::AnnotationRecord;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
 /// Parse a SpliceAI VCF and produce sorted AnnotationRecords.
@@ -18,7 +18,11 @@ pub fn parse_spliceai_vcf<R: BufRead>(
     chrom_to_idx: &HashMap<String, u16>,
 ) -> Result<Vec<AnnotationRecord>> {
     let mut records: Vec<_> = iter_spliceai_vcf(reader, chrom_to_idx).collect::<Result<_>>()?;
-    records.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
+    records.sort_by(|a, b| {
+        a.chrom_idx
+            .cmp(&b.chrom_idx)
+            .then(a.position.cmp(&b.position))
+    });
     Ok(records)
 }
 
@@ -30,17 +34,41 @@ pub fn iter_spliceai_vcf<'a, R: BufRead>(
     reader: R,
     chrom_to_idx: &'a HashMap<String, u16>,
 ) -> SpliceAiRecordIter<'a, R> {
+    iter_spliceai_vcf_selected(reader, chrom_to_idx, None)
+}
+
+/// Stream SpliceAI while emitting only the requested cache fields.
+pub fn iter_spliceai_vcf_selected<'a, R: BufRead>(
+    reader: R,
+    chrom_to_idx: &'a HashMap<String, u16>,
+    selected_fields: Option<&HashSet<String>>,
+) -> SpliceAiRecordIter<'a, R> {
+    let includes = |field| selected_fields.is_none_or(|fields| fields.contains(field));
     SpliceAiRecordIter {
-        lines: reader.lines(),
+        reader,
+        line: String::new(),
         chrom_to_idx,
         pending: VecDeque::new(),
+        includes: [
+            includes("gene"),
+            includes("dsAg"),
+            includes("dsAl"),
+            includes("dsDg"),
+            includes("dsDl"),
+            includes("dpAg"),
+            includes("dpAl"),
+            includes("dpDg"),
+            includes("dpDl"),
+        ],
     }
 }
 
 pub struct SpliceAiRecordIter<'a, R: BufRead> {
-    lines: std::io::Lines<R>,
+    reader: R,
+    line: String,
     chrom_to_idx: &'a HashMap<String, u16>,
     pending: VecDeque<AnnotationRecord>,
+    includes: [bool; 9],
 }
 
 impl<R: BufRead> Iterator for SpliceAiRecordIter<'_, R> {
@@ -52,10 +80,13 @@ impl<R: BufRead> Iterator for SpliceAiRecordIter<'_, R> {
                 return Some(Ok(record));
             }
 
-            let line = match self.lines.next()? {
-                Ok(line) => line,
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => return None,
+                Ok(_) => {}
                 Err(err) => return Some(Err(err).context("Reading SpliceAI VCF line")),
-            };
+            }
+            let line = self.line.trim_end_matches(['\r', '\n']);
             if line.starts_with('#') {
                 continue;
             }
@@ -83,7 +114,7 @@ impl<R: BufRead> Iterator for SpliceAiRecordIter<'_, R> {
                 if let Some(val) = pair.strip_prefix("SpliceAI=") {
                     for entry in val.split(',') {
                         if let Some(record) =
-                            parse_spliceai_entry(chrom_idx, pos, &ref_allele, entry)
+                            parse_spliceai_entry(chrom_idx, pos, &ref_allele, entry, &self.includes)
                         {
                             self.pending.push_back(record);
                         }
@@ -99,6 +130,7 @@ fn parse_spliceai_entry(
     position: u32,
     ref_allele: &str,
     entry: &str,
+    includes: &[bool; 9],
 ) -> Option<AnnotationRecord> {
     let parts: Vec<&str> = entry.split('|').collect();
     if parts.len() < 10 {
@@ -116,18 +148,23 @@ fn parse_spliceai_entry(
     let dp_dg: i32 = parts[8].parse().ok()?;
     let dp_dl: i32 = parts[9].parse().ok()?;
 
-    let json = serde_json::json!({
-        "gene": gene,
-        "dsAg": ds_ag,
-        "dsAl": ds_al,
-        "dsDg": ds_dg,
-        "dsDl": ds_dl,
-        "dpAg": dp_ag,
-        "dpAl": dp_al,
-        "dpDg": dp_dg,
-        "dpDl": dp_dl,
-    })
-    .to_string();
+    let mut values = serde_json::Map::new();
+    for (include, key, value) in [
+        (includes[0], "gene", serde_json::Value::from(gene)),
+        (includes[1], "dsAg", serde_json::Value::from(ds_ag)),
+        (includes[2], "dsAl", serde_json::Value::from(ds_al)),
+        (includes[3], "dsDg", serde_json::Value::from(ds_dg)),
+        (includes[4], "dsDl", serde_json::Value::from(ds_dl)),
+        (includes[5], "dpAg", serde_json::Value::from(dp_ag)),
+        (includes[6], "dpAl", serde_json::Value::from(dp_al)),
+        (includes[7], "dpDg", serde_json::Value::from(dp_dg)),
+        (includes[8], "dpDl", serde_json::Value::from(dp_dl)),
+    ] {
+        if include {
+            values.insert(key.into(), value);
+        }
+    }
+    let json = serde_json::Value::Object(values).to_string();
 
     Some(AnnotationRecord {
         chrom_idx,
@@ -222,5 +259,22 @@ mod tests {
         assert_eq!(records.len(), 1);
         let value: serde_json::Value = serde_json::from_str(&records[0].json).unwrap();
         assert_eq!(value["gene"], "GENE\"1");
+    }
+
+    #[test]
+    fn selected_fields_are_emitted_directly() {
+        let vcf = "1\t25000\t.\tA\tG\t.\t.\tSpliceAI=G|GENE1|0.01|0.00|0.85|0.00|5|-28|2|-13\n";
+        let map = HashMap::from([("chr1".to_string(), 0)]);
+        let selected = ["gene".to_string(), "dsDg".to_string()]
+            .into_iter()
+            .collect();
+        let record = iter_spliceai_vcf_selected(vcf.as_bytes(), &map, Some(&selected))
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&record.json).unwrap(),
+            serde_json::json!({"gene": "GENE1", "dsDg": 0.85})
+        );
     }
 }

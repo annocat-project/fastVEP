@@ -8,8 +8,28 @@ use crate::block::{BlockEntry, SaBlock};
 use crate::common::{AnnotationRecord, DEFAULT_BLOCK_SIZE, OSA_MAGIC, SCHEMA_VERSION};
 use crate::index::{BlockRef, IndexHeader, SaIndex};
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::{mpsc, Arc, Mutex};
+
+const FILE_BUFFER_SIZE: usize = 1024 * 1024;
+
+struct BlockJob {
+    sequence: u64,
+    chrom: String,
+    start_pos: u32,
+    end_pos: u32,
+    block: SaBlock,
+}
+
+struct CompressedBlock {
+    sequence: u64,
+    chrom: String,
+    start_pos: u32,
+    end_pos: u32,
+    compressed: Result<Vec<u8>>,
+}
 
 /// Builds an .osa data file and its .osa.idx index file.
 pub struct SaWriter {
@@ -44,20 +64,7 @@ impl SaWriter {
         records: impl Iterator<Item = AnnotationRecord>,
         chrom_map: &[String],
     ) -> Result<()> {
-        self.chrom_names = chrom_map.to_vec();
-
-        // Write data file header
-        data_writer.write_all(OSA_MAGIC)?;
-        data_writer.write_all(&SCHEMA_VERSION.to_le_bytes())?;
-        self.data_offset = (OSA_MAGIC.len() + 2) as u64;
-
-        for record in records {
-            self.write_record(data_writer, record, chrom_map)?;
-        }
-
-        // Flush remaining
-        self.flush_block(data_writer)?;
-        Ok(())
+        self.write_all_results(data_writer, records.map(Ok), chrom_map)
     }
 
     /// Build .osa and .osa.idx from an iterator that can surface parse errors.
@@ -69,94 +76,195 @@ impl SaWriter {
         records: impl Iterator<Item = Result<AnnotationRecord>>,
         chrom_map: &[String],
     ) -> Result<()> {
+        self.write_all_results_with_workers(
+            data_writer,
+            records,
+            chrom_map,
+            compression_worker_count(),
+        )
+    }
+
+    fn write_all_results_with_workers<W: Write>(
+        &mut self,
+        data_writer: &mut W,
+        records: impl Iterator<Item = Result<AnnotationRecord>>,
+        chrom_map: &[String],
+        worker_count: usize,
+    ) -> Result<()> {
         self.chrom_names = chrom_map.to_vec();
 
         data_writer.write_all(OSA_MAGIC)?;
         data_writer.write_all(&SCHEMA_VERSION.to_le_bytes())?;
         self.data_offset = (OSA_MAGIC.len() + 2) as u64;
 
-        for record in records {
-            self.write_record(data_writer, record?, chrom_map)?;
-        }
+        let worker_count = worker_count.max(1);
+        let queue_capacity = worker_count * 2;
+        let (job_sender, job_receiver) = mpsc::sync_channel::<BlockJob>(queue_capacity);
+        let job_receiver = Arc::new(Mutex::new(job_receiver));
+        let (result_sender, result_receiver) = mpsc::channel::<CompressedBlock>();
 
-        self.flush_block(data_writer)?;
-        Ok(())
-    }
-
-    fn write_record<W: Write>(
-        &mut self,
-        data_writer: &mut W,
-        record: AnnotationRecord,
-        chrom_map: &[String],
-    ) -> Result<()> {
-        if let Some((last_chrom, last_pos)) = self.last_key {
-            if (record.chrom_idx, record.position) < (last_chrom, last_pos) {
-                anyhow::bail!(
-                    "SA records are not sorted: previous chrom_idx={}, position={}; current chrom_idx={}, position={}. \
-                     The streaming .osa builder requires input sorted by chromosome (chr1..chr22,X,Y,M) then position \
-                     — sort the source file (e.g. `bcftools sort` / `sort -k1,1 -k2,2n`) and rebuild.",
-                    last_chrom,
-                    last_pos,
-                    record.chrom_idx,
-                    record.position
-                );
+        std::thread::scope(|scope| -> Result<()> {
+            for _ in 0..worker_count {
+                let jobs = Arc::clone(&job_receiver);
+                let results = result_sender.clone();
+                scope.spawn(move || loop {
+                    let job = match jobs.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(job) = job else {
+                        return;
+                    };
+                    let compressed = job.block.compress();
+                    if results
+                        .send(CompressedBlock {
+                            sequence: job.sequence,
+                            chrom: job.chrom,
+                            start_pos: job.start_pos,
+                            end_pos: job.end_pos,
+                            compressed,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                });
             }
-        }
-        self.last_key = Some((record.chrom_idx, record.position));
+            drop(result_sender);
 
-        let chrom_name = &chrom_map[record.chrom_idx as usize];
+            let mut job_sender = Some(job_sender);
+            let mut submitted = 0u64;
+            let mut next_to_write = 0u64;
+            let mut pending = BTreeMap::new();
 
-        // If we've moved to a new chromosome, flush the current block
-        if self.current_chrom.as_ref() != Some(chrom_name) {
-            self.flush_block(data_writer)?;
-            self.current_chrom = Some(chrom_name.clone());
-        }
+            let pipeline_result = (|| -> Result<()> {
+                for record in records {
+                    let record = record?;
+                    if let Some((last_chrom, last_pos)) = self.last_key {
+                        if (record.chrom_idx, record.position) < (last_chrom, last_pos) {
+                            anyhow::bail!(
+                                "SA records are not sorted: previous chrom_idx={}, position={}; current chrom_idx={}, position={}. \
+                                 The streaming .osa builder requires input sorted by chromosome (chr1..chr22,X,Y,M) then position \
+                                 — sort the source file (e.g. `bcftools sort` / `sort -k1,1 -k2,2n`) and rebuild.",
+                                last_chrom,
+                                last_pos,
+                                record.chrom_idx,
+                                record.position
+                            );
+                        }
+                    }
+                    self.last_key = Some((record.chrom_idx, record.position));
 
-        let entry = BlockEntry {
-            position: record.position,
-            ref_allele: record.ref_allele,
-            alt_allele: record.alt_allele,
-            json: record.json,
-        };
+                    let chrom_name = &chrom_map[record.chrom_idx as usize];
+                    if self.current_chrom.as_ref() != Some(chrom_name) {
+                        self.submit_block(job_sender.as_ref().unwrap(), submitted)?;
+                        if !self.block.is_empty() {
+                            unreachable!("submitted block was not cleared");
+                        }
+                        if self.current_chrom.is_some() {
+                            submitted += 1;
+                        }
+                        self.current_chrom = Some(chrom_name.clone());
+                        self.drain_compressed(
+                            data_writer,
+                            &result_receiver,
+                            &mut pending,
+                            &mut next_to_write,
+                        )?;
+                    }
 
-        if !self.block.can_add(&entry) {
-            // Check by reference so every source record's owned strings are
-            // moved exactly once instead of cloned on the normal hot path.
-            self.flush_block(data_writer)?;
-        }
-        assert!(self.block.add(entry), "Single entry exceeds block size");
+                    let entry = BlockEntry {
+                        position: record.position,
+                        ref_allele: record.ref_allele,
+                        alt_allele: record.alt_allele,
+                        json: record.json,
+                    };
+                    if !self.block.can_add(&entry) {
+                        self.submit_block(job_sender.as_ref().unwrap(), submitted)?;
+                        submitted += 1;
+                        self.drain_compressed(
+                            data_writer,
+                            &result_receiver,
+                            &mut pending,
+                            &mut next_to_write,
+                        )?;
+                    }
+                    assert!(self.block.add(entry), "Single entry exceeds block size");
+                }
 
-        Ok(())
+                if !self.block.is_empty() {
+                    self.submit_block(job_sender.as_ref().unwrap(), submitted)?;
+                    submitted += 1;
+                }
+                drop(job_sender.take());
+
+                while next_to_write < submitted {
+                    let completed = result_receiver
+                        .recv()
+                        .context("OSA compression worker stopped before completing all blocks")?;
+                    pending.insert(completed.sequence, completed);
+                    self.write_ready_blocks(data_writer, &mut pending, &mut next_to_write)?;
+                }
+                Ok(())
+            })();
+
+            drop(job_sender.take());
+            pipeline_result
+        })
     }
 
-    fn flush_block<W: Write>(&mut self, writer: &mut W) -> Result<()> {
+    fn submit_block(&mut self, sender: &mpsc::SyncSender<BlockJob>, sequence: u64) -> Result<()> {
         if self.block.is_empty() {
             return Ok(());
         }
+        let block = std::mem::replace(&mut self.block, SaBlock::new(DEFAULT_BLOCK_SIZE));
+        sender
+            .send(BlockJob {
+                sequence,
+                chrom: self.current_chrom.as_ref().unwrap().clone(),
+                start_pos: block.start_position().unwrap(),
+                end_pos: block.end_position().unwrap(),
+                block,
+            })
+            .context("OSA compression workers stopped unexpectedly")
+    }
 
-        let chrom = self.current_chrom.as_ref().unwrap().clone();
-        let start_pos = self.block.start_position().unwrap();
-        let end_pos = self.block.end_position().unwrap();
+    fn drain_compressed<W: Write>(
+        &mut self,
+        writer: &mut W,
+        receiver: &mpsc::Receiver<CompressedBlock>,
+        pending: &mut BTreeMap<u64, CompressedBlock>,
+        next_to_write: &mut u64,
+    ) -> Result<()> {
+        while let Ok(completed) = receiver.try_recv() {
+            pending.insert(completed.sequence, completed);
+        }
+        self.write_ready_blocks(writer, pending, next_to_write)
+    }
 
-        let compressed = self.block.compress()?;
-        let compressed_len = compressed.len() as u32;
-
-        // Write compressed block length prefix + data
-        writer.write_all(&compressed_len.to_le_bytes())?;
-        writer.write_all(&compressed)?;
-
-        self.index.add_block(
-            &chrom,
-            BlockRef {
-                start_pos,
-                end_pos,
-                file_offset: self.data_offset,
-                compressed_len,
-            },
-        );
-
-        self.data_offset += 4 + compressed_len as u64;
-        self.block.clear();
+    fn write_ready_blocks<W: Write>(
+        &mut self,
+        writer: &mut W,
+        pending: &mut BTreeMap<u64, CompressedBlock>,
+        next_to_write: &mut u64,
+    ) -> Result<()> {
+        while let Some(completed) = pending.remove(next_to_write) {
+            let compressed = completed.compressed?;
+            let compressed_len = compressed.len() as u32;
+            writer.write_all(&compressed_len.to_le_bytes())?;
+            writer.write_all(&compressed)?;
+            self.index.add_block(
+                &completed.chrom,
+                BlockRef {
+                    start_pos: completed.start_pos,
+                    end_pos: completed.end_pos,
+                    file_offset: self.data_offset,
+                    compressed_len,
+                },
+            );
+            self.data_offset += 4 + compressed_len as u64;
+            *next_to_write += 1;
+        }
         Ok(())
     }
 
@@ -175,15 +283,19 @@ impl SaWriter {
         let data_path = base_path.with_extension("osa");
         let idx_path = base_path.with_extension("osa.idx");
 
-        let data_file = std::fs::File::create(&data_path)
-            .with_context(|| format!("Creating output file {} (does the output directory exist?)", data_path.display()))?;
-        let mut data_writer = BufWriter::new(data_file);
+        let data_file = std::fs::File::create(&data_path).with_context(|| {
+            format!(
+                "Creating output file {} (does the output directory exist?)",
+                data_path.display()
+            )
+        })?;
+        let mut data_writer = BufWriter::with_capacity(FILE_BUFFER_SIZE, data_file);
         self.write_all(&mut data_writer, records, chrom_map)?;
         data_writer.flush()?;
 
         let idx_file = std::fs::File::create(&idx_path)
             .with_context(|| format!("Creating index file {}", idx_path.display()))?;
-        let mut idx_writer = BufWriter::new(idx_file);
+        let mut idx_writer = BufWriter::with_capacity(FILE_BUFFER_SIZE, idx_file);
         self.write_index(&mut idx_writer)?;
         idx_writer.flush()?;
 
@@ -200,20 +312,38 @@ impl SaWriter {
         let data_path = base_path.with_extension("osa");
         let idx_path = base_path.with_extension("osa.idx");
 
-        let data_file = std::fs::File::create(&data_path)
-            .with_context(|| format!("Creating output file {} (does the output directory exist?)", data_path.display()))?;
-        let mut data_writer = BufWriter::new(data_file);
+        let data_file = std::fs::File::create(&data_path).with_context(|| {
+            format!(
+                "Creating output file {} (does the output directory exist?)",
+                data_path.display()
+            )
+        })?;
+        let mut data_writer = BufWriter::with_capacity(FILE_BUFFER_SIZE, data_file);
         self.write_all_results(&mut data_writer, records, chrom_map)?;
         data_writer.flush()?;
 
         let idx_file = std::fs::File::create(&idx_path)
             .with_context(|| format!("Creating index file {}", idx_path.display()))?;
-        let mut idx_writer = BufWriter::new(idx_file);
+        let mut idx_writer = BufWriter::with_capacity(FILE_BUFFER_SIZE, idx_file);
         self.write_index(&mut idx_writer)?;
         idx_writer.flush()?;
 
         Ok(())
     }
+}
+
+fn compression_worker_count() -> usize {
+    if let Ok(value) = std::env::var("FASTVEP_SA_COMPRESSION_THREADS") {
+        if let Ok(count) = value.parse::<usize>() {
+            if (1..=8).contains(&count) {
+                return count;
+            }
+        }
+    }
+    // One compression worker already overlaps zstd with parsing on the caller
+    // thread. Additional workers are opt-in because AnnoCat may build several
+    // sources concurrently and should own the global CPU budget.
+    1
 }
 
 #[cfg(test)]
@@ -257,5 +387,36 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("SA records are not sorted"));
+    }
+
+    #[test]
+    fn parallel_compression_is_byte_identical_and_ordered() {
+        fn build(worker_count: usize) -> (Vec<u8>, Vec<u8>) {
+            let records = (0..10_000).map(|position| {
+                Ok(AnnotationRecord {
+                    chrom_idx: 0,
+                    position,
+                    ref_allele: "A".into(),
+                    alt_allele: "G".into(),
+                    json: format!(
+                        r#"{{"score":{},"padding":"{}"}}"#,
+                        position,
+                        "x".repeat(1024)
+                    ),
+                })
+            });
+            let mut writer = SaWriter::new(header());
+            let mut data = Vec::new();
+            writer
+                .write_all_results_with_workers(&mut data, records, &["1".into()], worker_count)
+                .unwrap();
+            let mut index = Vec::new();
+            writer.write_index(&mut index).unwrap();
+            (data, index)
+        }
+
+        let serial_worker = build(1);
+        let parallel_workers = build(3);
+        assert_eq!(serial_worker, parallel_workers);
     }
 }
