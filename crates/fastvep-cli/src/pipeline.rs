@@ -21,6 +21,8 @@ use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::parallel_records::{BatchParser, OrderedParallelRecordIter};
+
 const BATCH_SIZE: usize = 1024;
 
 fn open_vcf_input_reader(input: &str) -> Result<Box<dyn io::Read>> {
@@ -2362,8 +2364,8 @@ fn open_sa_input(
     input: &str,
     byte_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     skip_bytes: u64,
-) -> Result<Box<dyn io::Read>> {
-    let source: Box<dyn io::Read> = if input == "-" {
+) -> Result<Box<dyn io::Read + Send>> {
+    let source: Box<dyn io::Read + Send> = if input == "-" {
         Box::new(io::stdin())
     } else {
         Box::new(File::open(input).with_context(|| format!("Opening input file: {}", input))?)
@@ -2371,7 +2373,7 @@ fn open_sa_input(
 
     // Count compressed bytes before sniffing/decompression so stdin progress
     // and integrity accounting include every byte received.
-    let raw: Box<dyn io::Read> = match byte_counter {
+    let raw: Box<dyn io::Read + Send> = match byte_counter {
         Some(bytes) => Box::new(crate::progress::CountingReader {
             inner: source,
             bytes,
@@ -2382,7 +2384,7 @@ fn open_sa_input(
     let prefix = buffered.fill_buf()?;
     let is_gzip =
         prefix.starts_with(&[0x1f, 0x8b]) || input.ends_with(".gz") || input.ends_with(".bgz");
-    let mut decoded: Box<dyn io::Read> = if is_gzip {
+    let mut decoded: Box<dyn io::Read + Send> = if is_gzip {
         Box::new(MultiGzDecoder::new(buffered))
     } else {
         Box::new(buffered)
@@ -2546,6 +2548,77 @@ where
     }
 }
 
+fn supplementary_parser_worker_count() -> usize {
+    std::env::var("FASTVEP_SA_PARSE_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| (1..=4).contains(count))
+        .unwrap_or(1)
+}
+
+/// Construct a stateless complete-line parser for sources whose rows do not
+/// depend on file-level header state. dbNSFP and wigFix/PhyloP deliberately
+/// remain on the serial iterator because independent batches would lose their
+/// column or fixed-step context.
+fn parallel_batch_parser(
+    source: &str,
+    chrom_map: &std::collections::HashMap<String, u16>,
+) -> Result<Option<BatchParser>> {
+    if !matches!(
+        source,
+        "spliceai" | "cadd" | "revel" | "dbsnp" | "topmed" | "gerp" | "dann"
+    ) {
+        return Ok(None);
+    }
+
+    let map = std::sync::Arc::new(chrom_map.clone());
+    let selected_fields = annocat_selected_source_fields(source)?;
+    let parser: BatchParser = match source {
+        "spliceai" => std::sync::Arc::new(move |bytes| {
+            fastvep_sa::sources::spliceai::iter_spliceai_vcf_selected(
+                io::Cursor::new(bytes),
+                &map,
+                selected_fields.as_ref(),
+            )
+            .collect()
+        }),
+        "cadd" => std::sync::Arc::new(move |bytes| {
+            fastvep_sa::sources::cadd::iter_cadd_selected(
+                io::Cursor::new(bytes),
+                &map,
+                selected_fields.as_ref(),
+            )
+            .collect()
+        }),
+        "revel" => std::sync::Arc::new(move |bytes| {
+            fastvep_sa::sources::revel::iter_revel_selected(
+                io::Cursor::new(bytes),
+                &map,
+                2,
+                selected_fields.as_ref(),
+            )
+            .collect()
+        }),
+        "dbsnp" => std::sync::Arc::new(move |bytes| {
+            fastvep_sa::sources::dbsnp::iter_dbsnp_vcf_selected(
+                io::Cursor::new(bytes),
+                &map,
+                selected_fields.as_ref(),
+            )
+            .collect()
+        }),
+        "topmed" => std::sync::Arc::new(move |bytes| {
+            fastvep_sa::sources::topmed::iter_topmed_vcf(io::Cursor::new(bytes), &map).collect()
+        }),
+        "gerp" | "dann" => std::sync::Arc::new(move |bytes| {
+            fastvep_sa::sources::scores::iter_score_tsv(io::Cursor::new(bytes), &map, false)
+                .collect()
+        }),
+        _ => unreachable!(),
+    };
+    Ok(Some(parser))
+}
+
 /// Stream a coordinate-sorted source VCF straight into the .osa writer without
 /// buffering every record in memory (issue #55: gnomAD/TOPMed/dbSNP releases
 /// carry 100M+ records). The input is wrapped in a `CountingReader` so the
@@ -2568,12 +2641,12 @@ fn run_streaming_sa_build<'a, I>(
     show_progress: bool,
     selected_fields: Option<&std::collections::HashSet<String>>,
     mut make_iter: impl FnMut(
-        io::BufReader<Box<dyn io::Read>>,
+        io::BufReader<Box<dyn io::Read + Send>>,
         &'a std::collections::HashMap<String, u16>,
     ) -> I,
 ) -> Result<()>
 where
-    I: Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>>,
+    I: Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>> + 'a,
 {
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
@@ -2587,18 +2660,36 @@ where
         .map(|metadata| metadata.len())
         .sum();
     let byte_counter = Arc::new(AtomicU64::new(0));
-    let mut iterators = Vec::with_capacity(inputs.len());
+    let parallel_parser = parallel_batch_parser(source, chrom_map)?;
+    let requested_workers = supplementary_parser_worker_count();
+    let workers_per_input = (requested_workers / inputs.len().max(1)).max(1);
+    if parallel_parser.is_some() && workers_per_input > 1 {
+        eprintln!(
+            "INFO  SA parser - {workers_per_input} workers per input ({} input{})",
+            inputs.len(),
+            if inputs.len() == 1 { "" } else { "s" }
+        );
+    }
+    let mut iterators: Vec<
+        Box<dyn Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>> + 'a>,
+    > = Vec::with_capacity(inputs.len());
     for (input, skip) in inputs.iter().zip(input_skips) {
         let reader = open_sa_input(input, Some(Arc::clone(&byte_counter)), *skip)?;
-        let reader: Box<dyn io::Read> = if chromosome.is_some() {
+        let reader: Box<dyn io::Read + Send> = if chromosome.is_some() {
             Box::new(CompleteLinesReader::new(reader))
         } else {
             reader
         };
-        iterators.push(make_iter(
-            io::BufReader::with_capacity(1024 * 1024, reader),
-            chrom_map,
-        ));
+        let reader = io::BufReader::with_capacity(1024 * 1024, reader);
+        if let Some(parser) = parallel_parser.as_ref().filter(|_| workers_per_input > 1) {
+            iterators.push(Box::new(OrderedParallelRecordIter::new(
+                reader,
+                std::sync::Arc::clone(parser),
+                workers_per_input,
+            )));
+        } else {
+            iterators.push(Box::new(make_iter(reader, chrom_map)));
+        }
     }
 
     let mut meter = if show_progress && file_size > 0 {
@@ -2797,6 +2888,19 @@ mod supplementary_field_tests {
         let original = record.json.clone();
         let filtered = filter_supplementary_record("spliceai", record, Some(&selected)).unwrap();
         assert_eq!(filtered.json, original);
+    }
+
+    #[test]
+    fn parallel_parser_is_limited_to_row_stateless_sources() {
+        let chrom_map = std::collections::HashMap::new();
+        for source in [
+            "spliceai", "cadd", "revel", "dbsnp", "topmed", "gerp", "dann",
+        ] {
+            assert!(parallel_batch_parser(source, &chrom_map).unwrap().is_some());
+        }
+        for source in ["gnomad", "dbnsfp", "phylop"] {
+            assert!(parallel_batch_parser(source, &chrom_map).unwrap().is_none());
+        }
     }
 }
 
