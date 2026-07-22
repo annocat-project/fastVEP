@@ -181,6 +181,18 @@ enum Commands {
         no_progress: bool,
     },
 
+    /// Fully decode and validate a binary transcript cache.
+    CacheVerify {
+        /// Input transcript cache file.
+        #[arg(short, long)]
+        input: String,
+
+        /// Reject coding transcripts on chromosomes 1-22, X, Y, or MT when
+        /// their pre-built sequence data is missing.
+        #[arg(long, default_value_t = false)]
+        require_primary_coding_sequences: bool,
+    },
+
     /// Build a supplementary annotation database (.osa or .osi) from a source file
     SaBuild {
         /// Source type. Known sources (clinvar, gnomad, dbsnp, …) use their
@@ -327,8 +339,30 @@ fn main() -> Result<()> {
                 show_progress: !no_progress,
             })?;
         }
-        Commands::Cache { gff3, fasta, synonyms, output, no_progress } => {
-            pipeline::run_cache_build(&gff3, fasta.as_deref(), synonyms.as_deref(), &output, !no_progress)?;
+        Commands::Cache {
+            gff3,
+            fasta,
+            synonyms,
+            output,
+            no_progress,
+        } => {
+            pipeline::run_cache_build(
+                &gff3,
+                fasta.as_deref(),
+                synonyms.as_deref(),
+                &output,
+                !no_progress,
+            )?;
+        }
+        Commands::CacheVerify {
+            input,
+            require_primary_coding_sequences,
+        } => {
+            let report = fastvep_cache::transcript_cache::verify_cache(
+                std::path::Path::new(&input),
+                require_primary_coding_sequences,
+            )?;
+            println!("{}", serde_json::to_string(&report)?);
         }
         Commands::Web { port, gff3, fasta } => {
             webserver::run_server(port, gff3, fasta)?;

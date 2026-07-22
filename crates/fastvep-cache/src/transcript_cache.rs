@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use fastvep_genome::Transcript;
+use serde::Serialize;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
@@ -18,8 +19,8 @@ const CACHE_MAGIC_V1: &[u8; 8] = b"FSTVEP01";
 
 /// Save transcripts to a binary cache file (bincode + zstd).
 pub fn save_cache(transcripts: &[Transcript], path: &Path) -> Result<()> {
-    let file = File::create(path)
-        .with_context(|| format!("Creating cache file: {}", path.display()))?;
+    let file =
+        File::create(path).with_context(|| format!("Creating cache file: {}", path.display()))?;
     let writer = BufWriter::new(file);
     // zstd level 1: fast compression, still much better decompression than gzip
     let mut zst = zstd::Encoder::new(writer, 1)?;
@@ -39,15 +40,16 @@ pub fn save_cache(transcripts: &[Transcript], path: &Path) -> Result<()> {
 /// Load transcripts from a binary cache file.
 /// Supports both zstd (v2) and legacy gzip (v1) formats.
 pub fn load_cache(path: &Path) -> Result<Vec<Transcript>> {
-    let file = File::open(path)
-        .with_context(|| format!("Opening cache file: {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("Opening cache file: {}", path.display()))?;
     let mut reader = BufReader::new(file);
 
     // Peek at the first bytes to detect format.
     // zstd frames start with 0x28B52FFD; gzip starts with 0x1F8B.
     use std::io::Read;
     let mut peek = [0u8; 4];
-    reader.read_exact(&mut peek)
+    reader
+        .read_exact(&mut peek)
         .with_context(|| "Reading cache header")?;
 
     // Rewind so the decompressor sees the full stream
@@ -76,6 +78,7 @@ fn load_cache_zstd<R: std::io::Read>(reader: R) -> Result<Vec<Transcript>> {
 
     let transcripts: Vec<Transcript> = bincode::deserialize_from(&mut zst)
         .with_context(|| "Deserializing transcripts from cache")?;
+    require_decompressed_eof(&mut zst)?;
     Ok(transcripts)
 }
 
@@ -94,7 +97,137 @@ fn load_cache_gzip<R: std::io::Read>(reader: R) -> Result<Vec<Transcript>> {
 
     let transcripts: Vec<Transcript> = bincode::deserialize_from(&mut gz)
         .with_context(|| "Deserializing transcripts from cache")?;
+    require_decompressed_eof(&mut gz)?;
     Ok(transcripts)
+}
+
+fn require_decompressed_eof(reader: &mut impl std::io::Read) -> Result<()> {
+    let mut trailing = [0u8; 1];
+    if reader
+        .read(&mut trailing)
+        .with_context(|| "Finishing transcript cache stream")?
+        != 0
+    {
+        anyhow::bail!("Transcript cache contains trailing decoded data");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptCacheVerification {
+    pub schema_version: u32,
+    pub cache_format: &'static str,
+    pub cache_bytes: u64,
+    pub transcript_count: u64,
+    pub coding_transcript_count: u64,
+    pub coding_with_sequence_count: u64,
+    pub primary_coding_missing_sequence_count: u64,
+    pub non_primary_coding_missing_sequence_count: u64,
+}
+
+/// Fully decode a transcript cache and validate the structural invariants used
+/// by annotation. Installed caches may require sequence-complete coding
+/// transcripts on the primary assembly while still permitting annotation
+/// records on alt contigs that are absent from a primary-only FASTA.
+pub fn verify_cache(
+    path: &Path,
+    require_primary_coding_sequences: bool,
+) -> Result<TranscriptCacheVerification> {
+    let cache_bytes = path
+        .metadata()
+        .with_context(|| format!("Reading cache metadata: {}", path.display()))?
+        .len();
+    if cache_bytes == 0 {
+        anyhow::bail!("Transcript cache is empty");
+    }
+
+    let cache_format = cache_format(path)?;
+    let transcripts = load_cache(path)?;
+    if transcripts.is_empty() {
+        anyhow::bail!("Transcript cache contains no transcripts");
+    }
+
+    let mut coding_transcript_count = 0u64;
+    let mut coding_with_sequence_count = 0u64;
+    let mut primary_coding_missing_sequence_count = 0u64;
+    let mut non_primary_coding_missing_sequence_count = 0u64;
+
+    for transcript in &transcripts {
+        if transcript.stable_id.is_empty()
+            || transcript.chromosome.is_empty()
+            || transcript.start == 0
+            || transcript.end < transcript.start
+            || transcript.exons.is_empty()
+            || transcript
+                .exons
+                .iter()
+                .any(|exon| exon.start == 0 || exon.end < exon.start)
+        {
+            anyhow::bail!(
+                "Transcript cache contains an invalid transcript record: {}",
+                transcript.stable_id
+            );
+        }
+
+        if transcript.is_coding() {
+            coding_transcript_count += 1;
+            if transcript
+                .spliced_seq
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                coding_with_sequence_count += 1;
+            } else if is_primary_chromosome(&transcript.chromosome) {
+                primary_coding_missing_sequence_count += 1;
+            } else {
+                non_primary_coding_missing_sequence_count += 1;
+            }
+        }
+    }
+
+    if require_primary_coding_sequences && primary_coding_missing_sequence_count != 0 {
+        anyhow::bail!(
+            "Transcript cache has {} primary-assembly coding transcripts without sequence data",
+            primary_coding_missing_sequence_count
+        );
+    }
+
+    Ok(TranscriptCacheVerification {
+        schema_version: 1,
+        cache_format,
+        cache_bytes,
+        transcript_count: transcripts.len() as u64,
+        coding_transcript_count,
+        coding_with_sequence_count,
+        primary_coding_missing_sequence_count,
+        non_primary_coding_missing_sequence_count,
+    })
+}
+
+fn cache_format(path: &Path) -> Result<&'static str> {
+    use std::io::Read;
+    let mut file =
+        File::open(path).with_context(|| format!("Opening cache file: {}", path.display()))?;
+    let mut prefix = [0u8; 4];
+    file.read_exact(&mut prefix)
+        .with_context(|| "Reading cache compression header")?;
+    Ok(if prefix[0..2] == [0x1F, 0x8B] {
+        "FSTVEP01"
+    } else {
+        "FSTVEP02"
+    })
+}
+
+fn is_primary_chromosome(chromosome: &str) -> bool {
+    let chromosome = chromosome
+        .strip_prefix("chr")
+        .or_else(|| chromosome.strip_prefix("CHR"))
+        .unwrap_or(chromosome);
+    matches!(chromosome, "X" | "Y" | "M" | "MT")
+        || chromosome
+            .parse::<u8>()
+            .is_ok_and(|value| (1..=22).contains(&value))
 }
 
 /// Check if cache file is newer than source file.
@@ -132,7 +265,7 @@ pub fn default_cache_path(gff3_path: &Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use fastvep_core::Strand;
-    use fastvep_genome::{Exon, Gene, Transcript};
+    use fastvep_genome::{Exon, Gene, Transcript, Translation};
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
@@ -156,17 +289,15 @@ mod tests {
             start: 1000,
             end: 5000,
             strand: Strand::Forward,
-            exons: vec![
-                Exon {
-                    stable_id: "ENSE001".into(),
-                    start: 1000,
-                    end: 1200,
-                    strand: Strand::Forward,
-                    phase: 0,
-                    end_phase: -1,
-                    rank: 1,
-                },
-            ],
+            exons: vec![Exon {
+                stable_id: "ENSE001".into(),
+                start: 1000,
+                end: 1200,
+                strand: Strand::Forward,
+                phase: 0,
+                end_phase: -1,
+                rank: 1,
+            }],
             translation: None,
             cdna_coding_start: Some(1),
             cdna_coding_end: Some(200),
@@ -221,8 +352,8 @@ mod tests {
     #[test]
     fn test_legacy_gzip_cache_loads() {
         // Create a legacy gzip cache and verify it still loads
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         let transcripts = vec![make_test_transcript()];
@@ -239,5 +370,57 @@ mod tests {
         let loaded = load_cache(path).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(&*loaded[0].stable_id, "ENST00000001");
+    }
+
+    fn make_coding_transcript(chromosome: &str, sequence: bool) -> Transcript {
+        let mut transcript = make_test_transcript();
+        transcript.chromosome = chromosome.into();
+        transcript.gene.chromosome = chromosome.into();
+        transcript.translation = Some(Translation {
+            stable_id: "ENSP00000001".into(),
+            genomic_start: 1000,
+            genomic_end: 1200,
+            start_exon_rank: 1,
+            start_exon_offset: 0,
+            end_exon_rank: 1,
+            end_exon_offset: 200,
+        });
+        if !sequence {
+            transcript.spliced_seq = None;
+            transcript.translateable_seq = None;
+            transcript.peptide = None;
+        }
+        transcript
+    }
+
+    #[test]
+    fn verifies_a_sequence_complete_primary_cache() {
+        let tmp = NamedTempFile::new().unwrap();
+        save_cache(&[make_coding_transcript("1", true)], tmp.path()).unwrap();
+
+        let report = verify_cache(tmp.path(), true).unwrap();
+        assert_eq!(report.cache_format, "FSTVEP02");
+        assert_eq!(report.transcript_count, 1);
+        assert_eq!(report.coding_with_sequence_count, 1);
+        assert_eq!(report.primary_coding_missing_sequence_count, 0);
+    }
+
+    #[test]
+    fn rejects_missing_primary_coding_sequences_when_required() {
+        let tmp = NamedTempFile::new().unwrap();
+        save_cache(&[make_coding_transcript("chr1", false)], tmp.path()).unwrap();
+
+        assert!(verify_cache(tmp.path(), true).is_err());
+        let report = verify_cache(tmp.path(), false).unwrap();
+        assert_eq!(report.primary_coding_missing_sequence_count, 1);
+    }
+
+    #[test]
+    fn permits_missing_non_primary_sequences() {
+        let tmp = NamedTempFile::new().unwrap();
+        save_cache(&[make_coding_transcript("KI270713.1", false)], tmp.path()).unwrap();
+
+        let report = verify_cache(tmp.path(), true).unwrap();
+        assert_eq!(report.non_primary_coding_missing_sequence_count, 1);
     }
 }
