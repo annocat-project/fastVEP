@@ -377,3 +377,42 @@ fn fastvep_owns_range_skip_and_chromosome_filtering() {
             .is_none()
     );
 }
+
+#[test]
+fn indexed_range_discards_a_trailing_partial_database_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("cadd-range.part");
+    let output = tmp.path().join("cadd");
+    fs::write(
+        &input,
+        gzip(
+            "#Chrom\tPos\tRef\tAlt\tRawScore\tPHRED\n\
+             1\t100\tA\tG\t0.1\t10.0\n\
+             1\t101\tC",
+        ),
+    )
+    .unwrap();
+
+    run_sa_build_inputs(
+        "cadd",
+        &[input.to_string_lossy().into_owned()],
+        &[0],
+        Some("1"),
+        output.to_str().unwrap(),
+        "GRCh38",
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let reader = SaReader::open(&output.with_extension("osa")).unwrap();
+    assert!(reader
+        .annotate_position("chr1", 100, "A", "G")
+        .unwrap()
+        .is_some());
+    assert!(reader
+        .annotate_position("chr1", 101, "C", "T")
+        .unwrap()
+        .is_none());
+}

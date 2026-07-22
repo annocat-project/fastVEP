@@ -2304,6 +2304,70 @@ fn open_sa_input(
     Ok(decoded)
 }
 
+/// Expose only newline-terminated records from a decoded byte-range input.
+///
+/// Tabix ranges end on BGZF block boundaries, not necessarily text-record
+/// boundaries. The final complete BGZF block may therefore contain the first
+/// bytes of the next row. Source parsers must never see that fragment as a
+/// complete database row. Keep at most one pending line and discard it at EOF
+/// unless a newline arrived. Complete inputs continue to use the reader
+/// directly and retain their normal final-line behavior.
+struct CompleteLinesReader<R> {
+    inner: R,
+    pending: Vec<u8>,
+    ready: Vec<u8>,
+    ready_offset: usize,
+    eof: bool,
+}
+
+impl<R: Read> CompleteLinesReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            ready: Vec::new(),
+            ready_offset: 0,
+            eof: false,
+        }
+    }
+
+    fn fill_ready(&mut self) -> io::Result<()> {
+        while self.ready_offset == self.ready.len() && !self.eof {
+            self.ready.clear();
+            self.ready_offset = 0;
+            let mut chunk = [0_u8; 64 * 1024];
+            let read = self.inner.read(&mut chunk)?;
+            if read == 0 {
+                self.eof = true;
+                self.pending.clear();
+                break;
+            }
+            self.pending.extend_from_slice(&chunk[..read]);
+            if let Some(last_newline) = self.pending.iter().rposition(|byte| *byte == b'\n') {
+                self.ready.extend(self.pending.drain(..=last_newline));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for CompleteLinesReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        self.fill_ready()?;
+        if self.ready_offset == self.ready.len() {
+            return Ok(0);
+        }
+        let available = &self.ready[self.ready_offset..];
+        let count = output.len().min(available.len());
+        output[..count].copy_from_slice(&available[..count]);
+        self.ready_offset += count;
+        Ok(count)
+    }
+}
+
 /// Merge already-sorted source artifacts without asking the caller to decode,
 /// inspect, or rewrite their rows. This is used for logical sources such as
 /// CADD whose SNV and indel artifacts are independently coordinate sorted.
@@ -2432,6 +2496,11 @@ where
     let mut iterators = Vec::with_capacity(inputs.len());
     for (input, skip) in inputs.iter().zip(input_skips) {
         let reader = open_sa_input(input, Some(Arc::clone(&byte_counter)), *skip)?;
+        let reader: Box<dyn io::Read> = if chromosome.is_some() {
+            Box::new(CompleteLinesReader::new(reader))
+        } else {
+            reader
+        };
         iterators.push(make_iter(io::BufReader::new(reader), chrom_map));
     }
 
