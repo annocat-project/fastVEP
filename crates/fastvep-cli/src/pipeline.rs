@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::parallel_records::{BatchParser, OrderedParallelRecordIter};
@@ -2076,10 +2076,47 @@ pub fn run_cache_build(
     };
 
     if let Some(fasta) = fasta_path {
-        let fasta_file =
-            File::open(fasta).with_context(|| format!("Opening FASTA file: {}", fasta))?;
-        let reader = FastaReader::from_reader(fasta_file)?;
-        eprintln!("Loaded reference FASTA from {}", fasta);
+        let fasta_path = Path::new(fasta);
+        let fai_path = PathBuf::from(format!("{}.fai", fasta_path.display()));
+        let (contigs, sp): (
+            std::collections::HashSet<String>,
+            Box<dyn SequenceProvider>,
+        ) = if fai_path.is_file() {
+            let indexed = fastvep_cache::fasta::MmapFastaReader::open(fasta_path)
+                .with_context(|| {
+                    format!(
+                        "Opening indexed FASTA {} for transcript-cache construction",
+                        fasta_path.display()
+                    )
+                })?;
+            let contigs = indexed
+                .sequence_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            eprintln!("Memory-mapped indexed reference FASTA from {}", fasta);
+            (
+                contigs,
+                Box::new(fastvep_cache::providers::MmapFastaSequenceProvider::new(
+                    indexed,
+                )),
+            )
+        } else {
+            let fasta_file = File::open(fasta)
+                .with_context(|| format!("Opening FASTA file: {}", fasta))?;
+            let reader = FastaReader::from_reader(fasta_file)?;
+            let contigs = reader
+                .sequence_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            eprintln!(
+                "Loaded unindexed reference FASTA from {} (add {} to reduce memory use)",
+                fasta,
+                fai_path.display()
+            );
+            (contigs, Box::new(FastaSequenceProvider::new(reader)))
+        };
 
         // Canonicalize every transcript (and its gene) to the FASTA's contig
         // naming. This both lets sequence fetch succeed and makes a merged
@@ -2087,11 +2124,6 @@ pub fn run_cache_build(
         // `annotate` matches a VCF regardless of which GFF3 the transcript
         // came from. RefSeq accessions only resolve when a synonyms file maps
         // them; chr↔bare / mito resolve with no synonyms file at all.
-        let contigs: std::collections::HashSet<String> = reader
-            .sequence_names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
         let mut resolved: HashMap<String, Option<std::sync::Arc<str>>> = HashMap::new();
         let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tr in &mut transcripts {
@@ -2136,7 +2168,6 @@ pub fn run_cache_build(
             );
         }
 
-        let sp = FastaSequenceProvider::new(reader);
         let mut meter = crate::progress::ProgressMeter::new(show_progress);
         let mut missing_contig = 0usize;
         for tr in &mut transcripts {
