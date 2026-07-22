@@ -308,16 +308,21 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     if needs_seq_build {
         if let Some(ref sp) = seq_provider {
             let built = AtomicUsize::new(0);
+            let missing_contig = AtomicUsize::new(0);
             transcripts.par_iter_mut().for_each(|tr| {
                 if tr.is_coding() && tr.spliced_seq.is_none() {
                     if let Err(e) = tr.build_sequences(|chrom, start, end| {
                         sp.fetch_sequence(chrom, start, end)
                             .map_err(|e| e.to_string())
                     }) {
-                        eprintln!(
-                            "Warning: could not build sequences for {}: {}",
-                            tr.stable_id, e
-                        );
+                        if e.to_string().contains("not found in FASTA") {
+                            missing_contig.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            eprintln!(
+                                "Warning: could not build sequences for {}: {}",
+                                tr.stable_id, e
+                            );
+                        }
                     } else {
                         built.fetch_add(1, Ordering::Relaxed);
                     }
@@ -327,6 +332,12 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                 "Built sequences for {} coding transcripts",
                 built.load(Ordering::Relaxed)
             );
+            let missing_contig = missing_contig.load(Ordering::Relaxed);
+            if missing_contig > 0 {
+                eprintln!(
+                    "Skipped sequence construction for {missing_contig} coding transcripts on contigs absent from the FASTA"
+                );
+            }
         }
     }
 
@@ -2127,22 +2138,32 @@ pub fn run_cache_build(
 
         let sp = FastaSequenceProvider::new(reader);
         let mut meter = crate::progress::ProgressMeter::new(show_progress);
+        let mut missing_contig = 0usize;
         for tr in &mut transcripts {
             if tr.is_coding() {
                 if let Err(e) = tr.build_sequences(|chrom, start, end| {
                     sp.fetch_sequence(chrom, start, end)
                         .map_err(|e| e.to_string())
                 }) {
-                    eprintln!(
-                        "Warning: could not build sequences for {}: {}",
-                        tr.stable_id, e
-                    );
+                    if e.to_string().contains("not found in FASTA") {
+                        missing_contig += 1;
+                    } else {
+                        eprintln!(
+                            "Warning: could not build sequences for {}: {}",
+                            tr.stable_id, e
+                        );
+                    }
                 } else {
                     meter.update();
                 }
             }
         }
         meter.finish();
+        if missing_contig > 0 {
+            eprintln!(
+                "Skipped sequence construction for {missing_contig} coding transcripts on contigs absent from the FASTA"
+            );
+        }
     } else if synonyms_path.is_some() {
         eprintln!(
             "Warning: --synonyms has no effect without --fasta; chromosome names are kept as-is from the GFF3."
