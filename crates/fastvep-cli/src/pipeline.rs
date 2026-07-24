@@ -682,26 +682,6 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             break;
         }
 
-        // Phase 1.5: Preload SA providers for this batch (sequential)
-        if !sa_providers.is_empty() && !batch.is_empty() {
-            // Collect all positions in this batch, grouped by chromosome
-            let mut chrom_positions: HashMap<&str, Vec<u64>> = HashMap::new();
-            for (vf, _) in &batch {
-                let positions = chrom_positions.entry(&vf.position.chromosome).or_default();
-                positions.push(vf.position.start);
-                if let Some(vcf) = &vf.vcf_fields {
-                    if vcf.pos != vf.position.start {
-                        positions.push(vcf.pos);
-                    }
-                }
-            }
-            for sa in &sa_providers {
-                for (chrom, positions) in &chrom_positions {
-                    let _ = sa.preload(chrom, positions);
-                }
-            }
-        }
-
         // Phase 2: Annotate batch in parallel (transcript lookup + consequence prediction + HGVS)
         batch.par_iter_mut().for_each(|(vf, matched_by_allele)| {
             // In --sa-only mode, skip transcript lookup + consequence
@@ -1240,23 +1220,20 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                         vec![vf.transcript_variations.swap_remove(idx)];
                 }
             }
+        });
 
-            // Supplementary annotation: query SA providers once per unique
-            // allele, then attach the result to every (transcript, allele)
-            // slot that shares it. SA results depend only on (pos, ref, alt),
-            // never on the transcript context, so this avoids T× amplification
-            // for variants overlapping many transcripts. Runs for all variants
-            // (intergenic, transcript-overlapping, and sa_only scaffold) so
-            // supplementary databases attach to every record that matches.
-            if !sa_providers.is_empty() {
-                let chrom = &vf.position.chromosome;
+        // Query each supplementary provider in input order so its block cache
+        // advances monotonically. Independent providers still run in parallel.
+        let sa_queries_by_variant: Vec<Vec<(String, u64, String, String)>> = batch
+            .iter()
+            .map(|(vf, _)| {
                 let sa_queries = supplementary_query_alleles(vf);
-                let mut allele_results: HashMap<String, Vec<(String, String)>> =
-                    HashMap::new();
+                let mut seen = std::collections::HashSet::new();
+                let mut queries = Vec::new();
                 for tv in &vf.transcript_variations {
                     for aa in &tv.allele_annotations {
                         let allele_key = aa.allele.to_string();
-                        if allele_results.contains_key(&allele_key) {
+                        if !seen.insert(allele_key.clone()) {
                             continue;
                         }
                         let (query_pos, ref_str, alt_str) = sa_queries
@@ -1272,60 +1249,89 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                     allele_key.clone(),
                                 )
                             });
-                        // gnomAD stores left-aligned, parsimonious alleles; the
-                        // raw input representation can differ for indels (esp.
-                        // in repeats), silently missing the match and making
-                        // PM2 misfire on common variants. Normalize the query to
-                        // gnomAD's minimal representation — only when a gnomAD
-                        // provider and a reference are present, and applied only
-                        // to the gnomAD lookup (other sources keep the raw key).
-                        let gnomad_norm = if seq_provider.is_some()
-                            && sa_providers.iter().any(|sa| sa.json_key() == "gnomad")
-                        {
+                        queries.push((allele_key, query_pos, ref_str, alt_str));
+                    }
+                }
+                queries
+            })
+            .collect();
+        let provider_results = sa_providers
+            .par_iter()
+            .map(|sa| {
+                let source_key = sa.json_key().to_string();
+                let mut results = Vec::new();
+                for (variant_index, ((vf, _), queries)) in
+                    batch.iter().zip(&sa_queries_by_variant).enumerate()
+                {
+                    let chrom = &vf.position.chromosome;
+                    for (allele_key, query_pos, ref_str, alt_str) in queries {
+                        // gnomAD stores normalized alleles; other providers use
+                        // the uploaded representation retained above.
+                        let gnomad_norm = if source_key == "gnomad" {
                             seq_provider.as_ref().map(|sp| {
                                 fastvep_cache::normalize::normalize_variant(
                                     &**sp,
                                     chrom,
-                                    query_pos,
-                                    &ref_str,
-                                    &alt_str,
+                                    *query_pos,
+                                    ref_str,
+                                    alt_str,
                                 )
                             })
                         } else {
                             None
                         };
-                        let mut results: Vec<(String, String)> = Vec::new();
-                        for sa in &sa_providers {
-                            let (sa_pos, sa_ref, sa_alt) = if sa.metadata().match_by_allele {
-                                if sa.json_key() == "gnomad" {
-                                    match &gnomad_norm {
-                                        Some(n) => {
-                                            (n.pos, n.ref_allele.as_str(), n.alt_allele.as_str())
-                                        }
-                                        None => (query_pos, ref_str.as_str(), alt_str.as_str()),
+                        let (sa_pos, sa_ref, sa_alt) = if sa.metadata().match_by_allele {
+                            if source_key == "gnomad" {
+                                match &gnomad_norm {
+                                    Some(n) => {
+                                        (n.pos, n.ref_allele.as_str(), n.alt_allele.as_str())
                                     }
-                                } else {
-                                    (query_pos, ref_str.as_str(), alt_str.as_str())
+                                    None => (*query_pos, ref_str.as_str(), alt_str.as_str()),
                                 }
                             } else {
-                                (vf.position.start, "", "")
-                            };
-                            if let Ok(Some(ann)) =
-                                sa.annotate_position(chrom, sa_pos, sa_ref, sa_alt)
-                            {
-                                let json_str = match ann {
-                                    AnnotationValue::Json(j) => j,
-                                    AnnotationValue::Positional(j) => j,
-                                    AnnotationValue::Interval(v) => {
-                                        format!("[{}]", v.join(","))
-                                    }
-                                };
-                                results.push((sa.json_key().to_string(), json_str));
+                                (*query_pos, ref_str.as_str(), alt_str.as_str())
                             }
+                        } else {
+                            (vf.position.start, "", "")
+                        };
+                        if let Ok(Some(annotation)) =
+                            sa.annotate_position(chrom, sa_pos, sa_ref, sa_alt)
+                        {
+                            let json = match annotation {
+                                AnnotationValue::Json(json) => json,
+                                AnnotationValue::Positional(json) => json,
+                                AnnotationValue::Interval(values) => {
+                                    format!("[{}]", values.join(","))
+                                }
+                            };
+                            results.push((
+                                variant_index,
+                                allele_key.clone(),
+                                source_key.clone(),
+                                json,
+                            ));
                         }
-                        allele_results.insert(allele_key, results);
                     }
                 }
+                results
+            })
+            .collect::<Vec<_>>();
+        let mut batch_sa_results = vec![HashMap::<String, Vec<(String, String)>>::new(); batch.len()];
+        for results in provider_results {
+            for (variant_index, allele_key, source_key, json) in results {
+                batch_sa_results[variant_index]
+                    .entry(allele_key)
+                    .or_default()
+                    .push((source_key, json));
+            }
+        }
+
+        batch
+            .par_iter_mut()
+            .zip(batch_sa_results.par_iter())
+            .for_each(|((vf, _), allele_results)| {
+                // Attach each allele-level result to every transcript slot that
+                // shares it without repeating provider queries.
                 for tv in &mut vf.transcript_variations {
                     for aa in &mut tv.allele_annotations {
                         if let Some(results) = allele_results.get(&aa.allele.to_string()) {
@@ -1333,7 +1339,6 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                         }
                     }
                 }
-            }
 
             // Gene-level annotation pass (OMIM, gnomAD gene constraints, etc.)
             if !gene_providers.is_empty() {
