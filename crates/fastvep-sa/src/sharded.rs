@@ -29,6 +29,7 @@ pub struct ShardedSaReader {
     metadata: SaMetadata,
     readers: Vec<SaReader>,
     chromosome_to_reader: HashMap<String, usize>,
+    fallback_reader: Option<usize>,
 }
 
 impl ShardedSaReader {
@@ -55,6 +56,7 @@ impl ShardedSaReader {
             .with_context(|| format!("Resolving shard directory for {}", manifest_path.display()))?;
         let mut readers = Vec::with_capacity(manifest.shards.len());
         let mut chromosome_to_reader = HashMap::new();
+        let mut fallback_reader = None;
         let mut metadata: Option<SaMetadata> = None;
 
         for shard in manifest.shards {
@@ -78,6 +80,11 @@ impl ShardedSaReader {
             }
 
             let reader_index = readers.len();
+            if shard.chromosome.eq_ignore_ascii_case("all")
+                && fallback_reader.replace(reader_index).is_some()
+            {
+                anyhow::bail!("Duplicate all-chromosome fallback in OSA shard manifest");
+            }
             for alias in chrom_aliases(&shard.chromosome) {
                 if chromosome_to_reader.insert(alias.clone(), reader_index).is_some() {
                     anyhow::bail!("Duplicate chromosome/alias '{}' in OSA shard manifest", alias);
@@ -90,14 +97,17 @@ impl ShardedSaReader {
             metadata: metadata.expect("non-empty manifest establishes metadata"),
             readers,
             chromosome_to_reader,
+            fallback_reader,
         })
     }
 
     fn reader_for(&self, chromosome: &str) -> Option<&SaReader> {
-        chrom_aliases(chromosome)
+        let index = chrom_aliases(chromosome)
             .iter()
             .find_map(|alias| self.chromosome_to_reader.get(alias))
-            .and_then(|index| self.readers.get(*index))
+            .copied()
+            .or(self.fallback_reader)?;
+        self.readers.get(index)
     }
 }
 
@@ -198,6 +208,25 @@ mod tests {
         assert!(reader.annotate_position("chr2", 200, "A", "G").unwrap().is_some());
         assert!(reader.annotate_position("chr3", 100, "A", "G").unwrap().is_none());
         assert!(reader.annotate_position("chr1", 200, "A", "G").unwrap().is_none());
+    }
+
+    #[test]
+    fn uses_all_chromosome_shard_as_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let shard_dir = temp.path().join("shards");
+        std::fs::create_dir(&shard_dir).unwrap();
+        write_shard(&shard_dir, "all", "chr1", 0, 100);
+        let manifest = temp.path().join("clinvar.osa-shards.json");
+        std::fs::write(
+            &manifest,
+            r#"{"schemaVersion":1,"shards":[{"chromosome":"all","file":"shards/all.osa"}]}"#,
+        )
+        .unwrap();
+
+        let reader = ShardedSaReader::open(&manifest).unwrap();
+        assert!(reader.annotate_position("1", 100, "A", "G").unwrap().is_some());
+        assert!(reader.annotate_position("chr1", 100, "A", "G").unwrap().is_some());
+        assert!(reader.annotate_position("2", 100, "A", "G").unwrap().is_none());
     }
 
     #[test]

@@ -23,8 +23,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::parallel_records::{BatchParser, OrderedParallelRecordIter};
 
-const BATCH_SIZE: usize = 1024;
-
 fn open_vcf_input_reader(input: &str) -> Result<Box<dyn io::Read>> {
     let reader: Box<dyn io::Read> = if input == "-" {
         Box::new(io::stdin())
@@ -61,6 +59,7 @@ pub struct AnnotateConfig {
     pub gff3: Vec<String>,
     pub fasta: Option<String>,
     pub output_format: String,
+    pub buffer_size: usize,
     pub pick: bool,
     pub hgvs: bool,
     pub distance: u64,
@@ -620,11 +619,12 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     let mut meter = crate::progress::ProgressMeter::new(config.show_progress);
     let mut first_json = true;
 
+    let batch_size = config.buffer_size.max(1);
     loop {
         // Phase 1: Read a batch of variants (sequential - VCF parser is not Sync)
         let mut batch: Vec<(VariationFeature, HashMap<String, Vec<MatchedVariant>>)> =
-            Vec::with_capacity(BATCH_SIZE);
-        for _ in 0..BATCH_SIZE {
+            Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
             match vcf_parser.next_variant()? {
                 Some(mut vf) => {
                     // Variation lookup (sequential - TabixVariationProvider is not Sync)
