@@ -1,7 +1,7 @@
-//! Manifest-backed collection of chromosome-specific OSA v1 databases.
+//! Manifest-backed collection of chromosome-specific OSA databases.
 
 use crate::common::chrom_aliases;
-use crate::reader::SaReader;
+use crate::reader::{AnySaReader, SaCacheFormat};
 use anyhow::{Context, Result};
 use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
 use serde::Deserialize;
@@ -27,7 +27,7 @@ struct ShardEntry {
 /// One logical annotation provider backed by one verified OSA per chromosome.
 pub struct ShardedSaReader {
     metadata: SaMetadata,
-    readers: Vec<SaReader>,
+    readers: Vec<AnySaReader>,
     chromosome_to_reader: HashMap<String, usize>,
     fallback_reader: Option<usize>,
 }
@@ -46,33 +46,53 @@ impl ShardedSaReader {
             );
         }
         if manifest.shards.is_empty() {
-            anyhow::bail!("OSA shard manifest contains no shards: {}", manifest_path.display());
+            anyhow::bail!(
+                "OSA shard manifest contains no shards: {}",
+                manifest_path.display()
+            );
         }
 
         let manifest_dir = manifest_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .canonicalize()
-            .with_context(|| format!("Resolving shard directory for {}", manifest_path.display()))?;
+            .with_context(|| {
+                format!("Resolving shard directory for {}", manifest_path.display())
+            })?;
         let mut readers = Vec::with_capacity(manifest.shards.len());
         let mut chromosome_to_reader = HashMap::new();
         let mut fallback_reader = None;
         let mut metadata: Option<SaMetadata> = None;
+        let mut format: Option<SaCacheFormat> = None;
 
         for shard in manifest.shards {
             let relative = Path::new(&shard.file);
             if relative.is_absolute() {
                 anyhow::bail!("OSA shard path must be relative: {}", shard.file);
             }
-            let shard_path = manifest_dir.join(relative).canonicalize().with_context(|| {
-                format!("Resolving OSA shard '{}' from {}", shard.file, manifest_path.display())
-            })?;
+            let shard_path = manifest_dir
+                .join(relative)
+                .canonicalize()
+                .with_context(|| {
+                    format!(
+                        "Resolving OSA shard '{}' from {}",
+                        shard.file,
+                        manifest_path.display()
+                    )
+                })?;
             if !shard_path.starts_with(&manifest_dir) {
                 anyhow::bail!("OSA shard escapes its manifest directory: {}", shard.file);
             }
 
-            let reader = SaReader::open(&shard_path)
+            let reader = AnySaReader::open(&shard_path)
                 .with_context(|| format!("Opening OSA shard {}", shard_path.display()))?;
+            if let Some(expected) = format {
+                if reader.format() != expected {
+                    anyhow::bail!("OSA shard manifest mixes OSA v1 and OSA2 files");
+                }
+            } else {
+                format = Some(reader.format());
+            }
             if let Some(expected) = &metadata {
                 validate_same_source(expected, reader.metadata(), &shard.file)?;
             } else {
@@ -86,8 +106,14 @@ impl ShardedSaReader {
                 anyhow::bail!("Duplicate all-chromosome fallback in OSA shard manifest");
             }
             for alias in chrom_aliases(&shard.chromosome) {
-                if chromosome_to_reader.insert(alias.clone(), reader_index).is_some() {
-                    anyhow::bail!("Duplicate chromosome/alias '{}' in OSA shard manifest", alias);
+                if chromosome_to_reader
+                    .insert(alias.clone(), reader_index)
+                    .is_some()
+                {
+                    anyhow::bail!(
+                        "Duplicate chromosome/alias '{}' in OSA shard manifest",
+                        alias
+                    );
                 }
             }
             readers.push(reader);
@@ -101,7 +127,7 @@ impl ShardedSaReader {
         })
     }
 
-    fn reader_for(&self, chromosome: &str) -> Option<&SaReader> {
+    fn reader_for(&self, chromosome: &str) -> Option<&AnySaReader> {
         let index = chrom_aliases(chromosome)
             .iter()
             .find_map(|alias| self.chromosome_to_reader.get(alias))
@@ -120,15 +146,24 @@ fn validate_same_source(expected: &SaMetadata, actual: &SaMetadata, file: &str) 
         || expected.is_array != actual.is_array
         || expected.is_positional != actual.is_positional
     {
-        anyhow::bail!("OSA shard '{}' has source metadata inconsistent with the first shard", file);
+        anyhow::bail!(
+            "OSA shard '{}' has source metadata inconsistent with the first shard",
+            file
+        );
     }
     Ok(())
 }
 
 impl AnnotationProvider for ShardedSaReader {
-    fn name(&self) -> &str { &self.metadata.name }
-    fn json_key(&self) -> &str { &self.metadata.json_key }
-    fn metadata(&self) -> &SaMetadata { &self.metadata }
+    fn name(&self) -> &str {
+        &self.metadata.name
+    }
+    fn json_key(&self) -> &str {
+        &self.metadata.json_key
+    }
+    fn metadata(&self) -> &SaMetadata {
+        &self.metadata
+    }
 
     fn annotate_position(
         &self,
@@ -157,6 +192,7 @@ mod tests {
     use crate::common::{AnnotationRecord, SCHEMA_VERSION};
     use crate::index::IndexHeader;
     use crate::writer::SaWriter;
+    use crate::writer_v2::{Osa2Metadata, Osa2Record, Osa2Writer};
 
     fn write_shard(dir: &Path, name: &str, chromosome: &str, chrom_idx: u16, position: u32) {
         let header = IndexHeader {
@@ -187,6 +223,34 @@ mod tests {
             .unwrap();
     }
 
+    fn write_osa2_shard(dir: &Path, name: &str, chromosome: &str, position: u32) {
+        let metadata = Osa2Metadata {
+            format_version: 2,
+            name: "dbNSFP".into(),
+            version: "4.9a".into(),
+            description: "test".into(),
+            assembly: "GRCh38".into(),
+            json_key: "dbnsfp".into(),
+            match_by_allele: true,
+            is_array: false,
+            is_positional: false,
+            chunk_bits: 20,
+        };
+        Osa2Writer::new(metadata, Vec::new())
+            .write_all(
+                std::fs::File::create(dir.join(name)).unwrap(),
+                &[Osa2Record {
+                    chrom: chromosome.into(),
+                    position,
+                    ref_allele: b"A".to_vec(),
+                    alt_allele: b"G".to_vec(),
+                    values: Vec::new(),
+                    json_blob: None,
+                }],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn dispatches_each_chromosome_through_one_logical_provider() {
         let temp = tempfile::tempdir().unwrap();
@@ -204,10 +268,22 @@ mod tests {
         let reader = ShardedSaReader::open(&manifest).unwrap();
         assert_eq!(reader.name(), "dbNSFP");
         assert_eq!(reader.json_key(), "dbnsfp");
-        assert!(reader.annotate_position("1", 100, "A", "G").unwrap().is_some());
-        assert!(reader.annotate_position("chr2", 200, "A", "G").unwrap().is_some());
-        assert!(reader.annotate_position("chr3", 100, "A", "G").unwrap().is_none());
-        assert!(reader.annotate_position("chr1", 200, "A", "G").unwrap().is_none());
+        assert!(reader
+            .annotate_position("1", 100, "A", "G")
+            .unwrap()
+            .is_some());
+        assert!(reader
+            .annotate_position("chr2", 200, "A", "G")
+            .unwrap()
+            .is_some());
+        assert!(reader
+            .annotate_position("chr3", 100, "A", "G")
+            .unwrap()
+            .is_none());
+        assert!(reader
+            .annotate_position("chr1", 200, "A", "G")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -224,9 +300,18 @@ mod tests {
         .unwrap();
 
         let reader = ShardedSaReader::open(&manifest).unwrap();
-        assert!(reader.annotate_position("1", 100, "A", "G").unwrap().is_some());
-        assert!(reader.annotate_position("chr1", 100, "A", "G").unwrap().is_some());
-        assert!(reader.annotate_position("2", 100, "A", "G").unwrap().is_none());
+        assert!(reader
+            .annotate_position("1", 100, "A", "G")
+            .unwrap()
+            .is_some());
+        assert!(reader
+            .annotate_position("chr1", 100, "A", "G")
+            .unwrap()
+            .is_some());
+        assert!(reader
+            .annotate_position("2", 100, "A", "G")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -266,5 +351,25 @@ mod tests {
             .expect("absolute shard path must fail")
             .to_string()
             .contains("relative"));
+    }
+
+    #[test]
+    fn rejects_mixed_cache_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let shard_dir = temp.path().join("shards");
+        std::fs::create_dir(&shard_dir).unwrap();
+        write_shard(&shard_dir, "chr1", "1", 0, 100);
+        write_osa2_shard(&shard_dir, "chr2.osa2", "2", 200);
+        let manifest = temp.path().join("mixed.osa-shards.json");
+        std::fs::write(
+            &manifest,
+            r#"{"schemaVersion":1,"shards":[{"chromosome":"1","file":"shards/chr1.osa"},{"chromosome":"2","file":"shards/chr2.osa2"}]}"#,
+        )
+        .unwrap();
+
+        let error = ShardedSaReader::open(&manifest)
+            .err()
+            .expect("mixed cache formats must fail");
+        assert!(error.to_string().contains("mixes OSA v1 and OSA2"));
     }
 }

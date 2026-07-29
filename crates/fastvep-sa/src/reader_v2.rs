@@ -7,11 +7,12 @@ use crate::chunk::{delta_decode, Chunk};
 use crate::common::chrom_aliases;
 use crate::fields::{Field, FieldType};
 use crate::kmer16::LongVariant;
+use crate::reader::SaVerificationReport;
 use crate::var32;
 use crate::writer_v2::{read_u32_array, Osa2Metadata};
 use anyhow::{Context, Result};
-use lru::LruCache;
 use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
+use lru::LruCache;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
@@ -56,6 +57,8 @@ pub struct Osa2Reader {
     /// `chr*` and bare styles for the same physical contig never warms
     /// two cache slots for the same chunk. See issue #37.
     on_disk_chroms: HashSet<String>,
+    /// Every chunk declared by a unique `var32.bin` entry.
+    chunks: Vec<(String, u32)>,
     /// LRU cache of loaded chunks, keyed by `"<canonical-chrom>/<chunk_id>"`.
     chunk_cache: Mutex<LruCache<String, Arc<Chunk>>>,
 }
@@ -68,16 +71,24 @@ impl Osa2Reader {
 
         // Read metadata
         let metadata: Osa2Metadata = {
-            let mut entry = archive.by_name("fastsa/metadata.json")
+            let mut entry = archive
+                .by_name("fastsa/metadata.json")
                 .context("Missing fastsa/metadata.json")?;
             let mut buf = String::new();
             entry.read_to_string(&mut buf)?;
             serde_json::from_str(&buf)?
         };
+        if metadata.format_version != 2 {
+            anyhow::bail!(
+                "Unsupported OSA2 formatVersion {} (expected 2)",
+                metadata.format_version
+            );
+        }
 
         // Read field config
         let fields: Vec<Field> = {
-            let mut entry = archive.by_name("fastsa/config.json")
+            let mut entry = archive
+                .by_name("fastsa/config.json")
                 .context("Missing fastsa/config.json")?;
             let mut buf = String::new();
             entry.read_to_string(&mut buf)?;
@@ -120,27 +131,82 @@ impl Osa2Reader {
             is_positional: metadata.is_positional,
         };
 
-        // Enumerate chromosome directories once so `resolve_chrom` can
-        // pick the on-disk canonical name without re-scanning the ZIP per
-        // query. Entries look like `fastsa/<chrom>/<chunk_id>/var32.bin`,
-        // so we collect the second path segment under `fastsa/`.
+        // Validate every archive path once and retain the declared chunks.
+        // Duplicate ZIP names are ambiguous because `by_name` can select only
+        // one of them, so reject them before any annotation lookup.
+        let value_files: HashSet<String> = fields
+            .iter()
+            .filter(|field| field.ftype != FieldType::JsonBlob)
+            .map(|field| format!("{}.bin", field.alias))
+            .collect();
+        let string_files: HashSet<String> = fields
+            .iter()
+            .filter(|field| field.ftype == FieldType::Categorical)
+            .map(|field| format!("{}.txt", field.alias))
+            .collect();
+        let has_json_blob = fields
+            .iter()
+            .any(|field| field.ftype == FieldType::JsonBlob);
+        let mut entry_names = HashSet::new();
+        let mut chunk_set = HashSet::new();
+        let mut referenced_chunks = HashSet::new();
         let mut on_disk_chroms = HashSet::new();
         for i in 0..archive.len() {
             let entry = archive.by_index(i)?;
-            let name = entry.name();
-            let Some(rest) = name.strip_prefix("fastsa/") else {
-                continue;
-            };
-            let Some((chrom, _)) = rest.split_once('/') else {
-                continue;
-            };
-            // Skip the sibling metadata/config/strings subtrees, which
-            // share the `fastsa/` parent but aren't chromosome shards.
-            if matches!(chrom, "metadata.json" | "config.json" | "strings") {
+            let name = entry.name().to_string();
+            if !entry_names.insert(name.clone()) {
+                anyhow::bail!("Duplicate OSA2 ZIP entry '{}'", name);
+            }
+            if name.ends_with('/') {
                 continue;
             }
-            on_disk_chroms.insert(chrom.to_string());
+            let Some(rest) = name.strip_prefix("fastsa/") else {
+                anyhow::bail!("OSA2 entry is outside fastsa/: '{}'", name);
+            };
+            if matches!(rest, "metadata.json" | "config.json") {
+                continue;
+            }
+            if let Some(file) = rest.strip_prefix("strings/") {
+                if !string_files.contains(file) {
+                    anyhow::bail!("Unexpected OSA2 string-table entry '{}'", name);
+                }
+                continue;
+            }
+
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() != 3 || parts[0].is_empty() {
+                anyhow::bail!("Malformed OSA2 chunk path '{}'", name);
+            }
+            let chunk_id: u32 = parts[1]
+                .parse()
+                .with_context(|| format!("Invalid OSA2 chunk id in '{}'", name))?;
+            let file = parts[2];
+            if !matches!(file, "var32.bin" | "too-long.enc" | "json_blobs.zst")
+                && !value_files.contains(file)
+            {
+                anyhow::bail!("Unexpected OSA2 chunk entry '{}'", name);
+            }
+            if file == "json_blobs.zst" && !has_json_blob {
+                anyhow::bail!("Unexpected OSA2 JSON blob entry '{}'", name);
+            }
+            referenced_chunks.insert((parts[0].to_string(), chunk_id));
+            if file == "var32.bin" && !chunk_set.insert((parts[0].to_string(), chunk_id)) {
+                anyhow::bail!("Duplicate OSA2 chunk {}/{}", parts[0], chunk_id);
+            }
         }
+        if let Some((chromosome, chunk_id)) = referenced_chunks
+            .iter()
+            .find(|chunk| !chunk_set.contains(*chunk))
+        {
+            anyhow::bail!(
+                "OSA2 chunk {}/{} has data but no var32.bin entry",
+                chromosome,
+                chunk_id
+            );
+        }
+        let mut chunks: Vec<_> = chunk_set.into_iter().collect();
+        chunks.sort();
+        on_disk_chroms.extend(chunks.iter().map(|(chromosome, _)| chromosome.clone()));
 
         let cache_size = NonZeroUsize::new(CHUNK_CACHE_SIZE)
             .expect("CHUNK_CACHE_SIZE is a non-zero compile-time constant");
@@ -152,6 +218,7 @@ impl Osa2Reader {
             fields,
             string_tables,
             on_disk_chroms,
+            chunks,
             chunk_cache: Mutex::new(LruCache::new(cache_size)),
         })
     }
@@ -168,6 +235,218 @@ impl Osa2Reader {
             .into_iter()
             .find(|alias| self.on_disk_chroms.contains(alias))
             .unwrap_or_else(|| chrom.to_string())
+    }
+
+    /// Reopen and validate every declared OSA2 chunk.
+    pub fn verify(&self, expected_chromosome: Option<&str>) -> Result<SaVerificationReport> {
+        if self.chunks.is_empty() {
+            anyhow::bail!("OSA2 contains no chunks");
+        }
+        if let Some(expected) = expected_chromosome {
+            let aliases = chrom_aliases(expected);
+            let unexpected: Vec<_> = self
+                .chunks
+                .iter()
+                .map(|(chromosome, _)| chromosome)
+                .filter(|chromosome| !aliases.contains(chromosome))
+                .cloned()
+                .collect();
+            if !unexpected.is_empty() {
+                anyhow::bail!(
+                    "OSA2 contains chromosomes outside expected shard '{}': {:?}",
+                    expected,
+                    unexpected
+                );
+            }
+        }
+
+        let numeric_field_count = self
+            .fields
+            .iter()
+            .filter(|field| field.ftype != FieldType::JsonBlob)
+            .count();
+        let mut chromosomes = Vec::new();
+        let mut record_count = 0_u64;
+        let mut lookup_count = 0_u64;
+
+        for (chromosome, chunk_id) in &self.chunks {
+            if chromosomes.last() != Some(chromosome) {
+                chromosomes.push(chromosome.clone());
+            }
+            let chunk = self.build_chunk(chromosome, *chunk_id)?;
+            if chunk.is_empty() {
+                anyhow::bail!("OSA2 chunk {}/{} is empty", chromosome, chunk_id);
+            }
+            if chunk.var32s.windows(2).any(|pair| pair[0] >= pair[1]) {
+                anyhow::bail!(
+                    "OSA2 short keys are not strictly ordered in {}/{}",
+                    chromosome,
+                    chunk_id
+                );
+            }
+            if chunk.longs.windows(2).any(|pair| pair[0] >= pair[1]) {
+                anyhow::bail!(
+                    "OSA2 long keys are not strictly ordered in {}/{}",
+                    chromosome,
+                    chunk_id
+                );
+            }
+
+            let chunk_size = 1_u32 << self.metadata.chunk_bits;
+            for key in &chunk.var32s {
+                let (within_position, _, _) = var32::decode(*key);
+                if within_position >= chunk_size {
+                    anyhow::bail!(
+                        "OSA2 short key falls outside chunk {}/{}",
+                        chromosome,
+                        chunk_id
+                    );
+                }
+            }
+            for (rank, variant) in chunk.longs.iter().enumerate() {
+                if variant.position >> self.metadata.chunk_bits != *chunk_id {
+                    anyhow::bail!(
+                        "OSA2 long key falls outside chunk {}/{}",
+                        chromosome,
+                        chunk_id
+                    );
+                }
+                let expected_index = chunk.var32s.len() + rank;
+                if variant.idx as usize != expected_index {
+                    anyhow::bail!(
+                        "OSA2 long key has invalid value index in {}/{}",
+                        chromosome,
+                        chunk_id
+                    );
+                }
+                crate::kmer16::decode_var(&variant.sequence).with_context(|| {
+                    format!("Decoding OSA2 long key in {}/{}", chromosome, chunk_id)
+                })?;
+            }
+
+            let total = chunk.len();
+            if chunk.values.len() != numeric_field_count {
+                anyhow::bail!(
+                    "OSA2 chunk {}/{} has {} value columns; expected {}",
+                    chromosome,
+                    chunk_id,
+                    chunk.values.len(),
+                    numeric_field_count
+                );
+            }
+            let mut value_index = 0;
+            for (field_index, field) in self.fields.iter().enumerate() {
+                if field.ftype == FieldType::JsonBlob {
+                    continue;
+                }
+                let column = &chunk.values[value_index];
+                value_index += 1;
+                if column.len() != total {
+                    anyhow::bail!(
+                        "OSA2 chunk {}/{} has a value column of length {}; expected {}",
+                        chromosome,
+                        chunk_id,
+                        column.len(),
+                        total
+                    );
+                }
+                if field.ftype == FieldType::Categorical {
+                    let string_count = self.string_tables[field_index].len();
+                    if column.iter().any(|value| {
+                        *value != field.missing_value && *value as usize >= string_count
+                    }) {
+                        anyhow::bail!(
+                            "OSA2 categorical field '{}' has an out-of-range string index in {}/{}",
+                            field.alias,
+                            chromosome,
+                            chunk_id
+                        );
+                    }
+                }
+            }
+            if let Some(blobs) = &chunk.json_blobs {
+                if blobs.len() != total {
+                    anyhow::bail!(
+                        "OSA2 chunk {}/{} has {} JSON blobs; expected {}",
+                        chromosome,
+                        chunk_id,
+                        blobs.len(),
+                        total
+                    );
+                }
+            }
+
+            let mut edge_indices = vec![0];
+            if total > 1 {
+                edge_indices.push(total - 1);
+            }
+            for index in edge_indices {
+                let json = chunk.reconstruct_json(index, &self.fields, &self.string_tables);
+                serde_json::from_str::<serde_json::Value>(&json).with_context(|| {
+                    format!(
+                        "Invalid OSA2 JSON at {}/{} record {}",
+                        chromosome, chunk_id, index
+                    )
+                })?;
+                let (position, ref_allele, alt_allele) =
+                    self.variant_at(&chunk, *chunk_id, index)?;
+                if self
+                    .query(chromosome, position, &ref_allele, &alt_allele)?
+                    .is_none()
+                {
+                    anyhow::bail!(
+                        "OSA2 deterministic lookup failed at {}:{}",
+                        chromosome,
+                        position
+                    );
+                }
+                lookup_count += 1;
+            }
+            record_count += total as u64;
+        }
+
+        Ok(SaVerificationReport {
+            name: self.sa_metadata.name.clone(),
+            version: self.sa_metadata.version.clone(),
+            assembly: self.sa_metadata.assembly.clone(),
+            json_key: self.sa_metadata.json_key.clone(),
+            chromosomes,
+            block_count: self.chunks.len() as u64,
+            record_count,
+            lookup_count,
+        })
+    }
+
+    fn variant_at(
+        &self,
+        chunk: &Chunk,
+        chunk_id: u32,
+        index: usize,
+    ) -> Result<(u32, Vec<u8>, Vec<u8>)> {
+        if let Some(key) = chunk.var32s.get(index) {
+            let (within_position, ref_allele, alt_allele) = var32::decode(*key);
+            let base = chunk_id
+                .checked_mul(1_u32 << self.metadata.chunk_bits)
+                .ok_or_else(|| anyhow::anyhow!("OSA2 chunk position overflows u32"))?;
+            let position = base
+                .checked_add(within_position)
+                .ok_or_else(|| anyhow::anyhow!("OSA2 variant position overflows u32"))?;
+            return if self.metadata.is_positional {
+                Ok((position, Vec::new(), Vec::new()))
+            } else {
+                Ok((position, ref_allele, alt_allele))
+            };
+        }
+
+        let long_index = index
+            .checked_sub(chunk.var32s.len())
+            .ok_or_else(|| anyhow::anyhow!("OSA2 variant index underflow"))?;
+        let variant = chunk
+            .longs
+            .get(long_index)
+            .ok_or_else(|| anyhow::anyhow!("OSA2 variant index is out of bounds"))?;
+        let (ref_allele, alt_allele) = crate::kmer16::decode_var(&variant.sequence)?;
+        Ok((variant.position, ref_allele, alt_allele))
     }
 
     /// Build a chunk by reading its files from the ZIP archive. Pure (no cache
@@ -259,7 +538,7 @@ impl Osa2Reader {
                     values.push(read_u32_array(&buf)?);
                 }
                 Err(zip::result::ZipError::FileNotFound) => {
-                    values.push(vec![field.missing_value; var32s.len()]);
+                    values.push(vec![field.missing_value; var32s.len() + longs.len()]);
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -290,7 +569,7 @@ impl Osa2Reader {
                     );
                 }
                 let text = String::from_utf8(decompressed)?;
-                Some(text.lines().map(|l| l.to_string()).collect())
+                Some(text.split('\n').map(str::to_string).collect())
             }
             Err(zip::result::ZipError::FileNotFound) => None,
             Err(e) => {
@@ -303,7 +582,12 @@ impl Osa2Reader {
             }
         };
 
-        Ok(Chunk { var32s, longs, values, json_blobs })
+        Ok(Chunk {
+            var32s,
+            longs,
+            values,
+            json_blobs,
+        })
     }
 
     /// Ensure a chunk is in the LRU cache. Idempotent.
@@ -333,7 +617,13 @@ impl Osa2Reader {
     }
 
     /// Query a variant in the loaded chunks.
-    fn query(&self, chrom: &str, pos: u32, ref_allele: &[u8], alt_allele: &[u8]) -> Result<Option<String>> {
+    fn query(
+        &self,
+        chrom: &str,
+        pos: u32,
+        ref_allele: &[u8],
+        alt_allele: &[u8],
+    ) -> Result<Option<String>> {
         // Canonicalize before constructing the cache key so `chr1` and `1`
         // (same physical chunk) share a single LRU slot.
         let chrom = self.resolve_chrom(chrom);
@@ -371,8 +661,7 @@ impl Osa2Reader {
         } else if var32::is_long(ref_allele.len(), alt_allele.len()) {
             chunk.find_long(pos, ref_allele, alt_allele)
         } else {
-            var32::encode(within_pos, ref_allele, alt_allele)
-                .and_then(|key| chunk.find_short(key))
+            var32::encode(within_pos, ref_allele, alt_allele).and_then(|key| chunk.find_short(key))
         };
 
         match idx {

@@ -11,8 +11,9 @@
 
 use fastvep_cache::annotation::AnnotationProvider;
 use fastvep_sa::fields::{Field, FieldType};
+use fastvep_sa::reader::{AnySaReader, SaCacheFormat};
 use fastvep_sa::reader_v2::Osa2Reader;
-use fastvep_sa::writer_v2::{Osa2Metadata, Osa2Record, Osa2Writer};
+use fastvep_sa::writer_v2::{raw_json_blob_fields, Osa2Metadata, Osa2Record, Osa2Writer};
 
 fn metadata() -> Osa2Metadata {
     Osa2Metadata {
@@ -65,16 +66,31 @@ fn v2_reader_resolves_chr_query_against_bare_keyed_archive() {
         .unwrap();
 
     let reader = Osa2Reader::open(&path).unwrap();
+    let report = reader.verify(Some("1")).unwrap();
+    assert_eq!(report.record_count, records.len() as u64);
+    assert_eq!(report.block_count, 1);
+    assert_eq!(report.lookup_count, 2);
+
+    let dispatched = AnySaReader::open(&path).unwrap();
+    assert_eq!(dispatched.format(), SaCacheFormat::OsaV2);
+    assert_eq!(
+        dispatched.verify(Some("chr1")).unwrap().record_count,
+        records.len() as u64
+    );
 
     // chr*-prefixed query hits a bare-keyed archive.
-    let hit = reader
-        .annotate_position("chr1", 10_500, "A", "G")
-        .unwrap();
-    assert!(hit.is_some(), "chr1 query must resolve against bare archive");
+    let hit = reader.annotate_position("chr1", 10_500, "A", "G").unwrap();
+    assert!(
+        hit.is_some(),
+        "chr1 query must resolve against bare archive"
+    );
 
     // And the bare form still works.
     let hit = reader.annotate_position("1", 10_500, "A", "G").unwrap();
-    assert!(hit.is_some(), "bare query must resolve against bare archive");
+    assert!(
+        hit.is_some(),
+        "bare query must resolve against bare archive"
+    );
 }
 
 #[test]
@@ -116,4 +132,75 @@ fn v2_reader_preload_chr_warms_cache_for_bare_query() {
     // structural invariant kept by `resolve_chrom`.
     let hit = reader.annotate_position("1", 10_500, "A", "G").unwrap();
     assert!(hit.is_some());
+}
+
+#[test]
+fn v2_reader_preserves_a_trailing_missing_json_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v2_trailing_missing_blob.osa2");
+    let records = vec![
+        Osa2Record {
+            chrom: "1".into(),
+            position: 10_000,
+            ref_allele: b"A".to_vec(),
+            alt_allele: b"G".to_vec(),
+            values: Vec::new(),
+            json_blob: Some(r#"{"score":1}"#.into()),
+        },
+        Osa2Record {
+            chrom: "1".into(),
+            position: 10_100,
+            ref_allele: b"C".to_vec(),
+            alt_allele: b"T".to_vec(),
+            values: Vec::new(),
+            json_blob: None,
+        },
+    ];
+
+    Osa2Writer::new(metadata(), raw_json_blob_fields())
+        .write_all(std::fs::File::create(&path).unwrap(), &records)
+        .unwrap();
+
+    assert_eq!(
+        Osa2Reader::open(&path)
+            .unwrap()
+            .verify(Some("1"))
+            .unwrap()
+            .record_count,
+        2
+    );
+}
+
+#[test]
+fn v2_verifier_rejects_out_of_range_categorical_indices() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v2_bad_category.osa2");
+    let fields = vec![Field {
+        field: "category".into(),
+        alias: "category".into(),
+        ftype: FieldType::Categorical,
+        multiplier: 1,
+        zigzag: false,
+        missing_value: u32::MAX,
+        missing_string: ".".into(),
+        description: String::new(),
+    }];
+    let records = vec![Osa2Record {
+        chrom: "1".into(),
+        position: 10_000,
+        ref_allele: b"A".to_vec(),
+        alt_allele: b"G".to_vec(),
+        values: vec![1],
+        json_blob: None,
+    }];
+
+    Osa2Writer::new(metadata(), fields)
+        .write_all(std::fs::File::create(&path).unwrap(), &records)
+        .unwrap();
+
+    let error = Osa2Reader::open(&path)
+        .unwrap()
+        .verify(Some("1"))
+        .unwrap_err();
+    assert!(error.to_string().contains("out-of-range string index"));
 }

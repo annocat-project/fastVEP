@@ -50,7 +50,11 @@ pub struct Osa2Writer {
 impl Osa2Writer {
     pub fn new(metadata: Osa2Metadata, fields: Vec<Field>) -> Self {
         let string_tables = fields.iter().map(|_| Vec::new()).collect();
-        Self { metadata, fields, string_tables }
+        Self {
+            metadata,
+            fields,
+            string_tables,
+        }
     }
 
     /// Set the string table for a categorical field.
@@ -64,11 +68,7 @@ impl Osa2Writer {
     ///
     /// Records MUST be sorted by (chrom, position) so that all records for a
     /// given (chrom, chunk) are contiguous.
-    pub fn write_all<W: Write + Seek>(
-        &self,
-        writer: W,
-        records: &[Osa2Record],
-    ) -> Result<()> {
+    pub fn write_all<W: Write + Seek>(&self, writer: W, records: &[Osa2Record]) -> Result<()> {
         let mut zip = zip::ZipWriter::new(writer);
         let options = default_options();
 
@@ -192,22 +192,22 @@ fn write_chunk_entries<W: Write + Seek>(
             // only (alleles are empty) and never take the long-variant path.
             short_entries.push((var32::positional_key(within_chunk_pos), local_idx));
         } else if var32::is_long(record.ref_allele.len(), record.alt_allele.len()) {
-            // Skip variants whose alleles contain non-ACGT bases. Earlier
-            // revisions silently encoded them as runs of 'T', producing index
-            // entries that could never be retrieved with their original allele
-            // string.
-            let Some(sequence) = kmer16::encode_var(&record.ref_allele, &record.alt_allele) else {
-                log::warn!(
-                    "Skipping long variant at {}:{} with non-ACGT allele (ref={:?} alt={:?})",
-                    chrom,
-                    record.position,
-                    String::from_utf8_lossy(&record.ref_allele),
-                    String::from_utf8_lossy(&record.alt_allele),
-                );
-                continue;
-            };
+            let sequence =
+                kmer16::encode_var(&record.ref_allele, &record.alt_allele).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "OSA2 cannot encode non-ACGT allele at {}:{} (ref={:?} alt={:?})",
+                        chrom,
+                        record.position,
+                        String::from_utf8_lossy(&record.ref_allele),
+                        String::from_utf8_lossy(&record.alt_allele),
+                    )
+                })?;
             long_entries.push((
-                LongVariant { position: record.position, idx: 0, sequence },
+                LongVariant {
+                    position: record.position,
+                    idx: 0,
+                    sequence,
+                },
                 local_idx,
             ));
         } else if let Some(key) =
@@ -215,10 +215,8 @@ fn write_chunk_entries<W: Write + Seek>(
         {
             short_entries.push((key, local_idx));
         } else {
-            // Short variant that fails Var32 encoding only when it contains a
-            // non-ACGT base; same skip-with-warning policy.
-            log::warn!(
-                "Skipping short variant at {}:{} with non-ACGT allele (ref={:?} alt={:?})",
+            anyhow::bail!(
+                "OSA2 cannot encode non-ACGT allele at {}:{} (ref={:?} alt={:?})",
                 chrom,
                 record.position,
                 String::from_utf8_lossy(&record.ref_allele),
@@ -265,7 +263,13 @@ fn write_chunk_entries<W: Write + Seek>(
         }
         let values: Vec<u32> = value_order
             .iter()
-            .map(|&li| chunk_records[li].values.get(fi).copied().unwrap_or(field.missing_value))
+            .map(|&li| {
+                chunk_records[li]
+                    .values
+                    .get(fi)
+                    .copied()
+                    .unwrap_or(field.missing_value)
+            })
             .collect();
         zip.start_file(format!("{}{}.bin", prefix, field.alias), options)?;
         write_u32_array(zip, &values)?;
@@ -381,7 +385,12 @@ impl<W: Write + Seek> Osa2StreamWriter<W> {
     /// Flush the final chunk, write string tables, and finalize the archive.
     pub fn finish(mut self) -> Result<()> {
         self.flush_current()?;
-        write_string_tables(&mut self.zip, self.options, &self.fields, &self.string_tables)?;
+        write_string_tables(
+            &mut self.zip,
+            self.options,
+            &self.fields,
+            &self.string_tables,
+        )?;
         // Flush the inner writer explicitly — `ZipWriter::finish` hands it back
         // unflushed, and a `BufWriter`'s Drop swallows flush errors, which would
         // silently leave a truncated `.osa2` on a full disk. See `write_all`.
@@ -534,6 +543,7 @@ pub fn read_u32_array(data: &[u8]) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn test_u32_array_round_trip() {
@@ -555,5 +565,35 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes()); // a few trailing bytes only
         let err = read_u32_array(&buf).unwrap_err();
         assert!(err.to_string().contains("exceeds data size"));
+    }
+
+    #[test]
+    fn osa2_writer_rejects_unrepresentable_alleles() {
+        let metadata = Osa2Metadata {
+            format_version: 2,
+            name: "test".into(),
+            version: "1".into(),
+            assembly: "GRCh38".into(),
+            json_key: "test".into(),
+            match_by_allele: true,
+            is_array: false,
+            is_positional: false,
+            chunk_bits: 20,
+            description: String::new(),
+        };
+        let writer = Osa2Writer::new(metadata, Vec::new());
+        let records = vec![Osa2Record {
+            chrom: "1".into(),
+            position: 1,
+            ref_allele: b"N".to_vec(),
+            alt_allele: b"A".to_vec(),
+            values: Vec::new(),
+            json_blob: None,
+        }];
+
+        let error = writer
+            .write_all(Cursor::new(Vec::new()), &records)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot encode non-ACGT allele"));
     }
 }

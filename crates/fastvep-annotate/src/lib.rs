@@ -272,11 +272,7 @@ impl AnnotationContext {
     }
 
     /// Annotate VCF text and return JSON results, using `self.acmg_config`.
-    pub fn annotate_vcf_text(
-        &self,
-        vcf_text: &str,
-        pick: bool,
-    ) -> Result<Vec<serde_json::Value>> {
+    pub fn annotate_vcf_text(&self, vcf_text: &str, pick: bool) -> Result<Vec<serde_json::Value>> {
         self.annotate_vcf_text_with_acmg(vcf_text, pick, self.acmg_config.as_ref())
     }
 
@@ -319,9 +315,10 @@ impl AnnotationContext {
             if overlapping.is_empty() {
                 annotate_intergenic(vf);
             } else {
-                let ref_seq = self.seq_provider.as_ref().and_then(|sp| {
-                    sp.fetch_sequence(chrom, query_start, query_end).ok()
-                });
+                let ref_seq = self
+                    .seq_provider
+                    .as_ref()
+                    .and_then(|sp| sp.fetch_sequence(chrom, query_start, query_end).ok());
 
                 let result = self.predictor.predict(
                     &vf.position,
@@ -332,8 +329,7 @@ impl AnnotationContext {
                 );
 
                 for tc in &result.transcript_consequences {
-                    let transcript =
-                        overlapping.iter().find(|t| t.stable_id == tc.transcript_id);
+                    let transcript = overlapping.iter().find(|t| t.stable_id == tc.transcript_id);
 
                     let allele_annotations: Vec<AlleleAnnotation> = tc
                         .allele_consequences
@@ -626,11 +622,8 @@ impl AnnotationContext {
                             tsl: transcript.and_then(|t| t.tsl),
                             appris: transcript.and_then(|t| t.appris.clone()),
                             ccds: transcript.and_then(|t| t.ccds.clone()),
-                            gencode_primary: transcript
-                                .map(|t| t.gencode_primary)
-                                .unwrap_or(false),
-                            symbol_source: transcript
-                                .and_then(|t| t.gene.symbol_source.clone()),
+                            gencode_primary: transcript.map(|t| t.gencode_primary).unwrap_or(false),
+                            symbol_source: transcript.and_then(|t| t.gene.symbol_source.clone()),
                             hgnc_id: transcript.and_then(|t| t.gene.hgnc_id.clone()),
                             flags: transcript.map(|t| t.flags.clone()).unwrap_or_default(),
                         });
@@ -656,10 +649,8 @@ impl AnnotationContext {
                         .sa_providers
                         .iter()
                         .any(|sa| sa.lock().unwrap().json_key() == "gnomad");
-                let mut allele_results: std::collections::HashMap<
-                    String,
-                    Vec<(String, String)>,
-                > = std::collections::HashMap::new();
+                let mut allele_results: std::collections::HashMap<String, Vec<(String, String)>> =
+                    std::collections::HashMap::new();
                 for tv in &vf.transcript_variations {
                     for aa in &tv.allele_annotations {
                         let alt_str = aa.allele.to_string();
@@ -726,13 +717,11 @@ impl AnnotationContext {
                         if seen_genes.insert(gene_sym.to_string()) {
                             for gp in &self.gene_providers {
                                 if let Ok(Some(json)) = gp.annotate_gene(gene_sym) {
-                                    vf.gene_annotations.push(
-                                        fastvep_core::GeneAnnotation {
-                                            gene_symbol: gene_sym.to_string(),
-                                            json_key: gp.json_key().to_string(),
-                                            json_string: json,
-                                        },
-                                    );
+                                    vf.gene_annotations.push(fastvep_core::GeneAnnotation {
+                                        gene_symbol: gene_sym.to_string(),
+                                        json_key: gp.json_key().to_string(),
+                                        json_string: json,
+                                    });
                                 }
                             }
                         }
@@ -747,33 +736,31 @@ impl AnnotationContext {
 
                 for tv in &mut vf.transcript_variations {
                     let gene_sym = tv.gene_symbol.as_deref().unwrap_or("");
-                    let gene_anns: Vec<&fastvep_core::GeneAnnotation> =
-                        vf.gene_annotations
-                            .iter()
-                            .filter(|ga| ga.gene_symbol == gene_sym)
-                            .collect();
+                    let gene_anns: Vec<&fastvep_core::GeneAnnotation> = vf
+                        .gene_annotations
+                        .iter()
+                        .filter(|ga| ga.gene_symbol == gene_sym)
+                        .collect();
                     for aa in &mut tv.allele_annotations {
-                        let input =
-                            fastvep_classification::extract_classification_input(
-                                &aa.consequences,
-                                aa.impact,
-                                tv.gene_symbol.as_deref(),
-                                tv.canonical,
-                                aa.amino_acids.as_ref(),
-                                aa.protein_position.map(|(s, _)| s),
-                                aa.hgvsc.as_deref(),
-                                aa.exon,
-                                &aa.supplementary,
-                                &gene_anns,
-                                &vf.supplementary_annotations,
-                                trio_genotypes.0.clone(),
-                                trio_genotypes.1.clone(),
-                                trio_genotypes.2.clone(),
-                                vec![], // companion_variants populated in second pass
-                            );
+                        let input = fastvep_classification::extract_classification_input(
+                            &aa.consequences,
+                            aa.impact,
+                            tv.gene_symbol.as_deref(),
+                            tv.canonical,
+                            aa.amino_acids.as_ref(),
+                            aa.protein_position.map(|(s, _)| s),
+                            aa.hgvsc.as_deref(),
+                            aa.exon,
+                            &aa.supplementary,
+                            &gene_anns,
+                            &vf.supplementary_annotations,
+                            trio_genotypes.0.clone(),
+                            trio_genotypes.1.clone(),
+                            trio_genotypes.2.clone(),
+                            vec![], // companion_variants populated in second pass
+                        );
                         let result = fastvep_classification::classify(&input, acmg_cfg);
-                        aa.acmg_classification =
-                            serde_json::to_value(&result).ok();
+                        aa.acmg_classification = serde_json::to_value(&result).ok();
                     }
                 }
             }
@@ -788,7 +775,10 @@ impl AnnotationContext {
             }
         }
 
-        Ok(variants.iter().map(|vf| output::format_json(vf, false)).collect())
+        Ok(variants
+            .iter()
+            .map(|vf| output::format_json(vf, false))
+            .collect())
     }
 }
 
@@ -946,8 +936,7 @@ fn extract_trio_genotypes(
     let format_str = &vcf_fields.rest[0];
     let sample_strs: Vec<&str> = vcf_fields.rest[1..].iter().map(|s| s.as_str()).collect();
 
-    let samples =
-        fastvep_io::sample::parse_samples(format_str, &sample_strs, sample_names);
+    let samples = fastvep_io::sample::parse_samples(format_str, &sample_strs, sample_names);
 
     let proband_gt = samples
         .iter()
@@ -1051,9 +1040,7 @@ fn enrich_compound_het(
                             c.get("code")
                                 .and_then(|v| v.as_str())
                                 .map_or(false, |code| code == "PP5" || code == "PS4")
-                                && c.get("met")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false)
+                                && c.get("met").and_then(|v| v.as_bool()).unwrap_or(false)
                         })
                     });
 
@@ -1224,12 +1211,9 @@ fn enrich_compound_het(
 }
 
 /// Load supplementary annotation providers (.osa, .osa2 files) from a directory.
-pub fn load_sa_providers(
-    sa_dir: &Path,
-) -> Result<Vec<Mutex<Box<dyn AnnotationProvider>>>> {
+pub fn load_sa_providers(sa_dir: &Path) -> Result<Vec<Mutex<Box<dyn AnnotationProvider>>>> {
     use fastvep_sa::interval::OsiReader;
-    use fastvep_sa::reader::SaReader;
-    use fastvep_sa::reader_v2::Osa2Reader;
+    use fastvep_sa::reader::AnySaReader;
 
     let mut providers: Vec<Mutex<Box<dyn AnnotationProvider>>> = Vec::new();
 
@@ -1251,43 +1235,29 @@ pub fn load_sa_providers(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with(fastvep_sa::sharded::SHARD_MANIFEST_SUFFIX))
         {
-            let reader = fastvep_sa::sharded::ShardedSaReader::open(&path)
-                .with_context(|| format!("Loading required OSA shard manifest {}", path.display()))?;
+            let reader = fastvep_sa::sharded::ShardedSaReader::open(&path).with_context(|| {
+                format!("Loading required OSA shard manifest {}", path.display())
+            })?;
             tracing::info!("Loaded sharded SA: {} ({})", reader.name(), path.display());
             providers.push(Mutex::new(Box::new(reader)));
             continue;
         }
 
         match ext {
-            Some("osa2") => match Osa2Reader::open(&path) {
-                Ok(reader) => {
-                    tracing::info!("Loaded SA v2: {} ({})", reader.name(), path.display());
-                    providers.push(Mutex::new(Box::new(reader)));
-                }
-                Err(e) => {
-                    tracing::warn!("Could not load {}: {}", path.display(), e);
-                }
-            },
-            Some("osa") => match SaReader::open(&path) {
-                Ok(reader) => {
-                    tracing::info!("Loaded SA: {} ({})", reader.name(), path.display());
-                    providers.push(Mutex::new(Box::new(reader)));
-                }
-                Err(e) => {
-                    tracing::warn!("Could not load {}: {}", path.display(), e);
-                }
-            },
+            Some("osa" | "osa2") => {
+                let reader = AnySaReader::open(&path).with_context(|| {
+                    format!("Loading required supplementary cache {}", path.display())
+                })?;
+                tracing::info!("Loaded SA: {} ({})", reader.name(), path.display());
+                providers.push(Mutex::new(Box::new(reader)));
+            }
             // Interval-level (.osi) — typically BED-derived custom sources.
             // Wired up alongside .osa so a directory with mixed file types
             // "just works" via --sa-dir; the OsiReader exposes the same
             // AnnotationProvider trait, returning AnnotationValue::Interval.
             Some("osi") => match OsiReader::open(&path) {
                 Ok(reader) => {
-                    tracing::info!(
-                        "Loaded SA interval: {} ({})",
-                        reader.name(),
-                        path.display()
-                    );
+                    tracing::info!("Loaded SA interval: {} ({})", reader.name(), path.display());
                     providers.push(Mutex::new(Box::new(reader)));
                 }
                 Err(e) => {
@@ -1302,9 +1272,7 @@ pub fn load_sa_providers(
 }
 
 /// Load gene-level annotation providers (.oga files) from a directory.
-pub fn load_gene_providers(
-    sa_dir: &Path,
-) -> Result<Vec<fastvep_sa::gene::GeneIndex>> {
+pub fn load_gene_providers(sa_dir: &Path) -> Result<Vec<fastvep_sa::gene::GeneIndex>> {
     let mut providers = Vec::new();
 
     if !sa_dir.is_dir() {
@@ -1380,9 +1348,7 @@ mod tests {
         // acmg_requested=false) must take precedence over self.acmg_config,
         // since concurrent requests share one AnnotationContext and must not
         // leak each other's ACMG preference.
-        let results = ctx
-            .annotate_vcf_text_with_acmg(vcf, false, None)
-            .unwrap();
+        let results = ctx.annotate_vcf_text_with_acmg(vcf, false, None).unwrap();
         assert_eq!(results.len(), 1);
     }
 

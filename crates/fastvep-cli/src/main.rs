@@ -258,9 +258,9 @@ enum Commands {
         no_progress: bool,
     },
 
-    /// Reopen and fully validate an OSA database and index.
+    /// Reopen and fully validate an OSA v1 or OSA2 database.
     SaVerify {
-        /// Input .osa data file; the sibling .osa.idx is opened automatically.
+        /// Input .osa or .osa2 data file.
         #[arg(short, long)]
         input: String,
 
@@ -387,26 +387,24 @@ fn main() -> Result<()> {
             info_fields,
             format,
             no_progress,
-        } => {
-            pipeline::run_sa_build_format(
-                &format,
-                &source,
-                &input,
-                &input_skip,
-                chromosome.as_deref(),
-                &output,
-                &assembly,
-                name.as_deref(),
-                &info_fields,
-                !no_progress,
-            )?
-        }
+        } => pipeline::run_sa_build_format(
+            &format,
+            &source,
+            &input,
+            &input_skip,
+            chromosome.as_deref(),
+            &output,
+            &assembly,
+            name.as_deref(),
+            &info_fields,
+            !no_progress,
+        )?,
         Commands::SaVerify {
             input,
             chromosome,
             assembly,
         } => {
-            let reader = fastvep_sa::reader::SaReader::open(std::path::Path::new(&input))?;
+            let reader = fastvep_sa::reader::AnySaReader::open(std::path::Path::new(&input))?;
             let report = reader.verify(chromosome.as_deref())?;
             if report.assembly != assembly {
                 anyhow::bail!(

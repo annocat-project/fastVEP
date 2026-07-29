@@ -8,6 +8,7 @@
 use crate::block::{BlockEntry, SaBlock};
 use crate::common::{chrom_aliases, OSA_MAGIC};
 use crate::index::{BlockRef, SaIndex};
+use crate::reader_v2::Osa2Reader;
 use anyhow::Result;
 use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
 use lru::LruCache;
@@ -28,6 +29,88 @@ pub struct SaVerificationReport {
     pub block_count: u64,
     pub record_count: u64,
     pub lookup_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaCacheFormat {
+    OsaV1,
+    OsaV2,
+}
+
+/// One reader boundary for both supported supplementary-cache formats.
+pub enum AnySaReader {
+    OsaV1(SaReader),
+    OsaV2(Osa2Reader),
+}
+
+impl AnySaReader {
+    pub fn open(path: &Path) -> Result<Self> {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("osa") => Ok(Self::OsaV1(SaReader::open(path)?)),
+            Some("osa2") => Ok(Self::OsaV2(Osa2Reader::open(path)?)),
+            _ => anyhow::bail!(
+                "Unsupported supplementary annotation cache extension: {}",
+                path.display()
+            ),
+        }
+    }
+
+    pub fn format(&self) -> SaCacheFormat {
+        match self {
+            Self::OsaV1(_) => SaCacheFormat::OsaV1,
+            Self::OsaV2(_) => SaCacheFormat::OsaV2,
+        }
+    }
+
+    pub fn verify(&self, expected_chromosome: Option<&str>) -> Result<SaVerificationReport> {
+        match self {
+            Self::OsaV1(reader) => reader.verify(expected_chromosome),
+            Self::OsaV2(reader) => reader.verify(expected_chromosome),
+        }
+    }
+}
+
+impl AnnotationProvider for AnySaReader {
+    fn name(&self) -> &str {
+        match self {
+            Self::OsaV1(reader) => reader.name(),
+            Self::OsaV2(reader) => reader.name(),
+        }
+    }
+
+    fn json_key(&self) -> &str {
+        match self {
+            Self::OsaV1(reader) => reader.json_key(),
+            Self::OsaV2(reader) => reader.json_key(),
+        }
+    }
+
+    fn metadata(&self) -> &SaMetadata {
+        match self {
+            Self::OsaV1(reader) => reader.metadata(),
+            Self::OsaV2(reader) => reader.metadata(),
+        }
+    }
+
+    fn annotate_position(
+        &self,
+        chrom: &str,
+        pos: u64,
+        ref_allele: &str,
+        alt_allele: &str,
+    ) -> Result<Option<AnnotationValue>> {
+        match self {
+            Self::OsaV1(reader) => reader.annotate_position(chrom, pos, ref_allele, alt_allele),
+            Self::OsaV2(reader) => reader.annotate_position(chrom, pos, ref_allele, alt_allele),
+        }
+    }
+
+    fn preload(&self, chrom: &str, positions: &[u64]) -> Result<()> {
+        match self {
+            Self::OsaV1(reader) => reader.preload(chrom, positions),
+            Self::OsaV2(reader) => reader.preload(chrom, positions),
+        }
+    }
 }
 
 /// Default per-reader byte budget for the decompressed-block cache (32 MiB).
@@ -192,10 +275,14 @@ impl SaReader {
         }
         if let Some(expected) = expected_chromosome {
             let expected_aliases = chrom_aliases(expected);
-            if chromosomes.iter().any(|chromosome| !expected_aliases.contains(chromosome)) {
+            if chromosomes
+                .iter()
+                .any(|chromosome| !expected_aliases.contains(chromosome))
+            {
                 anyhow::bail!(
                     "OSA index contains chromosomes outside expected shard '{}': {:?}",
-                    expected, chromosomes
+                    expected,
+                    chromosomes
                 );
             }
         }
@@ -224,7 +311,10 @@ impl SaReader {
                 let mut previous_position = None;
                 for entry in &entries {
                     if entry.position < block.start_pos || entry.position > block.end_pos {
-                        anyhow::bail!("OSA record falls outside its indexed block on {}", chromosome);
+                        anyhow::bail!(
+                            "OSA record falls outside its indexed block on {}",
+                            chromosome
+                        );
                     }
                     if previous_position.is_some_and(|position| position > entry.position) {
                         anyhow::bail!("OSA records are not coordinate ordered on {}", chromosome);
@@ -239,15 +329,26 @@ impl SaReader {
                     serde_json::from_str::<serde_json::Value>(&entry.json).map_err(|error| {
                         anyhow::anyhow!(
                             "Invalid OSA JSON on {}:{}: {}",
-                            chromosome, entry.position, error
+                            chromosome,
+                            entry.position,
+                            error
                         )
                     })?;
                 }
                 for entry in [entries.first().unwrap(), entries.last().unwrap()] {
-                    if self.query(chromosome, entry.position, &entry.ref_allele, &entry.alt_allele)?.is_none() {
+                    if self
+                        .query(
+                            chromosome,
+                            entry.position,
+                            &entry.ref_allele,
+                            &entry.alt_allele,
+                        )?
+                        .is_none()
+                    {
                         anyhow::bail!(
                             "OSA deterministic lookup failed on {}:{}",
-                            chromosome, entry.position
+                            chromosome,
+                            entry.position
                         );
                     }
                     lookup_count += 1;
@@ -293,9 +394,9 @@ impl SaReader {
         // Bounds were just verified, but never `.expect()` on parsed bytes:
         // surface any unexpected slice shape as a typed error so debugging a
         // mismatched .osa/.osa.idx pair never produces a panic.
-        let len_bytes: [u8; 4] = self.mmap[offset..offset + 4]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("expected 4-byte block length prefix at offset {}", offset))?;
+        let len_bytes: [u8; 4] = self.mmap[offset..offset + 4].try_into().map_err(|_| {
+            anyhow::anyhow!("expected 4-byte block length prefix at offset {}", offset)
+        })?;
         let on_disk_len = u32::from_le_bytes(len_bytes);
         if on_disk_len != compressed_len {
             anyhow::bail!(
@@ -364,8 +465,16 @@ impl SaReader {
         ref_allele: &str,
         alt_allele: &str,
     ) -> Option<String> {
-        let allele_ref = if self.metadata.match_by_allele { ref_allele } else { "" };
-        let allele_alt = if self.metadata.match_by_allele { alt_allele } else { "" };
+        let allele_ref = if self.metadata.match_by_allele {
+            ref_allele
+        } else {
+            ""
+        };
+        let allele_alt = if self.metadata.match_by_allele {
+            alt_allele
+        } else {
+            ""
+        };
 
         SaBlock::find_by_position(
             entries,
@@ -582,12 +691,7 @@ mod tests {
         let reader = SaReader::open(&base.with_extension("osa")).unwrap();
         // Guard: the fixture must actually contain multiple blocks, otherwise
         // the assertion below is vacuous.
-        let total_blocks: usize = reader
-            .index
-            .chromosomes
-            .values()
-            .map(|v| v.len())
-            .sum();
+        let total_blocks: usize = reader.index.chromosomes.values().map(|v| v.len()).sum();
         assert!(
             total_blocks >= 2,
             "test fixture should have ≥ 2 blocks, got {}",
@@ -647,7 +751,10 @@ mod tests {
             json: "x".repeat(1000),
         }]);
         cache.put(0, entry, 1000);
-        assert!(cache.get(0).is_some(), "just-inserted block must be retained");
+        assert!(
+            cache.get(0).is_some(),
+            "just-inserted block must be retained"
+        );
     }
 
     #[test]
