@@ -13,6 +13,10 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::BufRead;
 
+// Wide transcript-vector records can exceed the reader's 256 MiB
+// decompression limit in a 1 MiB genomic window.
+const DBNSFP_CHUNK_BITS: u32 = 16;
+
 /// Fields retained by AnnoCat's `dbnsfp-4.9a-annocat-core-v2` contract.
 /// Coordinate columns are used as OSA keys and therefore are not duplicated in
 /// each record's JSON payload.
@@ -198,7 +202,7 @@ pub fn dbnsfp_osa2_metadata(assembly: &str) -> Osa2Metadata {
         is_array: false,
         record_list: true,
         is_positional: false,
-        chunk_bits: 20,
+        chunk_bits: DBNSFP_CHUNK_BITS,
         description: format!("dbNSFP SIFT/PolyPhen predictions for {assembly}"),
     }
 }
@@ -425,5 +429,10 @@ mod tests {
         let fields = selected_fields_from(Some(r#"["REVEL_score","SIFT_score"]"#)).unwrap();
         assert_eq!(fields, vec!["SIFT_score", "REVEL_score"]);
         assert!(selected_fields_from(Some(r#"["not_a_dbnsfp_field"]"#)).is_err());
+    }
+
+    #[test]
+    fn osa2_uses_bounded_chunks_for_wide_dbnsfp_records() {
+        assert_eq!(dbnsfp_osa2_metadata("GRCh38").chunk_bits, 16);
     }
 }
