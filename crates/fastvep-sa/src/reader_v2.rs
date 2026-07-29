@@ -277,16 +277,19 @@ impl Osa2Reader {
             if chunk.is_empty() {
                 anyhow::bail!("OSA2 chunk {}/{} is empty", chromosome, chunk_id);
             }
-            if chunk.var32s.windows(2).any(|pair| pair[0] >= pair[1]) {
+            // Transcript-specific sources such as dbNSFP may contain multiple
+            // records for the same allele. Reject descending keys, but allow
+            // adjacent duplicates and resolve them deterministically.
+            if chunk.var32s.windows(2).any(|pair| pair[0] > pair[1]) {
                 anyhow::bail!(
-                    "OSA2 short keys are not strictly ordered in {}/{}",
+                    "OSA2 short keys are not ordered in {}/{}",
                     chromosome,
                     chunk_id
                 );
             }
-            if chunk.longs.windows(2).any(|pair| pair[0] >= pair[1]) {
+            if chunk.longs.windows(2).any(|pair| pair[0] > pair[1]) {
                 anyhow::bail!(
-                    "OSA2 long keys are not strictly ordered in {}/{}",
+                    "OSA2 long keys are not ordered in {}/{}",
                     chromosome,
                     chunk_id
                 );

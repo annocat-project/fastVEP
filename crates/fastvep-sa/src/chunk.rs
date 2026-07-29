@@ -44,7 +44,8 @@ impl Chunk {
     /// Look up a variant by Var32 key. Returns the index into value arrays.
     #[inline]
     pub fn find_short(&self, encoded: u32) -> Option<usize> {
-        self.var32s.binary_search(&encoded).ok()
+        let index = self.var32s.partition_point(|key| *key < encoded);
+        (self.var32s.get(index) == Some(&encoded)).then_some(index)
     }
 
     /// Look up a long variant. Returns the index into value arrays.
@@ -59,7 +60,11 @@ impl Chunk {
             idx: 0,
             sequence,
         };
-        self.longs.binary_search(&query).ok().map(|i| self.longs[i].idx as usize)
+        let index = self.longs.partition_point(|variant| variant < &query);
+        self.longs
+            .get(index)
+            .filter(|variant| *variant == &query)
+            .map(|variant| variant.idx as usize)
     }
 
     /// Reconstruct a JSON string from parallel value arrays at the given index.
