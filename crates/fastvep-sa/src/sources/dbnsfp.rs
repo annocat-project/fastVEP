@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::BufRead;
 
-/// Fields retained by AnnoCat's `dbnsfp-4.9a-annocat-core-v1` contract.
+/// Fields retained by AnnoCat's `dbnsfp-4.9a-annocat-core-v2` contract.
 /// Coordinate columns are used as OSA keys and therefore are not duplicated in
 /// each record's JSON payload.
 pub const CURATED_FIELDS: &[&str] = &[
@@ -25,6 +25,7 @@ pub const CURATED_FIELDS: &[&str] = &[
     "Ensembl_transcriptid",
     "Ensembl_proteinid",
     "Uniprot_acc",
+    "Uniprot_entry",
     "HGVSc_VEP",
     "HGVSp_VEP",
     "APPRIS",
@@ -70,6 +71,8 @@ pub const CURATED_FIELDS: &[&str] = &[
     "REVEL_rankscore",
     "MutPred_score",
     "MutPred_rankscore",
+    "MutPred_protID",
+    "MutPred_AAchange",
     "MutPred_Top5features",
     "MVP_score",
     "MVP_rankscore",
@@ -193,6 +196,7 @@ pub fn dbnsfp_osa2_metadata(assembly: &str) -> Osa2Metadata {
         json_key: "dbnsfp".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: true,
         is_positional: false,
         chunk_bits: 20,
         description: format!("dbNSFP SIFT/PolyPhen predictions for {assembly}"),

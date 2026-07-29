@@ -5,7 +5,7 @@
 //! to the data file while building the index.
 
 use crate::block::{BlockEntry, SaBlock};
-use crate::common::{AnnotationRecord, DEFAULT_BLOCK_SIZE, OSA_MAGIC, SCHEMA_VERSION};
+use crate::common::{AnnotationRecord, DEFAULT_BLOCK_SIZE, OSA_MAGIC};
 use crate::index::{BlockRef, IndexHeader, SaIndex};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -94,7 +94,7 @@ impl SaWriter {
         self.chrom_names = chrom_map.to_vec();
 
         data_writer.write_all(OSA_MAGIC)?;
-        data_writer.write_all(&SCHEMA_VERSION.to_le_bytes())?;
+        data_writer.write_all(&self.index.header.schema_version.to_le_bytes())?;
         self.data_offset = (OSA_MAGIC.len() + 2) as u64;
 
         let worker_count = worker_count.max(1);
@@ -352,7 +352,7 @@ mod tests {
 
     fn header() -> IndexHeader {
         IndexHeader {
-            schema_version: SCHEMA_VERSION,
+            schema_version: crate::common::SCHEMA_VERSION,
             json_key: "test".into(),
             name: "Test".into(),
             version: "test".into(),
@@ -360,6 +360,7 @@ mod tests {
             assembly: "GRCh38".into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         }
     }

@@ -144,6 +144,7 @@ fn validate_same_source(expected: &SaMetadata, actual: &SaMetadata, file: &str) 
         || expected.json_key != actual.json_key
         || expected.match_by_allele != actual.match_by_allele
         || expected.is_array != actual.is_array
+        || expected.record_list != actual.record_list
         || expected.is_positional != actual.is_positional
     {
         anyhow::bail!(
@@ -204,6 +205,7 @@ mod tests {
             assembly: "GRCh38".into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         };
         let base = dir.join(name);
@@ -233,6 +235,7 @@ mod tests {
             json_key: "dbnsfp".into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
             chunk_bits: 20,
         };

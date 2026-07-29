@@ -93,6 +93,7 @@ pub fn alphamissense_osa2_metadata(assembly: &str) -> Osa2Metadata {
         json_key: "alphaMissense".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
         chunk_bits: 20,
         description: format!("AlphaMissense pathogenicity predictions for {assembly}"),

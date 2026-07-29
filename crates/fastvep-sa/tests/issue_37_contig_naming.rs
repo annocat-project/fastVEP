@@ -25,6 +25,7 @@ fn gnomad_header() -> IndexHeader {
         assembly: "GRCh38".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
     }
 }

@@ -21,6 +21,8 @@ pub struct Osa2Metadata {
     pub json_key: String,
     pub match_by_allele: bool,
     pub is_array: bool,
+    #[serde(default)]
+    pub record_list: bool,
     pub is_positional: bool,
     pub chunk_bits: u32,
     pub description: String,
@@ -577,6 +579,7 @@ mod tests {
             json_key: "test".into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
             chunk_bits: 20,
             description: String::new(),

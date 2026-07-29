@@ -128,6 +128,7 @@ impl Osa2Reader {
             json_key: metadata.json_key.clone(),
             match_by_allele: metadata.match_by_allele,
             is_array: metadata.is_array,
+            record_list: metadata.record_list,
             is_positional: metadata.is_positional,
         };
 
@@ -656,6 +657,28 @@ impl Osa2Reader {
         // chunk_bits validated in `open()` so the shift below is well-defined.
         let chunk_mask = (1u32 << self.metadata.chunk_bits) - 1;
         let within_pos = pos & chunk_mask;
+
+        if self.metadata.record_list {
+            let indices: Vec<usize> = if self.metadata.is_positional {
+                chunk
+                    .find_all_short(var32::positional_key(within_pos))
+                    .collect()
+            } else if var32::is_long(ref_allele.len(), alt_allele.len()) {
+                chunk.find_all_long(pos, ref_allele, alt_allele)
+            } else {
+                var32::encode(within_pos, ref_allele, alt_allele)
+                    .map(|key| chunk.find_all_short(key).collect())
+                    .unwrap_or_default()
+            };
+            if indices.is_empty() {
+                return Ok(None);
+            }
+            let records = indices
+                .into_iter()
+                .map(|index| chunk.reconstruct_json(index, &self.fields, &self.string_tables))
+                .collect::<Vec<_>>();
+            return Ok(Some(format!("[{}]", records.join(","))));
+        }
 
         let idx = if self.metadata.is_positional {
             // Positional sources match by coordinate alone: key on position and

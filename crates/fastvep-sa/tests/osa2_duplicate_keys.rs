@@ -20,10 +20,7 @@ fn json(value: AnnotationValue) -> String {
     }
 }
 
-#[test]
-fn osa2_preserves_duplicate_keys_and_returns_the_first_record() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("duplicate_keys.osa2");
+fn write_fixture(path: &std::path::Path, record_list: bool) {
     let records = vec![
         record(10_000, b"A", b"G", 1),
         record(10_000, b"A", b"G", 2),
@@ -38,14 +35,22 @@ fn osa2_preserves_duplicate_keys_and_returns_the_first_record() {
         json_key: "dbnsfp".into(),
         match_by_allele: true,
         is_array: false,
+        record_list,
         is_positional: false,
         chunk_bits: 20,
         description: "duplicate-key regression".into(),
     };
 
     Osa2Writer::new(metadata, raw_json_blob_fields())
-        .write_all(std::fs::File::create(&path).unwrap(), &records)
+        .write_all(std::fs::File::create(path).unwrap(), &records)
         .unwrap();
+}
+
+#[test]
+fn record_list_returns_all_duplicate_short_and_long_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("duplicate_keys.osa2");
+    write_fixture(&path, true);
 
     let reader = Osa2Reader::open(&path).unwrap();
     assert_eq!(reader.verify(Some("1")).unwrap().record_count, 4);
@@ -56,7 +61,7 @@ fn osa2_preserves_duplicate_keys_and_returns_the_first_record() {
                 .unwrap()
                 .unwrap()
         ),
-        r#"{"row":1}"#
+        r#"[{"row":1},{"row":2}]"#
     );
     assert_eq!(
         json(
@@ -65,6 +70,24 @@ fn osa2_preserves_duplicate_keys_and_returns_the_first_record() {
                 .unwrap()
                 .unwrap()
         ),
-        r#"{"row":3}"#
+        r#"[{"row":3},{"row":4}]"#
+    );
+}
+
+#[test]
+fn ordinary_lookup_keeps_first_record_behavior() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("single_record.osa2");
+    write_fixture(&path, false);
+
+    let reader = Osa2Reader::open(&path).unwrap();
+    assert_eq!(
+        json(
+            reader
+                .annotate_position("1", 10_000, "A", "G")
+                .unwrap()
+                .unwrap()
+        ),
+        r#"{"row":1}"#
     );
 }

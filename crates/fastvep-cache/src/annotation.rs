@@ -40,6 +40,8 @@ pub struct SaMetadata {
     pub match_by_allele: bool,
     /// Whether the output is an array of annotations (true) or a single object (false).
     pub is_array: bool,
+    /// Whether repeated records for one allele must be returned as a JSON array.
+    pub record_list: bool,
     /// Whether this is a positional annotation (same for all alleles at a position).
     pub is_positional: bool,
 }

@@ -3149,6 +3149,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: true,
+            record_list: false,
             is_positional: false,
         },
         "gnomad" => IndexHeader {
@@ -3160,6 +3161,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "dbsnp" => IndexHeader {
@@ -3171,6 +3173,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "phylop" | "gerp" | "dann" => {
@@ -3191,6 +3194,7 @@ pub fn run_sa_build_inputs(
                 assembly: assembly.into(),
                 match_by_allele: false,
                 is_array: false,
+                record_list: false,
                 is_positional: true,
             }
         },
@@ -3203,6 +3207,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "revel" => IndexHeader {
@@ -3214,6 +3219,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "spliceai" => IndexHeader {
@@ -3225,6 +3231,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "primateai" => IndexHeader {
@@ -3236,6 +3243,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "dbnsfp" => IndexHeader {
@@ -3247,6 +3255,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: true,
             is_positional: false,
         },
         "cosmic" => IndexHeader {
@@ -3258,6 +3267,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "onekg" | "1000g" => IndexHeader {
@@ -3269,6 +3279,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "topmed" => IndexHeader {
@@ -3280,6 +3291,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "alphamissense" => IndexHeader {
@@ -3291,6 +3303,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         "mitomap" => IndexHeader {
@@ -3302,6 +3315,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         },
         _ => anyhow::bail!(
@@ -4399,6 +4413,7 @@ fn run_custom_vcf_build(
         assembly: assembly.into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
     };
 

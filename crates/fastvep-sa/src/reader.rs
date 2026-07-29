@@ -6,7 +6,7 @@
 //! same block.
 
 use crate::block::{BlockEntry, SaBlock};
-use crate::common::{chrom_aliases, OSA_MAGIC};
+use crate::common::{chrom_aliases, OSA_MAGIC, OSA_SCHEMA_VERSION, SCHEMA_VERSION};
 use crate::index::{BlockRef, SaIndex};
 use crate::reader_v2::Osa2Reader;
 use anyhow::Result;
@@ -246,6 +246,17 @@ impl SaReader {
         if mmap.len() < 10 || &mmap[..8] != OSA_MAGIC {
             anyhow::bail!("Invalid OSA data file: bad magic");
         }
+        let data_version = u16::from_le_bytes([mmap[8], mmap[9]]);
+        if !matches!(data_version, SCHEMA_VERSION | OSA_SCHEMA_VERSION) {
+            anyhow::bail!("Unsupported OSA data schema version {}", data_version);
+        }
+        if data_version != index.header.schema_version {
+            anyhow::bail!(
+                "OSA data/index schema mismatch: data is {}, index is {}",
+                data_version,
+                index.header.schema_version
+            );
+        }
 
         let metadata = SaMetadata {
             name: index.header.name.clone(),
@@ -255,6 +266,7 @@ impl SaReader {
             json_key: index.header.json_key.clone(),
             match_by_allele: index.header.match_by_allele,
             is_array: index.header.is_array,
+            record_list: index.header.record_list,
             is_positional: index.header.is_positional,
         };
 
@@ -449,6 +461,20 @@ impl SaReader {
         alt_allele: &str,
     ) -> Result<Option<String>> {
         let block_refs = self.index.find_blocks(chrom, position);
+        if self.metadata.record_list {
+            let mut matches = Vec::new();
+            for block_ref in block_refs {
+                let entries = self.get_block(block_ref)?;
+                self.find_matches(
+                    &entries,
+                    position,
+                    ref_allele,
+                    alt_allele,
+                    &mut matches,
+                );
+            }
+            return Ok((!matches.is_empty()).then(|| format!("[{}]", matches.join(","))));
+        }
         for block_ref in block_refs {
             let entries = self.get_block(block_ref)?;
             if let Some(json) = self.find_match(&entries, position, ref_allele, alt_allele) {
@@ -484,6 +510,28 @@ impl SaReader {
             self.metadata.is_positional,
         )
         .map(|idx| entries[idx].json.clone())
+    }
+
+    fn find_matches(
+        &self,
+        entries: &[BlockEntry],
+        position: u32,
+        ref_allele: &str,
+        alt_allele: &str,
+        matches: &mut Vec<String>,
+    ) {
+        let start = entries.partition_point(|entry| entry.position < position);
+        for entry in &entries[start..] {
+            if entry.position != position {
+                break;
+            }
+            if self.metadata.is_positional
+                || !self.metadata.match_by_allele
+                || (entry.ref_allele == ref_allele && entry.alt_allele == alt_allele)
+            {
+                matches.push(entry.json.clone());
+            }
+        }
     }
 }
 
@@ -618,6 +666,7 @@ mod tests {
             assembly: "GRCh38".into(),
             match_by_allele,
             is_array: false,
+            record_list: false,
             is_positional,
         }
     }
@@ -666,6 +715,51 @@ mod tests {
             AnnotationValue::Json(j) => assert!(j.contains(r#""i":43"#)),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn record_list_collects_duplicates_across_block_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("record-list");
+        let mut header = header(true, false);
+        header.record_list = true;
+        let records = vec![
+            AnnotationRecord {
+                chrom_idx: 0,
+                position: 1000,
+                ref_allele: "A".into(),
+                alt_allele: "G".into(),
+                json: format!(
+                    r#"{{"row":1,"pad":"{}"}}"#,
+                    "x".repeat(crate::common::DEFAULT_BLOCK_SIZE)
+                ),
+            },
+            AnnotationRecord {
+                chrom_idx: 0,
+                position: 1000,
+                ref_allele: "A".into(),
+                alt_allele: "G".into(),
+                json: r#"{"row":2}"#.into(),
+            },
+        ];
+        let mut writer = SaWriter::new(header);
+        writer
+            .write_to_files(&base, records.into_iter(), &["chr1".into()])
+            .unwrap();
+
+        let reader = SaReader::open(&base.with_extension("osa")).unwrap();
+        assert_eq!(reader.index.find_blocks("chr1", 1000).len(), 2);
+        let AnnotationValue::Json(json) = reader
+            .annotate_position("chr1", 1000, "A", "G")
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected allele-specific JSON");
+        };
+        let records: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(records.as_array().unwrap().len(), 2);
+        assert_eq!(records[0]["row"], 1);
+        assert_eq!(records[1]["row"], 2);
     }
 
     #[test]

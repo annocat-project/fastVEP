@@ -3,7 +3,9 @@
 //! The index maps (chromosome, position) -> file offset so the reader can
 //! seek directly to the relevant compressed block.
 
-use crate::common::{chrom_aliases, MAX_INDEX_PAYLOAD, OSA_MAGIC, SCHEMA_VERSION};
+use crate::common::{
+    chrom_aliases, MAX_INDEX_PAYLOAD, OSA_MAGIC, OSA_SCHEMA_VERSION, SCHEMA_VERSION,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,6 +35,7 @@ pub struct IndexHeader {
     pub assembly: String,
     pub match_by_allele: bool,
     pub is_array: bool,
+    pub record_list: bool,
     pub is_positional: bool,
 }
 
@@ -46,7 +49,8 @@ pub struct SaIndex {
 
 impl SaIndex {
     /// Create a new empty index with the given header.
-    pub fn new(header: IndexHeader) -> Self {
+    pub fn new(mut header: IndexHeader) -> Self {
+        header.schema_version = OSA_SCHEMA_VERSION;
         Self {
             header,
             chromosomes: HashMap::new(),
@@ -118,7 +122,7 @@ impl SaIndex {
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         // Magic + schema version
         writer.write_all(OSA_MAGIC)?;
-        writer.write_all(&SCHEMA_VERSION.to_le_bytes())?;
+        writer.write_all(&OSA_SCHEMA_VERSION.to_le_bytes())?;
 
         // Serialize the rest with bincode
         let data = bincode::serialize(self)?;
@@ -144,14 +148,6 @@ impl SaIndex {
         let mut version_bytes = [0u8; 2];
         reader.read_exact(&mut version_bytes)?;
         let version = u16::from_le_bytes(version_bytes);
-        if version != SCHEMA_VERSION {
-            anyhow::bail!(
-                "Unsupported schema version: expected {}, got {}",
-                SCHEMA_VERSION,
-                version
-            );
-        }
-
         // Read bincode data
         let mut len_bytes = [0u8; 8];
         reader.read_exact(&mut len_bytes)?;
@@ -170,8 +166,68 @@ impl SaIndex {
         let mut data = vec![0u8; len];
         reader.read_exact(&mut data)?;
 
-        let index: SaIndex = bincode::deserialize(&data)?;
-        Ok(index)
+        match version {
+            SCHEMA_VERSION => {
+                let legacy: LegacySaIndex = bincode::deserialize(&data)?;
+                Ok(legacy.into())
+            }
+            OSA_SCHEMA_VERSION => {
+                let index: SaIndex = bincode::deserialize(&data)?;
+                if index.header.schema_version != OSA_SCHEMA_VERSION {
+                    anyhow::bail!(
+                        "OSA index schema mismatch: prefix is {}, header is {}",
+                        OSA_SCHEMA_VERSION,
+                        index.header.schema_version
+                    );
+                }
+                Ok(index)
+            }
+            _ => anyhow::bail!(
+                "Unsupported OSA schema version: expected {} or {}, got {}",
+                SCHEMA_VERSION,
+                OSA_SCHEMA_VERSION,
+                version
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyIndexHeader {
+    schema_version: u16,
+    json_key: String,
+    name: String,
+    version: String,
+    description: String,
+    assembly: String,
+    match_by_allele: bool,
+    is_array: bool,
+    is_positional: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySaIndex {
+    header: LegacyIndexHeader,
+    chromosomes: HashMap<String, Vec<BlockRef>>,
+}
+
+impl From<LegacySaIndex> for SaIndex {
+    fn from(legacy: LegacySaIndex) -> Self {
+        Self {
+            header: IndexHeader {
+                schema_version: legacy.header.schema_version,
+                json_key: legacy.header.json_key,
+                name: legacy.header.name,
+                version: legacy.header.version,
+                description: legacy.header.description,
+                assembly: legacy.header.assembly,
+                match_by_allele: legacy.header.match_by_allele,
+                is_array: legacy.header.is_array,
+                record_list: false,
+                is_positional: legacy.header.is_positional,
+            },
+            chromosomes: legacy.chromosomes,
+        }
     }
 }
 
@@ -190,6 +246,7 @@ mod tests {
             assembly: "GRCh38".into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         };
 
@@ -237,6 +294,7 @@ mod tests {
             assembly: "GRCh38".into(),
             match_by_allele: true,
             is_array: false,
+            record_list: false,
             is_positional: false,
         };
 
@@ -275,5 +333,33 @@ mod tests {
         // Missing chromosome
         let blocks = index.find_blocks("chr99", 100);
         assert_eq!(blocks.len(), 0);
+    }
+
+    #[test]
+    fn reads_legacy_index_with_record_lists_disabled() {
+        let legacy = LegacySaIndex {
+            header: LegacyIndexHeader {
+                schema_version: SCHEMA_VERSION,
+                json_key: "dbnsfp".into(),
+                name: "dbNSFP".into(),
+                version: "4.9a".into(),
+                description: String::new(),
+                assembly: "GRCh38".into(),
+                match_by_allele: true,
+                is_array: false,
+                is_positional: false,
+            },
+            chromosomes: HashMap::new(),
+        };
+        let payload = bincode::serialize(&legacy).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(OSA_MAGIC);
+        bytes.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        let loaded = SaIndex::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(loaded.header.schema_version, SCHEMA_VERSION);
+        assert!(!loaded.header.record_list);
     }
 }

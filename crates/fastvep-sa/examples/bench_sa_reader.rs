@@ -108,6 +108,7 @@ fn build_synthetic_osa(path: &PathBuf, n_records: usize) -> Result<u64> {
         assembly: "GRCh38".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
     };
 

@@ -48,6 +48,13 @@ impl Chunk {
         (self.var32s.get(index) == Some(&encoded)).then_some(index)
     }
 
+    #[inline]
+    pub fn find_all_short(&self, encoded: u32) -> std::ops::Range<usize> {
+        let start = self.var32s.partition_point(|key| *key < encoded);
+        let end = self.var32s.partition_point(|key| *key <= encoded);
+        start..end
+    }
+
     /// Look up a long variant. Returns the index into value arrays.
     ///
     /// Returns `None` if either allele contains a non-ACGT base: such a
@@ -65,6 +72,28 @@ impl Chunk {
             .get(index)
             .filter(|variant| *variant == &query)
             .map(|variant| variant.idx as usize)
+    }
+
+    pub fn find_all_long(
+        &self,
+        position: u32,
+        ref_allele: &[u8],
+        alt_allele: &[u8],
+    ) -> Vec<usize> {
+        let Some(sequence) = crate::kmer16::encode_var(ref_allele, alt_allele) else {
+            return Vec::new();
+        };
+        let query = LongVariant {
+            position,
+            idx: 0,
+            sequence,
+        };
+        let start = self.longs.partition_point(|variant| variant < &query);
+        self.longs[start..]
+            .iter()
+            .take_while(|variant| *variant == &query)
+            .map(|variant| variant.idx as usize)
+            .collect()
     }
 
     /// Reconstruct a JSON string from parallel value arrays at the given index.

@@ -102,8 +102,9 @@ fn build_sites(n_records: usize) -> Vec<SiteData> {
         let step = (*length as u64 / share as u64).max(1);
         for j in 0..share {
             let pos = (1 + j as u64 * step).min(*length as u64) as u32;
-            // Deterministic pseudo-values so both formats encode identical data
-            // without needing a RNG (Math.random-free, reproducible).
+            // Deterministic pseudo-values give every encoding the same inputs
+            // without needing an RNG; the numeric encodings intentionally
+            // quantize AF according to their configured multiplier.
             let an = 1_461_402i64;
             let ac = (j % 100_000 + 1) as i64;
             let af = ac as f64 / an as f64;
@@ -153,6 +154,7 @@ fn build_v1(path: &Path, sites: &[SiteData]) -> Result<u64> {
         assembly: "GRCh38".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
     };
     let mut writer = SaWriter::new(header);
@@ -217,6 +219,7 @@ fn build_v2_blob(path: &Path, sites: &[SiteData]) -> Result<u64> {
         json_key: "gnomad".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
         chunk_bits: 20,
         description: "Synthetic benchmark fixture".into(),
@@ -254,6 +257,7 @@ fn build_v2(path: &Path, sites: &[SiteData], af_multiplier: u32) -> Result<u64> 
         json_key: "gnomad".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
         chunk_bits: 20,
         description: "Synthetic benchmark fixture".into(),

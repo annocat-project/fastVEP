@@ -191,6 +191,7 @@ impl OsiReader {
             // dispatch in the annotate pipeline skip allele matching.
             match_by_allele: false,
             is_array: true,
+            record_list: false,
             is_positional: true,
         };
         Ok(Self { index, metadata })

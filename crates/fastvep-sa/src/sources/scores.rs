@@ -33,6 +33,7 @@ pub fn score_osa2_metadata(json_key: &str, assembly: &str) -> Osa2Metadata {
         json_key: json_key.into(),
         match_by_allele: false,
         is_array: false,
+        record_list: false,
         is_positional: true,
         chunk_bits: 20,
         description: format!("{} conservation/prediction scores for {}", json_key, assembly),

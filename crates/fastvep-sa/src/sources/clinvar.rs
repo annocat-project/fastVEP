@@ -24,6 +24,7 @@ pub fn clinvar_osa2_metadata(assembly: &str) -> Osa2Metadata {
         json_key: "clinvar".into(),
         match_by_allele: true,
         is_array: true,
+        record_list: false,
         is_positional: false,
         chunk_bits: 20,
         description: format!("ClinVar annotations for {assembly}"),

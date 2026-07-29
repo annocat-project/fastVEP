@@ -12,6 +12,9 @@ pub const OGA_MAGIC: &[u8; 8] = b"FSTGA_01";
 /// Current schema version. Bump when the binary format changes.
 pub const SCHEMA_VERSION: u16 = 1;
 
+/// Current allele-cache schema version. OSA v2 adds record-list metadata.
+pub const OSA_SCHEMA_VERSION: u16 = 2;
+
 /// Default block size for compression (8 MiB).
 pub const DEFAULT_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 

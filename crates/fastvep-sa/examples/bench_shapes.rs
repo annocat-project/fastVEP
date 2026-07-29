@@ -303,6 +303,7 @@ fn build_v1(path: &Path, sites: &[Site], shape: &dyn Shape) -> Result<u64> {
         assembly: "GRCh38".into(),
         match_by_allele: true,
         is_array: shape.is_array(),
+        record_list: false,
         is_positional: false,
     };
     let mut writer = SaWriter::new(header);
@@ -339,6 +340,7 @@ fn build_v2(path: &Path, sites: &[Site], shape: &dyn Shape) -> Result<u64> {
         json_key: shape.json_key().into(),
         match_by_allele: true,
         is_array: shape.is_array(),
+        record_list: false,
         is_positional: false,
         chunk_bits: 20,
         description: "bench".into(),
@@ -417,6 +419,7 @@ fn bench_positional(n_records: usize) -> Result<()> {
         assembly: "GRCh38".into(),
         match_by_allele: false,
         is_array: false,
+        record_list: false,
         is_positional: true,
     };
     let mut w = SaWriter::new(header);
@@ -445,6 +448,7 @@ fn bench_positional(n_records: usize) -> Result<()> {
         json_key: "phylop".into(),
         match_by_allele: false,
         is_array: false,
+        record_list: false,
         is_positional: true,
         chunk_bits: 20,
         description: "bench".into(),

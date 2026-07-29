@@ -28,6 +28,7 @@ pub fn dbsnp_osa2_metadata(assembly: &str) -> Osa2Metadata {
         json_key: "dbsnp".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
         chunk_bits: 20,
         description: format!("dbSNP RS IDs for {assembly}"),

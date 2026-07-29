@@ -47,6 +47,7 @@ fn gnomad_repeat_indel_matches_after_normalization() {
         assembly: "GRCh38".into(),
         match_by_allele: true,
         is_array: false,
+        record_list: false,
         is_positional: false,
     };
 
