@@ -1,6 +1,7 @@
 use crate::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
 use fastvep_core::{Allele, Consequence};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt::Write as FmtWrite;
 
 /// Format a VCF CSQ INFO field value from a VariationFeature.
@@ -1351,14 +1352,44 @@ pub fn format_tab_line_with(
     lines
 }
 
+fn supplementary_alleles(vf: &VariationFeature) -> Vec<serde_json::Value> {
+    let mut by_allele = BTreeMap::<String, serde_json::Map<String, Value>>::new();
+    for tv in &vf.transcript_variations {
+        for aa in &tv.allele_annotations {
+            let sources = by_allele.entry(aa.allele.to_string()).or_default();
+            for (key, json_str) in &aa.supplementary {
+                if sources.contains_key(key) {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(json_str) {
+                    sources.insert(key.clone(), value);
+                }
+            }
+        }
+    }
+
+    by_allele
+        .into_iter()
+        .filter_map(|(allele, sources)| {
+            if sources.is_empty() {
+                return None;
+            }
+            let mut object = serde_json::Map::new();
+            object.insert("allele".into(), Value::String(allele));
+            object.extend(sources);
+            Some(Value::Object(object))
+        })
+        .collect()
+}
+
 /// Format a VariationFeature as JSON.
 ///
-/// When `sa_only` is true (used by `--sa-only` mode), the
-/// `transcript_consequences`, `most_severe_consequence`, and per-allele
-/// ACMG metadata blocks are omitted, and per-allele supplementary
-/// annotations are surfaced under a top-level `alleles` array
-/// (`[{"allele": .., "<sa_key>": <value>, ...}]`). Variant-level
-/// `supplementary_annotations` and `gene_annotations` (if any) still emit.
+/// Per-allele supplementary annotations are emitted once under the top-level
+/// `alleles` array (`[{"allele": .., "<sa_key>": <value>, ...}]`).
+/// When `sa_only` is true (used by `--sa-only` mode),
+/// `transcript_consequences`, `most_severe_consequence`, and per-allele ACMG
+/// metadata are omitted. Variant-level `supplementary_annotations` and
+/// `gene_annotations` (if any) still emit.
 pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
 
@@ -1374,31 +1405,12 @@ pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
         serde_json::Value::String(vf.allele_string.clone()),
     );
     obj.insert("strand".into(), serde_json::Value::Number(vf.position.strand.as_int().into()));
+    let alleles = supplementary_alleles(vf);
+    if !alleles.is_empty() {
+        obj.insert("alleles".into(), Value::Array(alleles));
+    }
 
     if sa_only {
-        let alleles: Vec<serde_json::Value> = vf
-            .transcript_variations
-            .iter()
-            .flat_map(|tv| {
-                tv.allele_annotations.iter().map(|aa| {
-                    let mut a = serde_json::Map::new();
-                    a.insert(
-                        "allele".into(),
-                        serde_json::Value::String(aa.allele.to_string()),
-                    );
-                    for (key, json_str) in &aa.supplementary {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                            a.insert(key.clone(), val);
-                        }
-                    }
-                    serde_json::Value::Object(a)
-                })
-            })
-            .collect();
-        if !alleles.is_empty() {
-            obj.insert("alleles".into(), serde_json::Value::Array(alleles));
-        }
-
         for sa in &vf.supplementary_annotations {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sa.json_string) {
                 obj.insert(sa.json_key.clone(), val);
@@ -1538,12 +1550,6 @@ pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
                 }
                 if let Some(d) = aa.distance {
                     tc.insert("distance".into(), serde_json::Value::Number(d.into()));
-                }
-                // Per-allele supplementary annotations (ClinVar, gnomAD, etc.)
-                for (key, json_str) in &aa.supplementary {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        tc.insert(key.clone(), val);
-                    }
                 }
                 // ACMG-AMP classification
                 if let Some(ref acmg) = aa.acmg_classification {
@@ -1833,6 +1839,32 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn json_emits_supplementary_sources_once_per_allele() {
+        let mut vf = projection_test_variant();
+        let mut second_transcript = vf.transcript_variations[0].clone();
+        second_transcript.transcript_id = Arc::from("TX2");
+        vf.transcript_variations.push(second_transcript);
+
+        let value = format_json(&vf, false);
+        let alleles = value["alleles"].as_array().unwrap();
+        assert_eq!(alleles.len(), 1);
+        assert_eq!(alleles[0]["allele"], "G");
+        assert_eq!(alleles[0]["gnomad"]["allAc"], 12);
+        assert_eq!(value.to_string().matches("\"gnomad\"").count(), 1);
+
+        let consequences = value["transcript_consequences"].as_array().unwrap();
+        assert_eq!(consequences.len(), 2);
+        assert!(
+            consequences
+                .iter()
+                .all(|consequence| consequence.get("gnomad").is_none())
+        );
+
+        let projections = format_supplementary_vcf_info(&vf);
+        assert!(projections.iter().any(|(id, _)| id == "FV_GNOMAD"));
     }
 
     #[test]
