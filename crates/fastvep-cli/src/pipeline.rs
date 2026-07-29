@@ -1122,8 +1122,13 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                             if let (Some(ref spliced), Some(coding_start), Some(cds_s)) =
                                                 (&tr.spliced_seq, tr.cdna_coding_start, ac.cds_start)
                                             {
-                                                // Extract from CDS start to end of spliced seq (includes 3'UTR)
+                                                // Extract from CDS start to end of spliced seq (includes 3'UTR).
+                                                // Guard against malformed/truncated GFF3-derived transcript data
+                                                // where `coding_start` is inconsistent with the actual spliced
+                                                // sequence length — skip HGVSp generation for this case rather
+                                                // than panicking on an out-of-bounds slice.
                                                 let coding_start_idx = (coding_start - 1) as usize;
+                                                if coding_start >= 1 && coding_start_idx <= spliced.len() {
                                                 let ref_from_cds = &spliced.as_bytes()[coding_start_idx..];
                                                 let cds_idx = (cds_s - 1) as usize;
                                                 let mut alt_from_cds = ref_from_cds.to_vec();
@@ -1150,12 +1155,20 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                                 }
 
                                                 let codon_start = cds_idx / 3;
+                                                let fs_codon_table =
+                                                    if fastvep_genome::is_mitochondrial(&tr.chromosome) {
+                                                        fastvep_genome::mitochondrial_codon_table()
+                                                    } else {
+                                                        fastvep_genome::CodonTable::standard()
+                                                    };
                                                 ann.hgvsp = fastvep_hgvs::hgvsp_frameshift(
                                                     &versioned_pid,
                                                     ref_from_cds,
                                                     &alt_from_cds,
                                                     codon_start,
+                                                    &fs_codon_table,
                                                 );
+                                                }
                                             }
                                         } else if aa.1 == "-"
                                             || ac.consequences.contains(&Consequence::InframeDeletion)
@@ -1916,6 +1929,7 @@ pub fn run_filter(input: &str, output_path: &str, filter_expr: &str) -> Result<(
     let mut csq_fields: Vec<String> = Vec::new();
     let mut kept = 0u64;
     let mut total = 0u64;
+    let mut malformed = 0u64;
 
     for line in reader.lines() {
         let line = line?;
@@ -1949,6 +1963,11 @@ pub fn run_filter(input: &str, output_path: &str, filter_expr: &str) -> Result<(
         // Parse VCF data line
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 8 {
+            malformed += 1;
+            eprintln!(
+                "[filter] skipping malformed line {} (fewer than 8 tab-separated fields): {}",
+                total, line
+            );
             continue;
         }
 
@@ -2002,6 +2021,12 @@ pub fn run_filter(input: &str, output_path: &str, filter_expr: &str) -> Result<(
         "[filter] {} of {} variants passed filter: {}",
         kept, total, filter_expr
     );
+    if malformed > 0 {
+        eprintln!(
+            "[filter] {} of {} lines were skipped as malformed (fewer than 8 tab-separated fields)",
+            malformed, total
+        );
+    }
 
     Ok(())
 }
@@ -3032,6 +3057,22 @@ pub fn run_sa_build(
     )
 }
 
+fn normalized_sa_input_skips(inputs: &[String], input_skips: &[u64]) -> Result<Vec<u64>> {
+    if inputs.is_empty() || inputs.iter().any(|input| input.is_empty()) {
+        anyhow::bail!("sa-build requires at least one non-empty input");
+    }
+    if inputs.len() > 1 && inputs.iter().any(|input| input == "-") {
+        anyhow::bail!("stdin may only be used as a single sa-build input");
+    }
+    if input_skips.is_empty() {
+        return Ok(vec![0; inputs.len()]);
+    }
+    if input_skips.len() != inputs.len() {
+        anyhow::bail!("--input-skip must be omitted or supplied once per input");
+    }
+    Ok(input_skips.to_vec())
+}
+
 /// Build one logical supplementary source from one or more raw artifacts.
 /// Artifact decompression, row parsing, chromosome normalization, filtering,
 /// and sorted merging all remain inside fastVEP.
@@ -3048,20 +3089,7 @@ pub fn run_sa_build_inputs(
 ) -> Result<()> {
     use fastvep_sa::index::IndexHeader;
     use fastvep_sa::writer::SaWriter;
-    if inputs.is_empty() || inputs.iter().any(|input| input.is_empty()) {
-        anyhow::bail!("sa-build requires at least one non-empty input");
-    }
-    if inputs.len() > 1 && inputs.iter().any(|input| input == "-") {
-        anyhow::bail!("stdin may only be used as a single sa-build input");
-    }
-    let normalized_skips = if input_skips.is_empty() {
-        vec![0; inputs.len()]
-    } else {
-        if input_skips.len() != inputs.len() {
-            anyhow::bail!("--input-skip must be omitted or supplied once per input");
-        }
-        input_skips.to_vec()
-    };
+    let normalized_skips = normalized_sa_input_skips(inputs, input_skips)?;
     let input = inputs[0].as_str();
     let selected_fields = annocat_selected_source_fields(source)?;
     let framed_input =
@@ -3254,6 +3282,17 @@ pub fn run_sa_build_inputs(
             is_array: false,
             is_positional: false,
         },
+        "alphamissense" => IndexHeader {
+            schema_version: fastvep_sa::common::SCHEMA_VERSION,
+            json_key: "alphaMissense".into(),
+            name: "AlphaMissense".into(),
+            version: "latest".into(),
+            description: format!("AlphaMissense pathogenicity predictions for {}", assembly),
+            assembly: assembly.into(),
+            match_by_allele: true,
+            is_array: false,
+            is_positional: false,
+        },
         "mitomap" => IndexHeader {
             schema_version: fastvep_sa::common::SCHEMA_VERSION,
             json_key: "mitomap".into(),
@@ -3266,7 +3305,7 @@ pub fn run_sa_build_inputs(
             is_positional: false,
         },
         _ => anyhow::bail!(
-            "Unknown source: {}. Supported: clinvar, gnomad, dbsnp, cosmic, onekg, topmed, mitomap, phylop, gerp, dann, cadd, revel, spliceai, primateai, dbnsfp, omim, gnomad_genes, clinvar_protein, custom_vcf, custom_bed, custom",
+            "Unknown source: {}. Supported: clinvar, gnomad, dbsnp, cosmic, onekg, topmed, mitomap, phylop, gerp, dann, cadd, revel, spliceai, primateai, dbnsfp, alphamissense, omim, gnomad_genes, clinvar_protein, custom_vcf, custom_bed, custom",
             source
         ),
     };
@@ -3414,6 +3453,21 @@ pub fn run_sa_build_inputs(
                 |r, m| fastvep_sa::sources::topmed::iter_topmed_vcf(r, m),
             );
         }
+        "alphamissense" => {
+            return run_streaming_sa_build(
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                output,
+                header,
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                None,
+                |r, m| fastvep_sa::sources::alphamissense::iter_alphamissense_tsv(r, m),
+            );
+        }
         "phylop" => {
             return run_streaming_sa_build(
                 source,
@@ -3514,6 +3568,748 @@ pub fn run_sa_build_inputs(
     );
 
     Ok(())
+}
+
+/// The allele-level sources that build to the v2 `.osa2` format. Single source
+/// of truth for the `--format auto` dispatch and the `--format osa2` error
+/// message — adding a source to v2 means adding it here plus a match arm in
+/// [`run_sa_build_v2`]. Includes the `1000g` alias of `onekg`.
+///
+/// Gene-level (`.oga`) and `custom_*` sources are absent because v2 is a
+/// variant-level container. Positional per-base scores (PhyloP/GERP/DANN) ARE
+/// supported — keyed by coordinate via `var32::positional_key`.
+pub const OSA2_SUPPORTED_SOURCES: &[&str] = &[
+    "gnomad",
+    "onekg",
+    "1000g",
+    "topmed",
+    "alphamissense",
+    "dbsnp",
+    "cosmic",
+    "clinvar",
+    "revel",
+    "primateai",
+    "dbnsfp",
+    "phylop",
+    "gerp",
+    "dann",
+];
+
+/// Whether `--format osa2` (and `--format auto`) can build this source to v2.
+pub fn source_supports_osa2(source: &str) -> bool {
+    OSA2_SUPPORTED_SOURCES.contains(&source)
+}
+
+/// Dispatch `sa-build` to the v1 or v2 builder according to `--format`:
+///
+/// * `auto` (the default) — build v2 for sources that support it (smaller and
+///   faster to query at genome scale), v1 for everything else. This gives users
+///   the higher-quality format per source without having to know which is which.
+/// * `osa` / `v1` — force v1 `.osa`.
+/// * `osa2` / `v2` — force v2 `.osa2` (errors if the source has no v2 encoder).
+pub fn run_sa_build_format(
+    format: &str,
+    source: &str,
+    inputs: &[String],
+    input_skips: &[u64],
+    chromosome: Option<&str>,
+    output: &str,
+    assembly: &str,
+    name: Option<&str>,
+    info_fields: &[String],
+    show_progress: bool,
+) -> Result<()> {
+    match format {
+        "osa" | "v1" => run_sa_build_inputs(
+            source,
+            inputs,
+            input_skips,
+            chromosome,
+            output,
+            assembly,
+            name,
+            info_fields,
+            show_progress,
+        ),
+        "osa2" | "v2" => run_sa_build_v2(
+            source,
+            inputs,
+            input_skips,
+            chromosome,
+            output,
+            assembly,
+            show_progress,
+        ),
+        "auto" => {
+            if source_supports_osa2(source) {
+                run_sa_build_v2(
+                    source,
+                    inputs,
+                    input_skips,
+                    chromosome,
+                    output,
+                    assembly,
+                    show_progress,
+                )
+            } else {
+                run_sa_build_inputs(
+                    source,
+                    inputs,
+                    input_skips,
+                    chromosome,
+                    output,
+                    assembly,
+                    name,
+                    info_fields,
+                    show_progress,
+                )
+            }
+        }
+        other => anyhow::bail!(
+            "Unknown --format '{}': expected 'auto' (default; best format per source), \
+             'osa' (v1), or 'osa2' (v2)",
+            other
+        ),
+    }
+}
+
+/// Build a v2 (`.osa2`) supplementary annotation database.
+///
+/// The v2 format (chunked ZIP, u32 value arrays, Var32 binary search) is
+/// faster to query and smaller on disk at genome scale than v1 `.osa`. It is
+/// wired for the allele-level sources in [`OSA2_SUPPORTED_SOURCES`].
+/// Population frequencies and AlphaMissense use compact numeric columns;
+/// opaque string/array payloads use whole-record JSON blobs. Other sources
+/// continue to build v1 `.osa` via [`run_sa_build`].
+pub fn run_sa_build_v2(
+    source: &str,
+    inputs: &[String],
+    input_skips: &[u64],
+    chromosome: Option<&str>,
+    output: &str,
+    assembly: &str,
+    show_progress: bool,
+) -> Result<()> {
+    use fastvep_sa::sources::{
+        alphamissense, clinvar, cosmic, dbnsfp, dbsnp, gnomad, onekg, primateai, revel, scores,
+        topmed,
+    };
+
+    let normalized_skips = normalized_sa_input_skips(inputs, input_skips)?;
+    let input = inputs[0].as_str();
+    let selected_fields = annocat_selected_source_fields(source)?;
+    let (chrom_list, chrom_map) = standard_chrom_map(assembly);
+    let chromosome_idx = chromosome
+        .map(|value| {
+            let stripped = value.strip_prefix("chr").unwrap_or(value);
+            chrom_map
+                .get(value)
+                .or_else(|| chrom_map.get(stripped))
+                .or_else(|| chrom_map.get(&format!("chr{stripped}")))
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("unsupported {assembly} chromosome '{value}'"))
+        })
+        .transpose()?;
+    let framed_input =
+        inputs.len() != 1 || normalized_skips.iter().any(|skip| *skip != 0) || chromosome.is_some();
+    let out_path = Path::new(output).with_extension("osa2");
+
+    match source {
+        // Population frequencies use the canonical upstream numeric schema.
+        "gnomad" => {
+            run_streaming_osa2_v1_build(
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                &out_path,
+                &gnomad::gnomad_osa2_metadata(assembly),
+                gnomad::gnomad_osa2_fields(),
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                selected_fields.as_ref(),
+                |reader, map| {
+                    gnomad::iter_gnomad_vcf_selected(reader, map, selected_fields.as_ref())
+                },
+            )
+        }
+        // 1000 Genomes: the v1 parser buffers + sorts; bridge each record to
+        // the v2 layout and stream it out.
+        "onekg" | "1000g" => {
+            eprintln!("Building onekg .osa2: {} -> {}", input, out_path.display());
+            let (buf_reader, meter) = open_sa_reader_with_meter(input, show_progress)?;
+            if framed_input {
+                anyhow::bail!("source '{source}' requires one complete input for .osa2");
+            }
+            let mut v1 = onekg::parse_onekg_vcf(buf_reader, &chrom_map)?;
+            v1.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
+            let fields = onekg::onekg_osa2_fields();
+            let bridge_fields = fields.clone();
+            let records =
+                bridge_v1_records(v1.into_iter().map(Ok), &chrom_list, &bridge_fields);
+            finish_osa2_build(
+                &out_path,
+                &onekg::onekg_osa2_metadata(assembly),
+                fields,
+                &[],
+                records,
+                meter,
+                input,
+                assembly,
+            )
+        }
+        // TOPMed uses the same canonical numeric path as gnomAD.
+        "topmed" => {
+            run_streaming_osa2_v1_build(
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                &out_path,
+                &topmed::topmed_osa2_metadata(assembly),
+                topmed::topmed_osa2_fields(),
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                selected_fields.as_ref(),
+                |reader, map| topmed::iter_topmed_vcf(reader, map),
+            )
+        }
+        // AlphaMissense: numeric score + a 3-level categorical class. Streams
+        // straight into v2 with a dedicated encoder (the generic v1 bridge
+        // cannot encode categoricals) and a fixed 3-entry string table.
+        "alphamissense" => {
+            if framed_input {
+                anyhow::bail!("source '{source}' requires one complete input for .osa2");
+            }
+            eprintln!("Building alphamissense .osa2: {} -> {}", input, out_path.display());
+            let (buf_reader, meter) = open_sa_reader_with_meter(input, show_progress)?;
+            let records =
+                alphamissense::iter_alphamissense_osa2(buf_reader, &chrom_map, &chrom_list);
+            finish_osa2_build(
+                &out_path,
+                &alphamissense::alphamissense_osa2_metadata(assembly),
+                alphamissense::alphamissense_osa2_fields(),
+                &alphamissense::alphamissense_string_tables(),
+                records,
+                meter,
+                input,
+                assembly,
+            )
+        }
+        // dbSNP: whole-record JSON blob per variant (RS ID + optional MAF).
+        // Streams straight through (the full NCBI release is ~800M records).
+        "dbsnp" => {
+            run_streaming_osa2_v1_build(
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                &out_path,
+                &dbsnp::dbsnp_osa2_metadata(assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                selected_fields.as_ref(),
+                |reader, map| {
+                    dbsnp::iter_dbsnp_vcf_selected(reader, map, selected_fields.as_ref())
+                },
+            )
+        }
+        // COSMIC: whole-record JSON blob per variant (COSV id + gene + count).
+        // The coding-mutations file fits in memory; the v1 parser buffers and
+        // sorts, then we bridge each record to a blob and stream it out.
+        "cosmic" => {
+            if framed_input {
+                anyhow::bail!("source '{source}' requires one complete input for .osa2");
+            }
+            eprintln!("Building cosmic .osa2: {} -> {}", input, out_path.display());
+            let (buf_reader, meter) = open_sa_reader_with_meter(input, show_progress)?;
+            let v1 = cosmic::parse_cosmic_vcf(buf_reader, &chrom_map)?;
+            let records = bridge_v1_raw_blobs(v1.into_iter().map(Ok), &chrom_list);
+            finish_osa2_build(
+                &out_path,
+                &cosmic::cosmic_osa2_metadata(assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &[],
+                records,
+                meter,
+                input,
+                assembly,
+            )
+        }
+        // ClinVar: whole-record JSON blob per variant (significance/phenotype
+        // arrays, review status, population AFs). is_array=true is preserved in
+        // the v2 metadata to match v1 exactly. Buffered+sorted by the v1 parser.
+        "clinvar" => {
+            if framed_input {
+                anyhow::bail!("source '{source}' requires one complete input for .osa2");
+            }
+            eprintln!("Building clinvar .osa2: {} -> {}", input, out_path.display());
+            let (buf_reader, meter) = open_sa_reader_with_meter(input, show_progress)?;
+            let v1 = clinvar::parse_clinvar_vcf_selected(
+                buf_reader,
+                &chrom_map,
+                selected_fields.as_ref(),
+            )?;
+            let records = bridge_v1_raw_blobs(v1.into_iter().map(Ok), &chrom_list);
+            finish_osa2_build(
+                &out_path,
+                &clinvar::clinvar_osa2_metadata(assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &[],
+                records,
+                meter,
+                input,
+                assembly,
+            )
+        }
+        // REVEL: single `{"score":..}` object per allele, stored as a
+        // whole-record blob (its fixed-decimal score text rides through
+        // untouched). The v1 parser buffers+sorts the CSV; column 2 is the
+        // GRCh38 position, matching the v1 build path.
+        "revel" => {
+            run_streaming_osa2_v1_build(
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                &out_path,
+                &revel::revel_osa2_metadata(assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                selected_fields.as_ref(),
+                |reader, map| {
+                    revel::iter_revel_selected(reader, map, 2, selected_fields.as_ref())
+                },
+            )
+        }
+        // Positional per-base scores (PhyloP/GERP/DANN): allele-less, keyed by
+        // coordinate. Stream the score TSV/wig and store each bare-number score
+        // as a whole-record blob. Genome-wide (~3B positions for PhyloP), so
+        // these must stream — never buffer.
+        "phylop" => {
+            run_streaming_osa2_v1_build(
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                &out_path,
+                &scores::score_osa2_metadata("phylop", assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                selected_fields.as_ref(),
+                |reader, map| iter_phylop_auto(reader, map),
+            )
+        }
+        "gerp" | "dann" => {
+            run_streaming_osa2_v1_build(
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                &out_path,
+                &scores::score_osa2_metadata(source, assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                selected_fields.as_ref(),
+                |reader, map| scores::iter_score_tsv(reader, map, false),
+            )
+        }
+        // dbNSFP: composite SIFT/PolyPhen prediction strings per allele,
+        // whole-record blob. The v1 parser auto-detects columns from the
+        // header, buffers, and sorts; then we bridge to blobs.
+        "dbnsfp" => {
+            run_streaming_osa2_v1_build(
+                source,
+                inputs,
+                &normalized_skips,
+                chromosome_idx,
+                &out_path,
+                &dbnsfp::dbnsfp_osa2_metadata(assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &chrom_map,
+                &chrom_list,
+                show_progress,
+                selected_fields.as_ref(),
+                |reader, map| dbnsfp::iter_dbnsfp(reader, map),
+            )
+        }
+        // PrimateAI: single `{"score":..}` object per allele, whole-record blob.
+        "primateai" => {
+            if framed_input {
+                anyhow::bail!("source '{source}' requires one complete input for .osa2");
+            }
+            eprintln!("Building primateai .osa2: {} -> {}", input, out_path.display());
+            let (buf_reader, meter) = open_sa_reader_with_meter(input, show_progress)?;
+            let v1 = primateai::parse_primateai(buf_reader, &chrom_map)?;
+            let records = bridge_v1_raw_blobs(v1.into_iter().map(Ok), &chrom_list);
+            finish_osa2_build(
+                &out_path,
+                &primateai::primateai_osa2_metadata(assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &[],
+                records,
+                meter,
+                input,
+                assembly,
+            )
+        }
+        _ => anyhow::bail!(
+            "--format osa2 is currently supported for --source {} (got '{}'). Other \
+             sources build v1 .osa; use --format auto (the default) to pick the best \
+             format per source, or --format osa to force v1.",
+            OSA2_SUPPORTED_SOURCES.join(", "),
+            source
+        ),
+    }
+}
+
+fn run_streaming_osa2_v1_build<'a, I>(
+    source: &str,
+    inputs: &[String],
+    input_skips: &[u64],
+    chromosome: Option<u16>,
+    out_path: &Path,
+    metadata: &fastvep_sa::writer_v2::Osa2Metadata,
+    fields: Vec<fastvep_sa::fields::Field>,
+    chrom_map: &'a std::collections::HashMap<String, u16>,
+    chrom_list: &'a [String],
+    show_progress: bool,
+    selected_fields: Option<&std::collections::HashSet<String>>,
+    mut make_iter: impl FnMut(
+        io::BufReader<Box<dyn io::Read + Send>>,
+        &'a std::collections::HashMap<String, u16>,
+    ) -> I,
+) -> Result<()>
+where
+    I: Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>> + 'a,
+{
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    let file_size = inputs
+        .iter()
+        .filter_map(|input| std::fs::metadata(input).ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    let byte_counter = Arc::new(AtomicU64::new(0));
+    let parallel_parser = parallel_batch_parser(source, chrom_map)?;
+    let requested_workers = supplementary_parser_worker_count();
+    let workers_per_input = (requested_workers / inputs.len().max(1)).max(1);
+    let mut iterators: Vec<
+        Box<dyn Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>> + 'a>,
+    > = Vec::with_capacity(inputs.len());
+
+    for (input, skip) in inputs.iter().zip(input_skips) {
+        let reader = open_sa_input(input, Some(Arc::clone(&byte_counter)), *skip)?;
+        let reader: Box<dyn io::Read + Send> = if chromosome.is_some() {
+            Box::new(CompleteLinesReader::new(reader))
+        } else {
+            reader
+        };
+        let reader = io::BufReader::with_capacity(1024 * 1024, reader);
+        if let Some(parser) = parallel_parser.as_ref().filter(|_| workers_per_input > 1) {
+            iterators.push(Box::new(OrderedParallelRecordIter::new(
+                reader,
+                Arc::clone(parser),
+                workers_per_input,
+            )));
+        } else {
+            iterators.push(Box::new(make_iter(reader, chrom_map)));
+        }
+    }
+
+    let meter = if show_progress && file_size > 0 {
+        crate::progress::ProgressMeter::with_progress(true, file_size, byte_counter)
+    } else {
+        crate::progress::ProgressMeter::new(show_progress)
+    };
+    let records = MergedRecordIter::new(iterators, chromosome).map(|record| {
+        record.and_then(|record| filter_supplementary_record(source, record, selected_fields))
+    });
+    let bridge_fields = fields.clone();
+    let records = bridge_v1_records(records, chrom_list, &bridge_fields);
+    let input_label = inputs.join(", ");
+    finish_osa2_build(
+        out_path,
+        metadata,
+        fields,
+        &[],
+        records,
+        meter,
+        &input_label,
+        &metadata.assembly,
+    )
+}
+
+/// Adapt an iterator of v1 `AnnotationRecord`s into whole-record-blob
+/// `Osa2Record`s: each record's entire JSON is stored as the blob, so the v2
+/// reader returns exactly the v1 bytes. Used for payloads that must not be
+/// quantized or do not decompose cleanly into numeric u32 columns.
+fn bridge_v1_raw_blobs<'a, I>(
+    records: I,
+    chrom_list: &'a [String],
+) -> impl Iterator<Item = Result<fastvep_sa::writer_v2::Osa2Record>> + 'a
+where
+    I: Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>> + 'a,
+{
+    records.map(move |r| {
+        let rec = r?;
+        let chrom = chrom_list
+            .get(rec.chrom_idx as usize)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("chrom_idx {} out of range", rec.chrom_idx))?;
+        Ok(fastvep_sa::writer_v2::osa2_raw_blob_from_v1(&rec, chrom))
+    })
+}
+
+/// Open a (possibly gzipped) SA input and pair it with a byte-tracking
+/// progress meter, matching the v1 streaming builder's setup.
+fn open_sa_reader_with_meter(
+    input: &str,
+    show_progress: bool,
+) -> Result<(
+    io::BufReader<Box<dyn io::Read + Send>>,
+    crate::progress::ProgressMeter,
+)> {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    let file_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
+    let byte_counter = Arc::new(AtomicU64::new(0));
+    let reader = open_sa_input(input, Some(Arc::clone(&byte_counter)), 0)?;
+    let buf_reader = io::BufReader::new(reader);
+    let meter = if show_progress && file_size > 0 {
+        crate::progress::ProgressMeter::with_progress(true, file_size, byte_counter)
+    } else {
+        crate::progress::ProgressMeter::new(show_progress)
+    };
+    Ok((buf_reader, meter))
+}
+
+/// Stream `records` into `out_path` as a `.osa2` file, then report. Mirrors
+/// the v1 streaming builder's crash-safety contract: on any failure the
+/// partial `.osa2` is removed so no corrupt database is left behind.
+fn finish_osa2_build(
+    out_path: &Path,
+    metadata: &fastvep_sa::writer_v2::Osa2Metadata,
+    fields: Vec<fastvep_sa::fields::Field>,
+    string_tables: &[(usize, Vec<String>)],
+    records: impl Iterator<Item = Result<fastvep_sa::writer_v2::Osa2Record>>,
+    mut meter: crate::progress::ProgressMeter,
+    input: &str,
+    assembly: &str,
+) -> Result<()> {
+    let n = match write_osa2_stream(out_path, metadata, fields, string_tables, records, &mut meter) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(out_path);
+            return Err(e);
+        }
+    };
+    meter.finish();
+    if n == 0 {
+        eprintln!(
+            "Warning: 0 records parsed from {} — if the input is non-empty, none of its \
+             chromosome names matched assembly '{}'.",
+            input, assembly
+        );
+    }
+    eprintln!(
+        "Wrote: {} ({} records)",
+        out_path.display(),
+        crate::progress::fmt_count(n)
+    );
+    Ok(())
+}
+
+/// Core streaming loop: create the `.osa2` writer, push every record, finish.
+/// Returns the number of records written.
+fn write_osa2_stream(
+    out_path: &Path,
+    metadata: &fastvep_sa::writer_v2::Osa2Metadata,
+    fields: Vec<fastvep_sa::fields::Field>,
+    string_tables: &[(usize, Vec<String>)],
+    records: impl Iterator<Item = Result<fastvep_sa::writer_v2::Osa2Record>>,
+    meter: &mut crate::progress::ProgressMeter,
+) -> Result<u64> {
+    use fastvep_sa::writer_v2::Osa2StreamWriter;
+
+    let out_file = std::fs::File::create(out_path)
+        .with_context(|| format!("Creating {}", out_path.display()))?;
+    let mut writer = Osa2StreamWriter::new(BufWriter::new(out_file), metadata, fields)?;
+    for (field_idx, table) in string_tables {
+        writer.set_string_table(*field_idx, table.clone());
+    }
+
+    let mut n = 0u64;
+    for record in records {
+        let record = record?;
+        meter.update();
+        writer.push(record)?;
+        n += 1;
+    }
+    writer.finish()?;
+    Ok(n)
+}
+
+/// Adapt v1 records to either the canonical numeric layout or the raw JSON
+/// blob layout used by non-numeric sources.
+fn bridge_v1_records<'a, I>(
+    records: I,
+    chrom_list: &'a [String],
+    fields: &'a [fastvep_sa::fields::Field],
+) -> impl Iterator<Item = Result<fastvep_sa::writer_v2::Osa2Record>> + 'a
+where
+    I: Iterator<Item = Result<fastvep_sa::common::AnnotationRecord>> + 'a,
+{
+    records.map(move |record| {
+        let record = record?;
+        let chrom = chrom_list
+            .get(record.chrom_idx as usize)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("chrom_idx {} out of range", record.chrom_idx))?;
+        if fields.len() == 1
+            && fields[0].ftype == fastvep_sa::fields::FieldType::JsonBlob
+            && fields[0].alias.is_empty()
+        {
+            Ok(fastvep_sa::writer_v2::osa2_raw_blob_from_v1(
+                &record, chrom,
+            ))
+        } else {
+            fastvep_sa::writer_v2::osa2_record_from_v1(&record, chrom, fields)
+        }
+    })
+}
+
+#[cfg(test)]
+mod osa2_build_tests {
+    use super::*;
+    use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue};
+    use fastvep_sa::reader_v2::Osa2Reader;
+    use fastvep_sa::sources::gnomad;
+
+    fn annotation_json(
+        reader: &Osa2Reader,
+        chrom: &str,
+        position: u64,
+        reference: &str,
+        alternate: &str,
+    ) -> String {
+        match reader
+            .annotate_position(chrom, position, reference, alternate)
+            .unwrap()
+            .unwrap()
+        {
+            AnnotationValue::Json(json) => json,
+            other => panic!("expected JSON annotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gnomad_numeric_build_uses_upstream_schema_and_merges_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_a = dir.path().join("a.vcf");
+        let shard_b = dir.path().join("b.vcf");
+        let output = dir.path().join("gnomad");
+        let header = "\
+##fileformat=VCFv4.2
+##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">
+##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number\">
+##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
+";
+        let rows_a = "\
+chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
+chr1\t300\t.\tC\tT,A\t.\tPASS\tAF=0.01,0.005;AN=140000;AC=1400,700
+";
+        let rows_b = "chr1\t200\t.\tG\tA\t.\tPASS\tAF=0.25;AN=100;AC=25\n";
+        std::fs::write(&shard_a, format!("{header}{rows_a}")).unwrap();
+        std::fs::write(&shard_b, format!("{header}{rows_b}")).unwrap();
+
+        let inputs = vec![
+            shard_a.to_string_lossy().into_owned(),
+            shard_b.to_string_lossy().into_owned(),
+        ];
+        run_sa_build_v2(
+            "gnomad",
+            &inputs,
+            &[],
+            None,
+            output.to_str().unwrap(),
+            "GRCh38",
+            false,
+        )
+        .unwrap();
+
+        let reader = Osa2Reader::open(&output.with_extension("osa2")).unwrap();
+        let rare = annotation_json(&reader, "1", 100, "A", "G");
+        let rare: serde_json::Value = serde_json::from_str(&rare).unwrap();
+        assert_eq!(
+            gnomad::gnomad_osa2_fields()[0].multiplier,
+            2_000_000
+        );
+        assert_eq!(rare["allAf"], serde_json::json!(0.0000005));
+        assert_eq!(rare["allAn"], serde_json::json!(1_522_000));
+        assert_eq!(rare["allAc"], serde_json::json!(1));
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&annotation_json(
+                &reader, "chr1", 200, "G", "A"
+            ))
+            .unwrap()["allAf"],
+            serde_json::json!(0.25)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&annotation_json(
+                &reader, "chr1", 300, "C", "A"
+            ))
+            .unwrap()["allAc"],
+            serde_json::json!(700)
+        );
+    }
+
+    #[test]
+    fn canonical_gnomad_reader_uses_upstream_precision() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("numeric.osa2");
+        let vcf = "\
+##fileformat=VCFv4.2
+##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">
+##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number\">
+##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
+chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
+";
+        let (chrom_list, chrom_map) = standard_chrom_map("GRCh38");
+        finish_osa2_build(
+            &output,
+            &gnomad::gnomad_osa2_metadata("GRCh38"),
+            gnomad::gnomad_osa2_fields(),
+            &[],
+            gnomad::iter_gnomad_osa2(vcf.as_bytes(), &chrom_map),
+            crate::progress::ProgressMeter::new(false),
+            "test",
+            &chrom_list[0],
+        )
+        .unwrap();
+
+        let reader = Osa2Reader::open(&output).unwrap();
+        let json = annotation_json(&reader, "chr1", 100, "A", "G");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["allAf"],
+            serde_json::json!(0.0000005)
+        );
+    }
 }
 
 /// Classify a `--source custom` input as either `custom_vcf` or
@@ -4433,6 +5229,62 @@ mod custom_source_tests {
             msg.contains("custom_bed"),
             "error message must mention custom_bed: {}",
             msg
+        );
+    }
+
+    #[test]
+    fn run_filter_still_processes_well_formed_lines_when_malformed_lines_present() {
+        // Regression: lines with fewer than 8 tab-separated fields were
+        // silently `continue`d with no diagnostic even though they were
+        // already counted toward `total`. This doesn't change the filtering
+        // behavior (malformed lines still can't match), but verifies that
+        // well-formed lines around a malformed one are still processed
+        // correctly and the function doesn't error out.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("in.vcf");
+        let mut f = std::fs::File::create(&input_path).unwrap();
+        writeln!(f, "##fileformat=VCFv4.2").unwrap();
+        writeln!(
+            f,
+            "##INFO=<ID=CSQ,Number=.,Type=String,Description=\"Consequence annotations. Format: Consequence|IMPACT\">"
+        )
+        .unwrap();
+        writeln!(f, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
+        // Well-formed, matches the filter.
+        writeln!(f, "1\t100\t.\tA\tG\t.\tPASS\tCSQ=missense_variant|MODERATE").unwrap();
+        // Malformed: fewer than 8 tab-separated fields.
+        writeln!(f, "1\t200\t.\tC\tT").unwrap();
+        // Well-formed, matches the filter.
+        writeln!(f, "1\t300\t.\tG\tA\t.\tPASS\tCSQ=missense_variant|MODERATE").unwrap();
+        drop(f);
+
+        let output_path = dir.path().join("out.vcf");
+        run_filter(
+            input_path.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+            "Consequence is missense_variant",
+        )
+        .expect("run_filter should not error on a malformed line");
+
+        let out = std::fs::read_to_string(&output_path).unwrap();
+        // Both well-formed matching lines pass through; the malformed line
+        // is absent from the output (it can't match) but doesn't crash the
+        // run or swallow its neighbors.
+        assert!(
+            out.contains("1\t100\t.\tA\tG"),
+            "first well-formed line should pass:\n{}",
+            out
+        );
+        assert!(
+            out.contains("1\t300\t.\tG\tA"),
+            "second well-formed line should pass:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("1\t200\t.\tC\tT"),
+            "malformed line must not appear in output:\n{}",
+            out
         );
     }
 }

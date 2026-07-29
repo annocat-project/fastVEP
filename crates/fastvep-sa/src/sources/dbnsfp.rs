@@ -8,6 +8,7 @@
 //! semicolon lists) while the iterator keeps memory bounded.
 
 use crate::common::{escape_json, AnnotationRecord};
+use crate::writer_v2::Osa2Metadata;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -178,7 +179,27 @@ fn selected_fields() -> Result<Vec<&'static str>> {
     selected_fields_from(encoded.as_deref())
 }
 
-/// Parse a dbNSFP TSV file using the curated 4.9a schema.
+/// Standard dbNSFP `.osa2` metadata. dbNSFP's payload is composite prediction
+/// strings (`{"sift":"D(0.012)","polyphen":..}`) that don't decompose into
+/// numeric u32 columns, so it is stored as a whole-record JSON blob (see
+/// [`crate::writer_v2::raw_json_blob_fields`]): byte-identical to v1, with v2's
+/// chunk-level zstd shrinking the database.
+pub fn dbnsfp_osa2_metadata(assembly: &str) -> Osa2Metadata {
+    Osa2Metadata {
+        format_version: 2,
+        name: "dbNSFP".into(),
+        version: "latest".into(),
+        assembly: assembly.into(),
+        json_key: "dbnsfp".into(),
+        match_by_allele: true,
+        is_array: false,
+        is_positional: false,
+        chunk_bits: 20,
+        description: format!("dbNSFP SIFT/PolyPhen predictions for {assembly}"),
+    }
+}
+
+/// Parse a dbNSFP TSV file using the curated schema.
 ///
 /// The header must contain every curated field. This intentionally fails closed
 /// if a different dbNSFP layout is supplied.

@@ -29,6 +29,7 @@ input's other headers pass through unchanged.
 | REVEL             | `revel`             | `revel`           | `FV_REVEL`          | `FV_REVEL`          | Allele       |
 | PrimateAI         | `primateai`         | `primateAI`       | `FV_PRIMATEAI`      | `FV_PRIMATEAI`      | Allele       |
 | dbNSFP            | `dbnsfp`            | `dbnsfp`          | `FV_DBNSFP`         | `FV_DBNSFP`         | Allele       |
+| AlphaMissense     | `alphamissense`     | `alphaMissense`   | `FV_ALPHAMISSENSE`  | `FV_ALPHAMISSENSE`  | Allele       |
 | SpliceAI          | `spliceai`          | `spliceAI`        | `SpliceAI`          | `SpliceAI`          | Allele       |
 | OMIM / ClinGen GDV| `omim`              | `omim`            | `FV_OMIM`           | `FV_OMIM`           | Gene         |
 | gnomAD constraint | `gnomad_genes`      | `gnomad_genes`    | `FV_GNOMAD_GENE`    | `FV_GNOMAD_GENE`    | Gene         |
@@ -67,6 +68,44 @@ A directory passed to `--sa-dir` is scanned for any of the four
 extensions; mismatched files (e.g. a `.tsv` left in place) are silently
 skipped.
 
+## Choosing v1 vs v2 (`--format`)
+
+Allele-level sources can build to either the v1 `.osa` or v2 `.osa2`
+container. **You normally don't have to choose:** `sa-build --format` defaults
+to `auto`, which builds v2 for the sources that support it and v1 for the rest.
+The annotate side loads either transparently from `--sa-dir`, so downstream
+usage is identical.
+
+Rule of thumb:
+
+- **`auto` (default)** — recommended. Gives the best format per source with no
+  decision required.
+- **`osa` (force v1)** — use for a faster one-time build, or when a downstream
+  tool specifically expects the `.osa`/`.osa.idx` file pair.
+- **`osa2` (force v2)** — use to build v2 for a source that supports it even if
+  the default ever changes; errors out for sources with no v2 encoder.
+
+Why v2 is the higher-quality default where available: at genome scale its
+chunked index is **faster to query** on the sparse, scattered lookups a real
+VCF produces, and columnar encoding reduces numeric population-source caches.
+The trade-off is a slower one-time build; v2 is also not necessarily a size
+win for small inputs, where fixed per-chunk overhead dominates. Blob-backed
+sources preserve their JSON payloads byte-for-byte. gnomAD, 1000G, and TOPMed
+use the upstream numeric schema: allele frequencies have fixed 5e-7
+resolution, while allele counts, allele numbers, and homozygote counts remain
+exact.
+
+Every allele-level and positional source has a v2 encoder: `gnomad`, `onekg`
+(`1000g`), `topmed`, `alphamissense`, `dbsnp`, `cosmic`, `clinvar`, `revel`,
+`primateai`, `dbnsfp`, and the positional per-base scores `phylop`, `gerp`,
+`dann`. Only gene-level (`.oga`) sources and `custom_*` inputs build v1
+`.osa`/`.osi`/`.oga` regardless of `--format`.
+
+Positional scores get an especially large v2 win: their per-base coordinates
+delta-encode to almost nothing and the score column compresses well, so a
+dense per-base database is roughly **0.23× the size** of the v1 `.osa`
+(measured via `bench_shapes` on realistic-entropy synthetic scores).
+
 ## Pipe formats
 
 Each value is a pipe-delimited string. Multiple values for the same record
@@ -93,6 +132,7 @@ lead with the **gene symbol**.
 - `FV_REVEL`: `ALLELE|SCORE`
 - `FV_PRIMATEAI`: `ALLELE|SCORE`
 - `FV_DBNSFP`: `ALLELE|SIFT|POLYPHEN`
+- `FV_ALPHAMISSENSE`: `ALLELE|PATHOGENICITY|CLASS`
 - `SpliceAI`: `ALLELE|SYMBOL|DS_AG|DS_AL|DS_DG|DS_DL|DP_AG|DP_AL|DP_DG|DP_DL`
 
 ### Gene-level

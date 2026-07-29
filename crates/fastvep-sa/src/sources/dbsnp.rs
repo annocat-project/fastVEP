@@ -7,11 +7,32 @@
 //! tests and small inputs.
 
 use crate::common::AnnotationRecord;
+use crate::writer_v2::Osa2Metadata;
 use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::io::BufRead;
+
+/// Standard dbSNP `.osa2` metadata. dbSNP's payload (`id` RS string +
+/// optional `globalMaf`) is stored as a whole-record JSON blob per variant
+/// (see [`crate::writer_v2::raw_json_blob_fields`]) — the RS ID is near-unique
+/// per variant, so a numeric/categorical column split can't help, but v2's
+/// chunk-level zstd of the blob column still shrinks the database sharply.
+pub fn dbsnp_osa2_metadata(assembly: &str) -> Osa2Metadata {
+    Osa2Metadata {
+        format_version: 2,
+        name: "dbSNP".into(),
+        version: "latest".into(),
+        assembly: assembly.into(),
+        json_key: "dbsnp".into(),
+        match_by_allele: true,
+        is_array: false,
+        is_positional: false,
+        chunk_bits: 20,
+        description: format!("dbSNP RS IDs for {assembly}"),
+    }
+}
 
 /// Stream a coordinate-sorted dbSNP VCF as `AnnotationRecord`s without
 /// buffering the whole file in memory.
@@ -293,6 +314,27 @@ mod tests {
             "T should get CAF index 2 (0.02), not C's frequency: {}",
             t.json
         );
+    }
+
+    #[test]
+    fn test_parse_dbsnp_rs_id_is_json_escaped() {
+        // The ID column is attacker-influenced free text in a corrupted/hostile
+        // build input; if it (or the RS= fallback) ever contains a quote or
+        // backslash, the emitted record must still be valid JSON rather than
+        // having the id value break out of its string.
+        let vcf = "\
+##fileformat=VCFv4.0
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
+1\t10019\trs1\"evil\\n\tA\tG\t.\t.\tRS=1;CAF=0.9,0.1
+";
+        let mut chrom_map = HashMap::new();
+        chrom_map.insert("chr1".to_string(), 0u16);
+
+        let records = parse_dbsnp_vcf(vcf.as_bytes(), &chrom_map).unwrap();
+        assert_eq!(records.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&records[0].json)
+            .expect("rs_id must be escaped so the record is valid JSON");
+        assert_eq!(v.get("id").and_then(|x| x.as_str()), Some("rs1\"evil\\n"));
     }
 
     #[test]

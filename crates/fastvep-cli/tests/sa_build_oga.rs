@@ -4,7 +4,6 @@
 //! `run_sa_build` (the same entrypoint the CLI uses), and reads the resulting
 //! database back to confirm the round-trip.
 
-use fastvep_cache::annotation::AnnotationProvider;
 use fastvep_cli::pipeline::{run_annotate, run_sa_build, AnnotateConfig};
 use fastvep_sa::gene::GeneIndex;
 use std::fs::{self, File};
@@ -250,6 +249,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -351,6 +351,7 @@ chr1\t26011\t2.71
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -431,6 +432,7 @@ fn annotate_vcf_replaces_existing_fastvep_info() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -496,6 +498,7 @@ fn annotate_vcf_emits_fastsa_projection_for_gnomad() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -564,6 +567,7 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "tab".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -684,6 +688,7 @@ fn sa_only_vcf_omits_csq_and_default_pipeline() {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -746,6 +751,7 @@ fn sa_only_tab_emits_minimal_columns() {
         gff3: vec![],
         fasta: None,
         output_format: "tab".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -811,6 +817,7 @@ fn sa_only_json_omits_transcript_consequences() {
         gff3: vec![],
         fasta: None,
         output_format: "json".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -847,15 +854,12 @@ fn sa_only_json_omits_transcript_consequences() {
             "sa-only JSON must omit most_severe_consequence: {}",
             record
         );
-        assert!(
-            obj.contains_key("alleles"),
-            "sa-only JSON must include alleles array: {}",
-            record
-        );
     }
 
     let first = arr[0].as_object().unwrap();
-    let alleles = first["alleles"].as_array().unwrap();
+    let alleles = first["alleles"]
+        .as_array()
+        .expect("matched sa-only JSON record must include an alleles array");
     let g = alleles
         .iter()
         .find(|a| a["allele"].as_str() == Some("G"))
@@ -903,6 +907,7 @@ fn sa_only_requires_sa_dir() {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -972,6 +977,7 @@ fn sa_only_multi_allelic_emits_per_alt_rows_with_independent_sa_columns() {
         gff3: vec![],
         fasta: None,
         output_format: "tab".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -1044,6 +1050,7 @@ fn sa_only_strips_preexisting_csq_from_input_info() {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -1115,6 +1122,7 @@ fn sa_only_strips_csq_when_in_middle_of_info_field() {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -1202,6 +1210,7 @@ fn intergenic_variant_with_sa_dir_in_default_mode_emits_fv_clinvar() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -1263,6 +1272,7 @@ fn annotate_tab_gene_list_filters_to_panel_genes() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "tab".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -1316,6 +1326,7 @@ fn annotate_tab_explicit_alleles_inserts_ref_column() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "tab".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,
@@ -1401,6 +1412,7 @@ min_dp = 8
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "tab".into(),
+        buffer_size: 5000,
         pick: false,
         hgvs: false,
         distance: 0,

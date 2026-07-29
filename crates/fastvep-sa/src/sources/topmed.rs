@@ -5,10 +5,51 @@
 //! tests and small inputs.
 
 use crate::common::AnnotationRecord;
+use crate::fields::{Field, FieldType};
+use crate::writer_v2::Osa2Metadata;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::BufRead;
+
+/// Canonical TOPMed `.osa2` field schema. AC and AN remain exact integers;
+/// frequency values have fixed 5e-7 resolution.
+pub fn topmed_osa2_fields() -> Vec<Field> {
+    vec![
+        Field {
+            field: "allAf".into(), alias: "allAf".into(), ftype: FieldType::Float,
+            multiplier: 2_000_000, zigzag: false, missing_value: u32::MAX,
+            missing_string: ".".into(), description: "Global allele frequency".into(),
+        },
+        Field {
+            field: "allAc".into(), alias: "allAc".into(), ftype: FieldType::Integer,
+            multiplier: 1, zigzag: false, missing_value: u32::MAX,
+            missing_string: ".".into(), description: "Allele count".into(),
+        },
+        Field {
+            field: "allAn".into(), alias: "allAn".into(), ftype: FieldType::Integer,
+            multiplier: 1, zigzag: false, missing_value: u32::MAX,
+            missing_string: ".".into(), description: "Total allele number".into(),
+        },
+    ]
+}
+
+/// Standard TOPMed `.osa2` metadata (mirrors the v1 header:
+/// `json_key = "topmed"`, allele-matched, non-positional).
+pub fn topmed_osa2_metadata(assembly: &str) -> Osa2Metadata {
+    Osa2Metadata {
+        format_version: 2,
+        name: "TOPMed".into(),
+        version: "latest".into(),
+        assembly: assembly.into(),
+        json_key: "topmed".into(),
+        match_by_allele: true,
+        is_array: false,
+        is_positional: false,
+        chunk_bits: 20,
+        description: format!("TOPMed population frequencies for {assembly}"),
+    }
+}
 
 /// Stream a coordinate-sorted TOPMed VCF as `AnnotationRecord`s without
 /// buffering the whole file in memory.
@@ -81,10 +122,15 @@ impl<R: BufRead> Iterator for TopmedRecordIter<'_, R> {
                 if let Some(af) = all_afs.get(i).and_then(|s| s.parse::<f64>().ok()) {
                     parts.push(format!("\"allAf\":{:.6e}", af));
                 }
-                if let Some(ac) = all_acs.get(i) {
+                // AC/AN are written unquoted, so each must be a validated
+                // non-negative integer — raw INFO-field text would otherwise
+                // land in the JSON as a bare, unquoted token and break every
+                // downstream serde_json::from_str on this record. Mirrors
+                // the CNT validation in sources/cosmic.rs.
+                if let Some(ac) = all_acs.get(i).and_then(|s| s.parse::<u64>().ok()) {
                     parts.push(format!("\"allAc\":{}", ac));
                 }
-                if let Some(an) = info_map.get("AN") {
+                if let Some(an) = info_map.get("AN").and_then(|s| s.parse::<u64>().ok()) {
                     parts.push(format!("\"allAn\":{}", an));
                 }
                 if parts.is_empty() {
@@ -150,5 +196,35 @@ mod tests {
         let recs = parse_topmed_vcf(vcf.as_bytes(), &m).unwrap();
         assert_eq!(recs.len(), 1);
         assert!(recs[0].json.contains("\"allAf\":"));
+    }
+
+    #[test]
+    fn test_garbage_ac_an_omitted_not_emitted_unescaped() {
+        // AC/AN are spliced into the JSON unquoted, so malformed upstream
+        // text must be dropped rather than emitted as a bare token that
+        // would break serde_json::from_str on the whole record.
+        let vcf = "#h\nchr1\t100\t.\tA\tG\t.\t.\tAF=0.05;AC=garbage;AN=not_a_number\n";
+        let mut m = HashMap::new();
+        m.insert("chr1".into(), 0u16);
+        let recs = parse_topmed_vcf(vcf.as_bytes(), &m).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].json.contains("allAc"));
+        assert!(!recs[0].json.contains("allAn"));
+        let v: serde_json::Value = serde_json::from_str(&recs[0].json).unwrap();
+        assert!(v.get("allAf").is_some());
+    }
+
+    #[test]
+    fn test_topmed_osa2_bridge_encodes_values() {
+        let vcf = "#h\nchr1\t100\t.\tA\tG\t.\t.\tAF=0.05;AC=500;AN=10000\n";
+        let mut m = HashMap::new();
+        m.insert("chr1".into(), 0u16);
+        let recs = parse_topmed_vcf(vcf.as_bytes(), &m).unwrap();
+        let fields = topmed_osa2_fields();
+        assert_eq!(fields[0].multiplier, 2_000_000);
+        let o = crate::writer_v2::osa2_record_from_v1(&recs[0], "chr1".into(), &fields).unwrap();
+        assert_eq!(o.values[0], fields[0].encode_float(0.05)); // allAf
+        assert_eq!(o.values[1], 500); // allAc
+        assert_eq!(o.values[2], 10000); // allAn
     }
 }
