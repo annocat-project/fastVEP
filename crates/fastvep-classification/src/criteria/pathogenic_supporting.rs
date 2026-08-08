@@ -5,10 +5,7 @@ use crate::sa_extract::ClassificationInput;
 use crate::types::{EvidenceCriterion, EvidenceDirection, EvidenceStrength};
 
 /// Evaluate all pathogenic supporting criteria: PP1, PP2, PP3, PP4, PP5.
-pub fn evaluate_all(
-    input: &ClassificationInput,
-    config: &AcmgConfig,
-) -> Vec<EvidenceCriterion> {
+pub fn evaluate_all(input: &ClassificationInput, config: &AcmgConfig) -> Vec<EvidenceCriterion> {
     let mut criteria = vec![
         evaluate_pp1(input, config),
         evaluate_pp2(input, config),
@@ -22,10 +19,7 @@ pub fn evaluate_all(
 }
 
 /// PP1: Co-segregation with disease in multiple affected family members.
-fn evaluate_pp1(
-    _input: &ClassificationInput,
-    _config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_pp1(_input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
     EvidenceCriterion {
         code: "PP1".to_string(),
         direction: EvidenceDirection::Pathogenic,
@@ -33,17 +27,16 @@ fn evaluate_pp1(
         default_strength: EvidenceStrength::Supporting,
         met: false,
         evaluated: false,
-        summary: "Requires multi-generation pedigree with affection status to assess co-segregation".to_string(),
+        summary:
+            "Requires multi-generation pedigree with affection status to assess co-segregation"
+                .to_string(),
         details: serde_json::Value::Null,
     }
 }
 
 /// PP2: Missense variant in a gene that has a low rate of benign missense variation
 /// and in which missense variants are a common mechanism of disease.
-fn evaluate_pp2(
-    input: &ClassificationInput,
-    config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_pp2(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCriterion {
     let is_missense = input
         .consequences
         .iter()
@@ -120,10 +113,7 @@ fn evaluate_pp2(
 /// PP3 at *Supporting* strength only. SpliceAI alone does not reach Strong;
 /// experimental RNA evidence (PVS1_RNA / PS3) is required for Strong splicing
 /// claims.
-fn evaluate_pp3(
-    input: &ClassificationInput,
-    config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_pp3(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCriterion {
     let mut details = serde_json::Map::new();
     let mut evidence_lines: Vec<String> = Vec::new();
 
@@ -269,10 +259,7 @@ fn evaluate_pp3(
 
 /// PP4: Patient's phenotype or family history is highly specific for a disease
 /// with a single genetic etiology.
-fn evaluate_pp4(
-    _input: &ClassificationInput,
-    _config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_pp4(_input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
     EvidenceCriterion {
         code: "PP4".to_string(),
         direction: EvidenceDirection::Pathogenic,
@@ -280,7 +267,8 @@ fn evaluate_pp4(
         default_strength: EvidenceStrength::Supporting,
         met: false,
         evaluated: false,
-        summary: "Requires patient HPO phenotype terms matched to disease-gene associations".to_string(),
+        summary: "Requires patient HPO phenotype terms matched to disease-gene associations"
+            .to_string(),
         details: serde_json::Value::Null,
     }
 }
@@ -289,20 +277,22 @@ fn evaluate_pp4(
 ///
 /// Note: ClinGen SVI recommends against using PP5 without reviewing underlying evidence.
 /// Disabled by default (config.use_pp5_bp6 = false).
-fn evaluate_pp5(
-    input: &ClassificationInput,
-    _config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_pp5(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
     let mut details = serde_json::Map::new();
     details.insert(
         "svi_note".into(),
-        serde_json::json!("ClinGen SVI recommends against using PP5 without reviewing underlying evidence"),
+        serde_json::json!(
+            "ClinGen SVI recommends against using PP5 without reviewing underlying evidence"
+        ),
     );
 
     let (met, evaluated, summary) = if let Some(ref clinvar) = input.clinvar {
         let stars = clinvar.review_stars();
         let is_pathogenic = clinvar.has_pathogenic();
-        details.insert("clinvar_pathogenic".into(), serde_json::json!(is_pathogenic));
+        details.insert(
+            "clinvar_pathogenic".into(),
+            serde_json::json!(is_pathogenic),
+        );
         details.insert("review_stars".into(), serde_json::json!(stars));
 
         if is_pathogenic && stars >= 2 {
@@ -318,7 +308,10 @@ fn evaluate_pp5(
             (
                 false,
                 true,
-                format!("ClinVar not pathogenic or insufficient review ({} stars)", stars),
+                format!(
+                    "ClinVar not pathogenic or insufficient review ({} stars)",
+                    stars
+                ),
             )
         }
     } else {
@@ -353,9 +346,7 @@ mod tests {
             protein_position: None,
             gnomad: None,
             clinvar: None,
-            revel: Some(RevelData {
-                score: Some(score),
-            }),
+            revel: Some(RevelData { score: Some(score) }),
             splice_ai: None,
             dbnsfp: None,
             phylop: None,

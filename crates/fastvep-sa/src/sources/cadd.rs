@@ -1,9 +1,27 @@
 //! Streaming parser for CADD score tables.
 
 use crate::common::AnnotationRecord;
+use crate::writer_v2::Osa2Metadata;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
+
+/// OSA2 metadata that preserves the CADD OSA1 annotation contract.
+pub fn cadd_osa2_metadata(assembly: &str) -> Osa2Metadata {
+    Osa2Metadata {
+        format_version: 2,
+        name: "CADD".into(),
+        version: "1.7".into(),
+        assembly: assembly.into(),
+        json_key: "cadd".into(),
+        match_by_allele: true,
+        is_array: false,
+        record_list: false,
+        is_positional: false,
+        chunk_bits: 16,
+        description: format!("CADD raw and PHRED scores for {assembly}"),
+    }
+}
 
 pub fn iter_cadd<'a, R: BufRead>(
     reader: R,

@@ -258,6 +258,25 @@ enum Commands {
         no_progress: bool,
     },
 
+    /// Convert a verified CADD or SpliceAI OSA v1 shard to OSA2.
+    SaConvert {
+        /// Input OSA v1 data file. Its matching .osa.idx file is required.
+        #[arg(short, long)]
+        input: String,
+
+        /// New .osa2 file. Existing files are never overwritten.
+        #[arg(short, long)]
+        output: String,
+
+        /// Suppress periodic progress output.
+        #[arg(long, default_value_t = false)]
+        no_progress: bool,
+
+        /// Skip source records whose alleles contain ambiguity codes that OSA2 cannot encode.
+        #[arg(long, default_value_t = false)]
+        skip_non_acgt: bool,
+    },
+
     /// Reopen and fully validate an OSA v1 or OSA2 database.
     SaVerify {
         /// Input .osa or .osa2 data file.
@@ -399,6 +418,12 @@ fn main() -> Result<()> {
             &info_fields,
             !no_progress,
         )?,
+        Commands::SaConvert {
+            input,
+            output,
+            no_progress,
+            skip_non_acgt,
+        } => pipeline::run_sa_convert(&input, &output, !no_progress, skip_non_acgt)?,
         Commands::SaVerify {
             input,
             chromosome,

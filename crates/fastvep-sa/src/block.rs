@@ -51,8 +51,7 @@ impl SaBlock {
 
     /// Check whether an entry fits without cloning its owned strings.
     pub fn can_add(&self, entry: &BlockEntry) -> bool {
-        self.entries.is_empty()
-            || self.uncompressed_size + Self::entry_size(entry) <= self.max_size
+        self.entries.is_empty() || self.uncompressed_size + Self::entry_size(entry) <= self.max_size
     }
 
     fn entry_size(entry: &BlockEntry) -> usize {

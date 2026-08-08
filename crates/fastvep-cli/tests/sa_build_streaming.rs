@@ -111,8 +111,26 @@ fn streaming_build_detects_gzip_by_magic_bytes_not_extension() {
 
     let out_plain = tmp.path().join("plain_db");
     let out_gz = tmp.path().join("gz_db");
-    run_sa_build("gnomad", plain.to_str().unwrap(), out_plain.to_str().unwrap(), "GRCh38", None, &[], false).unwrap();
-    run_sa_build("gnomad", misnamed.to_str().unwrap(), out_gz.to_str().unwrap(), "GRCh38", None, &[], false).unwrap();
+    run_sa_build(
+        "gnomad",
+        plain.to_str().unwrap(),
+        out_plain.to_str().unwrap(),
+        "GRCh38",
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    run_sa_build(
+        "gnomad",
+        misnamed.to_str().unwrap(),
+        out_gz.to_str().unwrap(),
+        "GRCh38",
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
 
     // Magic-byte detection must transparently decompress the misnamed gzip, so
     // both builds produce byte-identical databases. Before the fix the gzip
@@ -139,8 +157,17 @@ fn custom_vcf_build_accepts_plain_and_gzip_stdin() {
         let output = tmp.path().join(label);
         let mut child = Command::new(env!("CARGO_BIN_EXE_fastvep"))
             .args([
-                "sa-build", "--source", "custom_vcf", "--input", "-", "--output",
-                output.to_str().unwrap(), "--assembly", "GRCh38", "--name", "fixture",
+                "sa-build",
+                "--source",
+                "custom_vcf",
+                "--input",
+                "-",
+                "--output",
+                output.to_str().unwrap(),
+                "--assembly",
+                "GRCh38",
+                "--name",
+                "fixture",
                 "--no-progress",
             ])
             .stdin(Stdio::piped())
@@ -255,7 +282,9 @@ fixedStep chrom=chr2 start=50 step=1
         .unwrap()
         .expect("position 101 on chr1 should have a phyloP score");
     match hit {
-        AnnotationValue::Positional(v) => assert!(v.contains("0.75"), "unexpected phyloP value: {v}"),
+        AnnotationValue::Positional(v) => {
+            assert!(v.contains("0.75"), "unexpected phyloP value: {v}")
+        }
         other => panic!("expected a positional phyloP value, got {other:?}"),
     }
     assert!(
@@ -290,7 +319,9 @@ chr1\t200\t-0.5
         .unwrap()
         .expect("position 100 on chr1 should have a GERP score");
     match hit {
-        AnnotationValue::Positional(v) => assert!(v.contains("1.234"), "unexpected GERP value: {v}"),
+        AnnotationValue::Positional(v) => {
+            assert!(v.contains("1.234"), "unexpected GERP value: {v}")
+        }
         other => panic!("expected a positional GERP value, got {other:?}"),
     }
 }
@@ -329,9 +360,7 @@ fn fastvep_merges_multiple_raw_cadd_artifacts() {
     .unwrap();
 
     let reader = SaReader::open(&out.with_extension("osa")).unwrap();
-    for (position, reference, alternate) in
-        [(100, "A", "G"), (150, "AT", "A"), (200, "C", "T")]
-    {
+    for (position, reference, alternate) in [(100, "A", "G"), (150, "AT", "A"), (200, "C", "T")] {
         assert!(
             reader
                 .annotate_position("chr1", position, reference, alternate)
@@ -364,18 +393,14 @@ fn fastvep_owns_range_skip_and_chromosome_filtering() {
     .unwrap();
 
     let reader = SaReader::open(&output.with_extension("osa")).unwrap();
-    assert!(
-        reader
-            .annotate_position("chr1", 100, "A", "G")
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        reader
-            .annotate_position("chr2", 150, "G", "A")
-            .unwrap()
-            .is_none()
-    );
+    assert!(reader
+        .annotate_position("chr1", 100, "A", "G")
+        .unwrap()
+        .is_some());
+    assert!(reader
+        .annotate_position("chr2", 150, "G", "A")
+        .unwrap()
+        .is_none());
 }
 
 #[test]

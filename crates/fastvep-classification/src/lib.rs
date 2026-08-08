@@ -95,11 +95,7 @@ mod tests {
 
     #[test]
     fn test_classify_common_variant_benign() {
-        let mut input = make_input(
-            vec![Consequence::MissenseVariant],
-            Impact::Moderate,
-            "TEST",
-        );
+        let mut input = make_input(vec![Consequence::MissenseVariant], Impact::Moderate, "TEST");
         input.gnomad = Some(GnomadData {
             all_af: Some(0.10),
             afr_af: Some(0.15),
@@ -114,11 +110,7 @@ mod tests {
 
     #[test]
     fn test_classify_frameshift_lof_gene_likely_pathogenic() {
-        let mut input = make_input(
-            vec![Consequence::FrameshiftVariant],
-            Impact::High,
-            "BRCA1",
-        );
+        let mut input = make_input(vec![Consequence::FrameshiftVariant], Impact::High, "BRCA1");
         // High pLI → PVS1
         input.gene_constraints = Some(GnomadGeneData {
             pli: Some(1.0),
@@ -152,11 +144,7 @@ mod tests {
         // not contribute to non-missense classification. Without other
         // pathogenic-Strong evidence, PVS1 + PM2_Supporting tops out at LP
         // via the ClinGen SVI PVS+PP rule.
-        let mut input = make_input(
-            vec![Consequence::FrameshiftVariant],
-            Impact::High,
-            "BRCA1",
-        );
+        let mut input = make_input(vec![Consequence::FrameshiftVariant], Impact::High, "BRCA1");
         input.gene_constraints = Some(GnomadGeneData {
             pli: Some(1.0),
             loeuf: Some(0.03),
@@ -178,11 +166,7 @@ mod tests {
 
     #[test]
     fn test_classify_synonymous_no_splice_not_conserved() {
-        let mut input = make_input(
-            vec![Consequence::SynonymousVariant],
-            Impact::Low,
-            "TEST",
-        );
+        let mut input = make_input(vec![Consequence::SynonymousVariant], Impact::Low, "TEST");
         input.splice_ai = Some(SpliceAiData {
             ds_ag: Some(0.01),
             ds_al: Some(0.02),
@@ -228,11 +212,7 @@ mod tests {
         // reach a definite call on either side (PVS1 needs PS/PM/PP to fire
         // a pathogenic rule, and BS1 alone is sub-threshold for Benign).
         // Result is plain VUS without a "Conflicting" label.
-        let mut input = make_input(
-            vec![Consequence::FrameshiftVariant],
-            Impact::High,
-            "GENE",
-        );
+        let mut input = make_input(vec![Consequence::FrameshiftVariant], Impact::High, "GENE");
         input.gene_constraints = Some(GnomadGeneData {
             pli: Some(1.0),
             loeuf: Some(0.03),
@@ -268,11 +248,7 @@ mod tests {
 
     #[test]
     fn test_acmg_result_serialization() {
-        let input = make_input(
-            vec![Consequence::MissenseVariant],
-            Impact::Moderate,
-            "TEST",
-        );
+        let input = make_input(vec![Consequence::MissenseVariant], Impact::Moderate, "TEST");
         let result = classify(&input, &AcmgConfig::default());
         let json = serde_json::to_value(&result).unwrap();
 

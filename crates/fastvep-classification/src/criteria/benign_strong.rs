@@ -3,10 +3,7 @@ use crate::sa_extract::ClassificationInput;
 use crate::types::{EvidenceCriterion, EvidenceDirection, EvidenceStrength};
 
 /// Evaluate all benign strong criteria: BS1, BS2, BS3, BS4.
-pub fn evaluate_all(
-    input: &ClassificationInput,
-    config: &AcmgConfig,
-) -> Vec<EvidenceCriterion> {
+pub fn evaluate_all(input: &ClassificationInput, config: &AcmgConfig) -> Vec<EvidenceCriterion> {
     vec![
         evaluate_bs1(input, config),
         evaluate_bs2(input, config),
@@ -16,10 +13,7 @@ pub fn evaluate_all(
 }
 
 /// BS1: Allele frequency is greater than expected for disorder.
-fn evaluate_bs1(
-    input: &ClassificationInput,
-    config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_bs1(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCriterion {
     let threshold = config.effective_bs1_threshold(input.gene_symbol.as_deref());
 
     let mut details = serde_json::Map::new();
@@ -131,10 +125,7 @@ fn evaluate_bs1(
 ///
 /// Inheritance is inferred from the disease-gene `.oga` (ClinGen GDV
 /// preferred, OMIM accepted as legacy).
-fn evaluate_bs2(
-    input: &ClassificationInput,
-    config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_bs2(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCriterion {
     let mut details = serde_json::Map::new();
 
     let is_dominant = input
@@ -191,11 +182,7 @@ fn evaluate_bs2(
                 ),
             )
         } else {
-            (
-                false,
-                true,
-                "No homozygotes observed in gnomAD".to_string(),
-            )
+            (false, true, "No homozygotes observed in gnomAD".to_string())
         }
     } else {
         (false, false, "No gnomAD data available".to_string())
@@ -214,10 +201,7 @@ fn evaluate_bs2(
 }
 
 /// BS3: Well-established in vitro or in vivo functional studies show no damaging effect.
-fn evaluate_bs3(
-    _input: &ClassificationInput,
-    _config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_bs3(_input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
     EvidenceCriterion {
         code: "BS3".to_string(),
         direction: EvidenceDirection::Benign,
@@ -231,10 +215,7 @@ fn evaluate_bs3(
 }
 
 /// BS4: Lack of segregation in affected members of a family.
-fn evaluate_bs4(
-    _input: &ClassificationInput,
-    _config: &AcmgConfig,
-) -> EvidenceCriterion {
+fn evaluate_bs4(_input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
     EvidenceCriterion {
         code: "BS4".to_string(),
         direction: EvidenceDirection::Benign,
@@ -242,7 +223,9 @@ fn evaluate_bs4(
         default_strength: EvidenceStrength::Strong,
         met: false,
         evaluated: false,
-        summary: "Requires multi-generation pedigree with affection status to assess lack of segregation".to_string(),
+        summary:
+            "Requires multi-generation pedigree with affection status to assess lack of segregation"
+                .to_string(),
         details: serde_json::Value::Null,
     }
 }

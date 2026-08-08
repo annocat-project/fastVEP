@@ -166,7 +166,9 @@ fn selected_fields_from(encoded: Option<&str>) -> Result<Vec<&'static str>> {
     if requested.is_empty() || requested.len() > CURATED_FIELDS.len() {
         anyhow::bail!("ANNOCAT_DBNSFP_FIELDS has an invalid field count");
     }
-    let requested = requested.into_iter().collect::<std::collections::HashSet<_>>();
+    let requested = requested
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     if requested.len() > CURATED_FIELDS.len()
         || requested
             .iter()

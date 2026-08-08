@@ -506,7 +506,9 @@ mod tests {
                     // UTR: first 50 bases, CDS starts at offset 50
                     let mut seq = vec![b'N'; len];
                     // Put ATG at offset 50 (genomic 1050)
-                    seq[50] = b'A'; seq[51] = b'T'; seq[52] = b'G';
+                    seq[50] = b'A';
+                    seq[51] = b'T';
+                    seq[52] = b'G';
                     // Fill rest of CDS with GCT (Ala)
                     for i in 53..len {
                         seq[i] = b"GCT"[(i - 53) % 3];
@@ -541,15 +543,24 @@ mod tests {
 
         let ts = tr.translateable_seq.as_ref().unwrap();
         // translateable_seq should start with ATG
-        assert!(ts.starts_with("ATG"), "translateable_seq starts with: {}", &ts[..6]);
+        assert!(
+            ts.starts_with("ATG"),
+            "translateable_seq starts with: {}",
+            &ts[..6]
+        );
         // Length should be cdna_coding_end - cdna_coding_start + 1 = 952 - 51 + 1 = 902
         // Actually: cdna_coding_end = 952 in the test fixture
-        let expected_len = (tr.cdna_coding_end.unwrap() - tr.cdna_coding_start.unwrap() + 1) as usize;
+        let expected_len =
+            (tr.cdna_coding_end.unwrap() - tr.cdna_coding_start.unwrap() + 1) as usize;
         // Wait, the slice is [cs-1..ce] which is ce - (cs-1) = ce - cs + 1 items
         assert_eq!(ts.len(), expected_len);
 
         let peptide = tr.peptide.as_ref().unwrap();
         // Peptide should start with M (Met)
-        assert!(peptide.starts_with('M'), "peptide starts with: {}", &peptide[..1]);
+        assert!(
+            peptide.starts_with('M'),
+            "peptide starts with: {}",
+            &peptide[..1]
+        );
     }
 }

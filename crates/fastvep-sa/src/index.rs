@@ -251,24 +251,33 @@ mod tests {
         };
 
         let mut index = SaIndex::new(header);
-        index.add_block("chr1", BlockRef {
-            start_pos: 100,
-            end_pos: 500,
-            file_offset: 0,
-            compressed_len: 1024,
-        });
-        index.add_block("chr1", BlockRef {
-            start_pos: 501,
-            end_pos: 1000,
-            file_offset: 1024,
-            compressed_len: 2048,
-        });
-        index.add_block("chr2", BlockRef {
-            start_pos: 1,
-            end_pos: 300,
-            file_offset: 3072,
-            compressed_len: 512,
-        });
+        index.add_block(
+            "chr1",
+            BlockRef {
+                start_pos: 100,
+                end_pos: 500,
+                file_offset: 0,
+                compressed_len: 1024,
+            },
+        );
+        index.add_block(
+            "chr1",
+            BlockRef {
+                start_pos: 501,
+                end_pos: 1000,
+                file_offset: 1024,
+                compressed_len: 2048,
+            },
+        );
+        index.add_block(
+            "chr2",
+            BlockRef {
+                start_pos: 1,
+                end_pos: 300,
+                file_offset: 3072,
+                compressed_len: 512,
+            },
+        );
 
         // Serialize and deserialize
         let mut buf = Vec::new();
@@ -299,18 +308,24 @@ mod tests {
         };
 
         let mut index = SaIndex::new(header);
-        index.add_block("chr1", BlockRef {
-            start_pos: 100,
-            end_pos: 500,
-            file_offset: 0,
-            compressed_len: 100,
-        });
-        index.add_block("chr1", BlockRef {
-            start_pos: 501,
-            end_pos: 1000,
-            file_offset: 100,
-            compressed_len: 200,
-        });
+        index.add_block(
+            "chr1",
+            BlockRef {
+                start_pos: 100,
+                end_pos: 500,
+                file_offset: 0,
+                compressed_len: 100,
+            },
+        );
+        index.add_block(
+            "chr1",
+            BlockRef {
+                start_pos: 501,
+                end_pos: 1000,
+                file_offset: 100,
+                compressed_len: 200,
+            },
+        );
 
         // Position in first block
         let blocks = index.find_blocks("chr1", 250);

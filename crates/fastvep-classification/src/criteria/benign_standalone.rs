@@ -10,10 +10,7 @@ use crate::types::{EvidenceCriterion, EvidenceDirection, EvidenceStrength};
 /// p.Cys282Tyr — hereditary hemochromatosis; F5 / GJB2 founder alleles).
 /// The exception list is configurable via `config.ba1_exceptions` so VCEPs
 /// can extend it.
-pub fn evaluate_ba1(
-    input: &ClassificationInput,
-    config: &AcmgConfig,
-) -> EvidenceCriterion {
+pub fn evaluate_ba1(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCriterion {
     let mut details = serde_json::Map::new();
     details.insert(
         "af_threshold".into(),
@@ -102,14 +99,30 @@ pub fn evaluate_ba1(
 
             // Add per-population breakdown for transparency
             let mut pop_afs = serde_json::Map::new();
-            if let Some(v) = gnomad.all_af { pop_afs.insert("all".into(), serde_json::json!(v)); }
-            if let Some(v) = gnomad.afr_af { pop_afs.insert("afr".into(), serde_json::json!(v)); }
-            if let Some(v) = gnomad.nfe_af { pop_afs.insert("nfe".into(), serde_json::json!(v)); }
-            if let Some(v) = gnomad.eas_af { pop_afs.insert("eas".into(), serde_json::json!(v)); }
-            if let Some(v) = gnomad.amr_af { pop_afs.insert("amr".into(), serde_json::json!(v)); }
-            if let Some(v) = gnomad.asj_af { pop_afs.insert("asj".into(), serde_json::json!(v)); }
-            if let Some(v) = gnomad.fin_af { pop_afs.insert("fin".into(), serde_json::json!(v)); }
-            if let Some(v) = gnomad.sas_af { pop_afs.insert("sas".into(), serde_json::json!(v)); }
+            if let Some(v) = gnomad.all_af {
+                pop_afs.insert("all".into(), serde_json::json!(v));
+            }
+            if let Some(v) = gnomad.afr_af {
+                pop_afs.insert("afr".into(), serde_json::json!(v));
+            }
+            if let Some(v) = gnomad.nfe_af {
+                pop_afs.insert("nfe".into(), serde_json::json!(v));
+            }
+            if let Some(v) = gnomad.eas_af {
+                pop_afs.insert("eas".into(), serde_json::json!(v));
+            }
+            if let Some(v) = gnomad.amr_af {
+                pop_afs.insert("amr".into(), serde_json::json!(v));
+            }
+            if let Some(v) = gnomad.asj_af {
+                pop_afs.insert("asj".into(), serde_json::json!(v));
+            }
+            if let Some(v) = gnomad.fin_af {
+                pop_afs.insert("fin".into(), serde_json::json!(v));
+            }
+            if let Some(v) = gnomad.sas_af {
+                pop_afs.insert("sas".into(), serde_json::json!(v));
+            }
             details.insert("population_afs".into(), serde_json::Value::Object(pop_afs));
 
             if af > config.ba1_af_threshold {
@@ -130,10 +143,16 @@ pub fn evaluate_ba1(
                 )
             }
         } else {
-            (false, "gnomAD data present but no allele frequency values".to_string())
+            (
+                false,
+                "gnomAD data present but no allele frequency values".to_string(),
+            )
         }
     } else {
-        (false, "No gnomAD population frequency data available".to_string())
+        (
+            false,
+            "No gnomAD population frequency data available".to_string(),
+        )
     };
 
     EvidenceCriterion {
@@ -279,7 +298,10 @@ mod tests {
             companion_variants: vec![],
         };
         let result = evaluate_ba1(&input, &AcmgConfig::default());
-        assert!(!result.met, "BA1 must not fire for HFE c.845G>A (Ghosh 2018 exception)");
+        assert!(
+            !result.met,
+            "BA1 must not fire for HFE c.845G>A (Ghosh 2018 exception)"
+        );
         assert!(result.evaluated);
         assert!(result.summary.contains("exception"));
     }
@@ -294,7 +316,10 @@ mod tests {
             is_canonical: true,
             amino_acids: None,
             protein_position: None,
-            gnomad: Some(GnomadData { all_af: Some(0.10), ..Default::default() }),
+            gnomad: Some(GnomadData {
+                all_af: Some(0.10),
+                ..Default::default()
+            }),
             clinvar: None,
             revel: None,
             splice_ai: None,
@@ -334,7 +359,11 @@ mod tests {
             is_canonical: true,
             amino_acids: None,
             protein_position: None,
-            gnomad: Some(GnomadData { all_af: Some(0.10), all_an: Some(100_000), ..Default::default() }),
+            gnomad: Some(GnomadData {
+                all_af: Some(0.10),
+                all_an: Some(100_000),
+                ..Default::default()
+            }),
             clinvar: None,
             revel: None,
             splice_ai: None,

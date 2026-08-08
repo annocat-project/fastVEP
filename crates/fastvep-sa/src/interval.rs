@@ -66,7 +66,12 @@ impl IntervalIndex {
     }
 
     /// Find all intervals overlapping [query_start, query_end].
-    pub fn find_overlapping(&self, chrom: &str, query_start: u32, query_end: u32) -> Vec<OverlapResult> {
+    pub fn find_overlapping(
+        &self,
+        chrom: &str,
+        query_start: u32,
+        query_end: u32,
+    ) -> Vec<OverlapResult> {
         let intervals = match self.intervals.get(chrom) {
             Some(i) => i,
             None => return Vec::new(),
@@ -180,10 +185,7 @@ impl OsiReader {
         let metadata = SaMetadata {
             name: index.header.name.clone(),
             version: index.header.version.clone(),
-            description: format!(
-                "Interval annotation database from {}",
-                path.display()
-            ),
+            description: format!("Interval annotation database from {}", path.display()),
             assembly: index.header.assembly.clone(),
             json_key: index.header.json_key.clone(),
             // Intervals are inherently positional — overlap doesn't care
@@ -307,8 +309,18 @@ mod tests {
         };
         let mut index = IntervalIndex::new(header);
         // Intentionally out of order:
-        index.add(IntervalRecord { chrom: "chr1".into(), start: 500, end: 700, json: "{\"id\":\"B\"}".into() });
-        index.add(IntervalRecord { chrom: "chr1".into(), start: 100, end: 200, json: "{\"id\":\"A\"}".into() });
+        index.add(IntervalRecord {
+            chrom: "chr1".into(),
+            start: 500,
+            end: 700,
+            json: "{\"id\":\"B\"}".into(),
+        });
+        index.add(IntervalRecord {
+            chrom: "chr1".into(),
+            start: 100,
+            end: 200,
+            json: "{\"id\":\"A\"}".into(),
+        });
         // Skip index.sort() so the on-disk layout is unsorted.
 
         let mut buf = Vec::new();

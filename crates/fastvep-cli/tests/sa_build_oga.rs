@@ -4,7 +4,7 @@
 //! `run_sa_build` (the same entrypoint the CLI uses), and reads the resulting
 //! database back to confirm the round-trip.
 
-use fastvep_cli::pipeline::{run_annotate, run_sa_build, AnnotateConfig};
+use fastvep_cli::pipeline::{run_annotate, run_sa_build, run_sa_build_v2, AnnotateConfig};
 use fastvep_sa::gene::GeneIndex;
 use std::fs::{self, File};
 use std::io::Write;
@@ -222,20 +222,43 @@ fn sa_build_unknown_source_errors_with_full_supported_list() {
 fn annotate_vcf_emits_spliceai_from_fastsa() {
     let tmp = tempfile::tempdir().unwrap();
     let spliceai_source = tmp.path().join("spliceai-mini.vcf");
+    let cadd_source = tmp.path().join("cadd-mini.tsv");
     let input_vcf = tmp.path().join("input-no-spliceai-info.vcf");
     let gff3 = tmp.path().join("mini.gff3");
-    let output_base = tmp.path().join("spliceai-mini");
-    let output_vcf = tmp.path().join("annotated.vcf");
+    let spliceai_output_base = tmp.path().join("spliceai-mini");
+    let cadd_output_base = tmp.path().join("cadd-mini");
+    let output_v1_vcf = tmp.path().join("annotated-v1.vcf");
+    let output_v2_vcf = tmp.path().join("annotated-v2.vcf");
+    let output_v1_json = tmp.path().join("annotated-v1.jsonl");
+    let output_v2_json = tmp.path().join("annotated-v2.jsonl");
     let transcript_cache = tmp.path().join("mini.fastvep.cache");
 
     fs::write(&spliceai_source, SPLICEAI_SOURCE_VCF).unwrap();
+    fs::write(
+        &cadd_source,
+        "#Chrom\tPos\tRef\tAlt\tRawScore\tPHRED\n\
+         1\t25000\tA\tG\t0.125\t12.4\n\
+         1\t30000\tC\tT\t-0.025\t2.1\n\
+         1\t30000\tC\tA\t0.875\t24.6\n",
+    )
+    .unwrap();
     fs::write(&input_vcf, INPUT_NO_SPLICEAI_INFO_VCF).unwrap();
     fs::write(&gff3, MINI_GFF3).unwrap();
 
     run_sa_build(
         "spliceai",
         spliceai_source.to_str().unwrap(),
-        output_base.to_str().unwrap(),
+        spliceai_output_base.to_str().unwrap(),
+        "GRCh38",
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    run_sa_build(
+        "cadd",
+        cadd_source.to_str().unwrap(),
+        cadd_output_base.to_str().unwrap(),
         "GRCh38",
         None,
         &[],
@@ -245,7 +268,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
 
     run_annotate(AnnotateConfig {
         input: input_vcf.to_string_lossy().into_owned(),
-        output: output_vcf.to_string_lossy().into_owned(),
+        output: output_v1_vcf.to_string_lossy().into_owned(),
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
@@ -265,12 +288,12 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
-        structured_output: None,
+        structured_output: Some(output_v1_json.to_string_lossy().into_owned()),
         show_progress: false,
     })
     .unwrap();
 
-    let annotated = fs::read_to_string(output_vcf).unwrap();
+    let annotated = fs::read_to_string(&output_v1_vcf).unwrap();
 
     assert!(
         annotated.contains("##INFO=<ID=SpliceAI,Number=.,Type=String,Description=\"SpliceAI annotations. Format: ALLELE|SYMBOL|DS_AG|DS_AL|DS_DG|DS_DL|DP_AG|DP_AL|DP_DG|DP_DL\">"),
@@ -288,6 +311,70 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         ),
         "VCF output should emit one SpliceAI value per matching alternate allele:\n{}",
         annotated
+    );
+
+    fs::remove_file(spliceai_output_base.with_extension("osa")).unwrap();
+    fs::remove_file(cadd_output_base.with_extension("osa")).unwrap();
+    run_sa_build_v2(
+        "spliceai",
+        &[spliceai_source.to_string_lossy().into_owned()],
+        &[],
+        None,
+        spliceai_output_base.to_str().unwrap(),
+        "GRCh38",
+        false,
+    )
+    .unwrap();
+    run_sa_build_v2(
+        "cadd",
+        &[cadd_source.to_string_lossy().into_owned()],
+        &[],
+        None,
+        cadd_output_base.to_str().unwrap(),
+        "GRCh38",
+        false,
+    )
+    .unwrap();
+
+    run_annotate(AnnotateConfig {
+        input: input_vcf.to_string_lossy().into_owned(),
+        output: output_v2_vcf.to_string_lossy().into_owned(),
+        gff3: vec![gff3.to_string_lossy().into_owned()],
+        fasta: None,
+        output_format: "vcf".into(),
+        buffer_size: 5000,
+        pick: false,
+        hgvs: false,
+        distance: 0,
+        cache_dir: None,
+        transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
+        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_only: false,
+        acmg: false,
+        acmg_config: None,
+        proband: None,
+        mother: None,
+        father: None,
+        gene_list: None,
+        explicit_alleles: false,
+        qc_rules: None,
+        structured_output: Some(output_v2_json.to_string_lossy().into_owned()),
+        show_progress: false,
+    })
+    .unwrap();
+
+    assert_eq!(
+        annotated,
+        fs::read_to_string(output_v2_vcf).unwrap(),
+        "OSA1 and OSA2 SpliceAI caches must emit identical VCF output"
+    );
+    let structured_v1 = fs::read_to_string(output_v1_json).unwrap();
+    assert!(structured_v1.contains("\"cadd\""));
+    assert!(structured_v1.contains("\"spliceAI\""));
+    assert_eq!(
+        structured_v1,
+        fs::read_to_string(output_v2_json).unwrap(),
+        "OSA1 and OSA2 dense caches must emit identical structured output"
     );
 }
 
@@ -454,7 +541,11 @@ fn annotate_vcf_replaces_existing_fastvep_info() {
     .unwrap();
 
     let annotated = fs::read_to_string(output_vcf).unwrap();
-    assert_eq!(annotated.matches("##INFO=<ID=CSQ,").count(), 1, "{annotated}");
+    assert_eq!(
+        annotated.matches("##INFO=<ID=CSQ,").count(),
+        1,
+        "{annotated}"
+    );
     assert_eq!(
         annotated.matches("##INFO=<ID=SpliceAI,").count(),
         1,
@@ -614,10 +705,7 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
     );
 
     // At least one data row carries a populated FV_CLINVAR value at position 25000.
-    let data_rows: Vec<&str> = annotated
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect();
+    let data_rows: Vec<&str> = annotated.lines().filter(|l| !l.starts_with('#')).collect();
     assert!(!data_rows.is_empty(), "tab output must contain data rows");
     let pos25k = data_rows
         .iter()
@@ -639,8 +727,16 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
     );
 
     // Sanity: no raw JSON leaked into the tab file.
-    assert!(!annotated.contains('{'), "tab output must not contain raw JSON:\n{}", annotated);
-    assert!(!annotated.contains('}'), "tab output must not contain raw JSON:\n{}", annotated);
+    assert!(
+        !annotated.contains('{'),
+        "tab output must not contain raw JSON:\n{}",
+        annotated
+    );
+    assert!(
+        !annotated.contains('}'),
+        "tab output must not contain raw JSON:\n{}",
+        annotated
+    );
 }
 
 /// Build a minimal ClinVar SA database in a temp dir and return its path.
@@ -787,7 +883,12 @@ fn sa_only_tab_emits_minimal_columns() {
     assert!(!data_rows.is_empty(), "expected sa-only tab data rows");
     for row in &data_rows {
         let cols: Vec<&str> = row.split('\t').collect();
-        assert_eq!(cols.len(), 4, "sa-only tab row must have 4 columns: {}", row);
+        assert_eq!(
+            cols.len(),
+            4,
+            "sa-only tab row must have 4 columns: {}",
+            row
+        );
     }
     let pos25k = data_rows
         .iter()
@@ -872,7 +973,10 @@ fn sa_only_json_omits_transcript_consequences() {
         .as_array()
         .expect("clinvar.significance should be an array");
     assert_eq!(
-        significance.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+        significance
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>(),
         vec!["Pathogenic"],
         "clinvar.significance should be exactly [\"Pathogenic\"]: {}",
         clinvar
@@ -887,7 +991,10 @@ fn sa_only_json_omits_transcript_consequences() {
         .as_array()
         .expect("clinvar.phenotypes should be an array");
     assert_eq!(
-        phenotypes.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+        phenotypes
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>(),
         vec!["Breast_cancer"],
         "clinvar.phenotypes mismatch: {}",
         clinvar
@@ -1003,7 +1110,12 @@ fn sa_only_multi_allelic_emits_per_alt_rows_with_independent_sa_columns() {
         .lines()
         .filter(|l| !l.starts_with('#') && l.contains("1:30000\t"))
         .collect();
-    assert_eq!(rows_30k.len(), 2, "expected one row per ALT, got: {:?}", rows_30k);
+    assert_eq!(
+        rows_30k.len(),
+        2,
+        "expected one row per ALT, got: {:?}",
+        rows_30k
+    );
 
     let mut t_row = None;
     let mut a_row = None;
@@ -1148,10 +1260,18 @@ fn sa_only_strips_csq_when_in_middle_of_info_field() {
         .lines()
         .find(|l| !l.starts_with('#'))
         .expect("expected a data row");
-    assert!(!row.contains("CSQ=stale"), "stale CSQ in middle not stripped: {}", row);
+    assert!(
+        !row.contains("CSQ=stale"),
+        "stale CSQ in middle not stripped: {}",
+        row
+    );
     assert!(row.contains("AC=1"), "AC must be preserved: {}", row);
     assert!(row.contains("AF=0.5"), "AF must be preserved: {}", row);
-    assert!(row.contains("FV_CLINVAR="), "FV_CLINVAR must still be added: {}", row);
+    assert!(
+        row.contains("FV_CLINVAR="),
+        "FV_CLINVAR must still be added: {}",
+        row
+    );
 }
 
 #[test]
@@ -1466,4 +1586,3 @@ min_dp = 8
         row_30k
     );
 }
-

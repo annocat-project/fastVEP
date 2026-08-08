@@ -154,7 +154,11 @@ mod tests {
             }
         }
         // With 1% FP rate and 1000 queries, expect ~10 false positives
-        assert!(false_positives < 50, "Too many false positives: {}", false_positives);
+        assert!(
+            false_positives < 50,
+            "Too many false positives: {}",
+            false_positives
+        );
     }
 
     #[test]
@@ -183,7 +187,9 @@ mod tests {
         let bits = optimal_num_bits(usize::MAX, 1e-12);
         assert!(bits <= usize::MAX - NUM_BITS_HEADROOM);
         // And the headroom is sufficient for the downstream word-count math.
-        let _ = bits.checked_add(63).expect("(num_bits + 63) must not overflow");
+        let _ = bits
+            .checked_add(63)
+            .expect("(num_bits + 63) must not overflow");
     }
 
     #[test]

@@ -95,7 +95,9 @@ pub fn looks_like_refseq_accession(name: &str) -> bool {
 /// Accepts the common spellings of each assembly (`GRCh38`, `hg38`, `38`,
 /// `b38`, case-insensitively) and tolerates a patch-level suffix
 /// (`GRCh38.p14`), so new NCBI patches keep resolving without a code change.
-pub fn refseq_primary_accessions(assembly: &str) -> Option<&'static [(&'static str, &'static str)]> {
+pub fn refseq_primary_accessions(
+    assembly: &str,
+) -> Option<&'static [(&'static str, &'static str)]> {
     let mut a = assembly.trim().to_ascii_lowercase();
     // Drop a patch-level suffix (`grch38.p14`, `grch38.p15`, …). The primary
     // chromosome accessions are stable across patches of a given major build,
@@ -312,7 +314,15 @@ mod synonym_tests {
 
     #[test]
     fn non_refseq_names_rejected() {
-        for n in ["17", "chr17", "NC_00017", "NC_000017", "X", "", "NX_000017.11"] {
+        for n in [
+            "17",
+            "chr17",
+            "NC_00017",
+            "NC_000017",
+            "X",
+            "",
+            "NX_000017.11",
+        ] {
             assert!(!looks_like_refseq_accession(n), "{} misclassified", n);
         }
     }
@@ -345,7 +355,15 @@ mod synonym_tests {
     fn refseq_primary_accessions_cover_both_assemblies() {
         use super::refseq_primary_accessions;
 
-        for spelling in ["GRCh38", "grch38", "hg38", "38", "b38", "GRCh38.p14", "GRCh38.p15"] {
+        for spelling in [
+            "GRCh38",
+            "grch38",
+            "hg38",
+            "38",
+            "b38",
+            "GRCh38.p14",
+            "GRCh38.p15",
+        ] {
             let table = refseq_primary_accessions(spelling).expect("GRCh38 table");
             assert_eq!(table.len(), 25, "24 chromosomes + MT");
             assert!(table.contains(&("NC_000001.11", "chr1")));

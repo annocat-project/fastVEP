@@ -578,14 +578,23 @@ impl<R: BufRead> Iterator for GnomadOsa2Iter<'_, R> {
                 }
                 // Value order MUST match `gnomad_osa2_fields()`.
                 let mut values = Vec::with_capacity(self.fields.len());
-                values.push(enc_float(&self.fields[0], all_afs.get(ai).map(|s| s.as_str())));
+                values.push(enc_float(
+                    &self.fields[0],
+                    all_afs.get(ai).map(|s| s.as_str()),
+                ));
                 values.push(enc_int(&self.fields[1], an.first().map(|s| s.as_str())));
-                values.push(enc_int(&self.fields[2], all_acs.get(ai).map(|s| s.as_str())));
+                values.push(enc_int(
+                    &self.fields[2],
+                    all_acs.get(ai).map(|s| s.as_str()),
+                ));
                 values.push(enc_int(&self.fields[3], all_nh.get(ai).map(|s| s.as_str())));
                 for (pi, pop) in POPULATIONS.iter().enumerate() {
                     let key = field_names.pop_key(pop);
                     let vals = split_info_values(info_map.get(&key).map(|s| s.as_str()));
-                    values.push(enc_float(&self.fields[4 + pi], vals.get(ai).map(|s| s.as_str())));
+                    values.push(enc_float(
+                        &self.fields[4 + pi],
+                        vals.get(ai).map(|s| s.as_str()),
+                    ));
                 }
 
                 self.pending.push_back(Osa2Record {
@@ -875,8 +884,9 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_afr=0.002;
 chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF=0.01,0.005;AN=140000;AC=1400,700;nhomalt=10,3;AF_eas=0.02,0.01
 ";
         let map = chr1_map();
-        let recs: Vec<Osa2Record> =
-            iter_gnomad_osa2(vcf.as_bytes(), &map).collect::<Result<_>>().unwrap();
+        let recs: Vec<Osa2Record> = iter_gnomad_osa2(vcf.as_bytes(), &map)
+            .collect::<Result<_>>()
+            .unwrap();
         assert_eq!(recs.len(), 3); // 1 SNV + 2 from the multi-allelic site
 
         let fields = gnomad_osa2_fields();
@@ -886,7 +896,7 @@ chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF=0.01,0.005;AN=140000;AC=1400,700;nhomalt=10,
         assert_eq!(recs[0].values[1], 150000); // AN
         assert_eq!(recs[0].values[2], 150); // AC
         assert_eq!(recs[0].values[3], 2); // nhomalt
-        // afr AF present, sas AF missing.
+                                          // afr AF present, sas AF missing.
         let afr_idx = 4 + POPULATIONS.iter().position(|p| *p == "afr").unwrap();
         let sas_idx = 4 + POPULATIONS.iter().position(|p| *p == "sas").unwrap();
         assert_eq!(recs[0].values[afr_idx], fields[afr_idx].encode_float(0.002));
@@ -912,8 +922,9 @@ chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF=0.01,0.005;AN=140000;AC=1400,700;nhomalt=10,
 chr1\t10001\t.\tA\tG\t.\tPASS\tAF_joint=0.001;AN_joint=150000;AC_joint=150;AF_joint_nfe=0.0005
 ";
         let map = chr1_map();
-        let recs: Vec<Osa2Record> =
-            iter_gnomad_osa2(vcf.as_bytes(), &map).collect::<Result<_>>().unwrap();
+        let recs: Vec<Osa2Record> = iter_gnomad_osa2(vcf.as_bytes(), &map)
+            .collect::<Result<_>>()
+            .unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].values[0], 2000); // AF_joint 0.001 encoded
         assert_eq!(recs[0].values[1], 150000); // AN_joint
@@ -931,8 +942,9 @@ chr2\t100\t.\tA\tG\t.\tPASS\tAF=0.5
 chr1\t200\t.\tA\tG\t.\tPASS\tAF=0.5
 ";
         let map = chr1_map(); // only chr1 is valid
-        let recs: Vec<Osa2Record> =
-            iter_gnomad_osa2(vcf.as_bytes(), &map).collect::<Result<_>>().unwrap();
+        let recs: Vec<Osa2Record> = iter_gnomad_osa2(vcf.as_bytes(), &map)
+            .collect::<Result<_>>()
+            .unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].chrom, "chr1");
         assert_eq!(recs[0].position, 200);

@@ -352,8 +352,8 @@ mod tests {
     #[test]
     fn test_legacy_gzip_cache_loads() {
         // Create a legacy gzip cache and verify it still loads
-        use flate2::Compression;
         use flate2::write::GzEncoder;
+        use flate2::Compression;
         use std::io::Write;
 
         let transcripts = vec![make_test_transcript()];

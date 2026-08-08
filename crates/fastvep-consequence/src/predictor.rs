@@ -90,7 +90,8 @@ impl ConsequencePredictor {
         let mut transcript_consequences = Vec::new();
 
         for transcript in transcripts {
-            let tc = self.predict_transcript(position, ref_allele, alt_alleles, transcript, ref_seq);
+            let tc =
+                self.predict_transcript(position, ref_allele, alt_alleles, transcript, ref_seq);
             transcript_consequences.push(tc);
         }
 
@@ -195,11 +196,16 @@ impl ConsequencePredictor {
                 allele: alt_allele.clone(),
                 consequences,
                 impact,
-                cdna_start: None, cdna_end: None,
-                cds_start: None, cds_end: None,
-                protein_start: None, protein_end: None,
-                amino_acids: None, codons: None,
-                exon: None, intron: None,
+                cdna_start: None,
+                cdna_end: None,
+                cds_start: None,
+                cds_end: None,
+                protein_start: None,
+                protein_end: None,
+                amino_acids: None,
+                codons: None,
+                exon: None,
+                intron: None,
                 distance,
             };
         }
@@ -210,10 +216,13 @@ impl ConsequencePredictor {
 
         // 3. Determine exon/intron location
         // Use range-based overlap for exon detection to handle large indels
-        let exon_info = transcript.exon_at(var_start)
+        let exon_info = transcript
+            .exon_at(var_start)
             .or_else(|| transcript.exon_overlapping(var_start, var_end))
             .map(|(i, t)| (i as u32 + 1, t as u32));
-        let intron_info = transcript.intron_at(var_start).map(|(i, t)| (i as u32 + 1, t as u32));
+        let intron_info = transcript
+            .intron_at(var_start)
+            .map(|(i, t)| (i as u32 + 1, t as u32));
 
         let in_exon = exon_info.is_some();
         let in_intron = intron_info.is_some();
@@ -228,7 +237,10 @@ impl ConsequencePredictor {
 
         // Only add extended splice consequences if not already a donor/acceptor
         let is_essential_splice = consequences.iter().any(|c| {
-            matches!(c, Consequence::SpliceDonorVariant | Consequence::SpliceAcceptorVariant)
+            matches!(
+                c,
+                Consequence::SpliceDonorVariant | Consequence::SpliceAcceptorVariant
+            )
         });
 
         if !is_essential_splice {
@@ -270,7 +282,8 @@ impl ConsequencePredictor {
                 protein_end = Some(Transcript::cds_to_protein(cds_e));
             }
 
-            let in_coding_region = self.is_in_coding_region(var_start, var_end, coding_start, coding_end);
+            let in_coding_region =
+                self.is_in_coding_region(var_start, var_end, coding_start, coding_end);
             let in_5_utr = self.is_in_5_utr(var_start, var_end, transcript);
             let in_3_utr = self.is_in_3_utr(var_start, var_end, transcript);
 
@@ -330,11 +343,16 @@ impl ConsequencePredictor {
             allele: alt_allele.clone(),
             consequences,
             impact,
-            cdna_start, cdna_end,
-            cds_start, cds_end,
-            protein_start, protein_end,
-            amino_acids, codons,
-            exon: exon_info, intron: intron_info,
+            cdna_start,
+            cdna_end,
+            cds_start,
+            cds_end,
+            protein_start,
+            protein_end,
+            amino_acids,
+            codons,
+            exon: exon_info,
+            intron: intron_info,
             distance,
         }
     }
@@ -347,7 +365,11 @@ impl ConsequencePredictor {
         transcript: &Transcript,
         cds_start: Option<u64>,
         cds_end: Option<u64>,
-    ) -> Option<(Consequence, Option<(String, String)>, Option<(String, String)>)> {
+    ) -> Option<(
+        Consequence,
+        Option<(String, String)>,
+        Option<(String, String)>,
+    )> {
         let cds_pos_start = cds_start?;
 
         let ref_len = ref_allele.len();
@@ -392,7 +414,11 @@ impl ConsequencePredictor {
 
             // Try to compute amino acids and codons from translateable_seq
             let (aa_pair, codon_pair) = self.compute_indel_amino_acids(
-                transcript, cds_pos, ref_allele, alt_allele, is_frameshift,
+                transcript,
+                cds_pos,
+                ref_allele,
+                alt_allele,
+                is_frameshift,
             );
 
             return Some((consequence, aa_pair, codon_pair));
@@ -408,7 +434,11 @@ impl ConsequencePredictor {
             let codon_start = codon_number * 3;
 
             if codon_start + 3 <= seq_bytes.len() {
-                let ref_codon = [seq_bytes[codon_start], seq_bytes[codon_start + 1], seq_bytes[codon_start + 2]];
+                let ref_codon = [
+                    seq_bytes[codon_start],
+                    seq_bytes[codon_start + 1],
+                    seq_bytes[codon_start + 2],
+                ];
                 let mut alt_codon = ref_codon;
 
                 // Apply the substitution
@@ -499,7 +529,11 @@ impl ConsequencePredictor {
             return (None, None);
         }
 
-        let ref_codon = [seq_bytes[codon_start], seq_bytes[codon_start + 1], seq_bytes[codon_start + 2]];
+        let ref_codon = [
+            seq_bytes[codon_start],
+            seq_bytes[codon_start + 1],
+            seq_bytes[codon_start + 2],
+        ];
         let ref_aa = self.codon_table_for(transcript).translate(&ref_codon);
         let ref_aa_str = String::from(ref_aa as char);
 
@@ -567,7 +601,8 @@ impl ConsequencePredictor {
                     }
                     _ => {}
                 }
-                original_codon.iter()
+                original_codon
+                    .iter()
                     .map(|&b| (b as char).to_ascii_lowercase())
                     .collect()
             };
@@ -581,7 +616,10 @@ impl ConsequencePredictor {
                     if transcript.strand == Strand::Reverse {
                         bases = bases.iter().map(|&b| complement(b)).collect();
                     }
-                    bases.iter().map(|&b| (b as char).to_ascii_uppercase()).collect::<String>()
+                    bases
+                        .iter()
+                        .map(|&b| (b as char).to_ascii_uppercase())
+                        .collect::<String>()
                 } else {
                     alt_codon_display
                 };
@@ -609,12 +647,19 @@ impl ConsequencePredictor {
                         // Deletion starts at codon boundary: VEP shows deleted AAs vs "-"
                         let ref_end = (codon_start + del_codons * 3).min(seq_bytes.len());
                         let ref_region = &seq_bytes[codon_start..ref_end];
-                        let ref_aas: String = ref_region.chunks(3)
+                        let ref_aas: String = ref_region
+                            .chunks(3)
                             .filter(|c| c.len() == 3)
-                            .map(|c| self.codon_table_for(transcript).translate(&[c[0], c[1], c[2]]) as char)
+                            .map(|c| {
+                                self.codon_table_for(transcript)
+                                    .translate(&[c[0], c[1], c[2]])
+                                    as char
+                            })
                             .collect();
-                        let ref_codons: String = ref_region.iter()
-                            .map(|&b| (b as char).to_uppercase().next().unwrap()).collect();
+                        let ref_codons: String = ref_region
+                            .iter()
+                            .map(|&b| (b as char).to_uppercase().next().unwrap())
+                            .collect();
                         let aa_pair = Some((ref_aas, "-".to_string()));
                         let codon_pair = Some((ref_codons, "-".to_string()));
                         return (aa_pair, codon_pair);
@@ -623,21 +668,37 @@ impl ConsequencePredictor {
                         let n_ref_codons = del_codons + 1;
                         let ref_end = (codon_start + n_ref_codons * 3).min(seq_bytes.len());
                         let ref_region = &seq_bytes[codon_start..ref_end];
-                        let ref_aas: String = ref_region.chunks(3)
+                        let ref_aas: String = ref_region
+                            .chunks(3)
                             .filter(|c| c.len() == 3)
-                            .map(|c| self.codon_table_for(transcript).translate(&[c[0], c[1], c[2]]) as char)
+                            .map(|c| {
+                                self.codon_table_for(transcript)
+                                    .translate(&[c[0], c[1], c[2]])
+                                    as char
+                            })
                             .collect();
                         let alt_codon_end = (codon_start + 3).min(alt_seq.len());
                         let alt_region = &alt_seq[codon_start..alt_codon_end];
                         let alt_aas: String = if alt_region.len() == 3 {
-                            String::from(self.codon_table_for(transcript).translate(&[alt_region[0], alt_region[1], alt_region[2]]) as char)
+                            String::from(self.codon_table_for(transcript).translate(&[
+                                alt_region[0],
+                                alt_region[1],
+                                alt_region[2],
+                            ]) as char)
                         } else {
                             "-".to_string()
                         };
-                        let ref_codons: String = ref_region.iter()
-                            .map(|&b| (b as char).to_uppercase().next().unwrap()).collect();
-                        let alt_codons: String = if alt_aas == "-" { "-".to_string() } else {
-                            alt_region.iter().map(|&b| (b as char).to_uppercase().next().unwrap()).collect()
+                        let ref_codons: String = ref_region
+                            .iter()
+                            .map(|&b| (b as char).to_uppercase().next().unwrap())
+                            .collect();
+                        let alt_codons: String = if alt_aas == "-" {
+                            "-".to_string()
+                        } else {
+                            alt_region
+                                .iter()
+                                .map(|&b| (b as char).to_uppercase().next().unwrap())
+                                .collect()
                         };
                         let aa_pair = Some((ref_aas, alt_aas));
                         let codon_pair = Some((ref_codons, alt_codons));
@@ -664,16 +725,22 @@ impl ConsequencePredictor {
                     }
 
                     // Ref: the single codon at the insertion point
-                    let ref_codon_str: String = ref_codon.iter()
-                        .map(|&b| (b as char).to_lowercase().next().unwrap()).collect();
+                    let ref_codon_str: String = ref_codon
+                        .iter()
+                        .map(|&b| (b as char).to_lowercase().next().unwrap())
+                        .collect();
 
                     // Alt: translate codons spanning the insertion
                     let ins_codons = (bases.len() / 3) + 1;
                     let alt_end = (codon_start + ins_codons * 3).min(alt_seq.len());
                     let alt_region = &alt_seq[codon_start..alt_end];
-                    let alt_aas: String = alt_region.chunks(3)
+                    let alt_aas: String = alt_region
+                        .chunks(3)
                         .filter(|c| c.len() == 3)
-                        .map(|c| self.codon_table_for(transcript).translate(&[c[0], c[1], c[2]]) as char)
+                        .map(|c| {
+                            self.codon_table_for(transcript)
+                                .translate(&[c[0], c[1], c[2]]) as char
+                        })
                         .collect();
 
                     // Build alt codon string: original bases lowercase, inserted uppercase
@@ -708,7 +775,12 @@ impl ConsequencePredictor {
         }
     }
 
-    fn distance_to_transcript(&self, var_start: u64, var_end: u64, transcript: &Transcript) -> Option<i64> {
+    fn distance_to_transcript(
+        &self,
+        var_start: u64,
+        var_end: u64,
+        transcript: &Transcript,
+    ) -> Option<i64> {
         // For insertions (end < start), use start for distance calculation
         // since start represents the actual insertion position
         let effective_start = var_start.min(var_end);
@@ -722,7 +794,13 @@ impl ConsequencePredictor {
         }
     }
 
-    fn is_in_coding_region(&self, var_start: u64, var_end: u64, coding_start: u64, coding_end: u64) -> bool {
+    fn is_in_coding_region(
+        &self,
+        var_start: u64,
+        var_end: u64,
+        coding_start: u64,
+        coding_end: u64,
+    ) -> bool {
         var_start <= coding_end && var_end >= coding_start
     }
 
@@ -812,9 +890,33 @@ mod tests {
             end: 5000,
             strand: Strand::Forward,
             exons: vec![
-                Exon { stable_id: "E1".into(), start: 1000, end: 1200, strand: Strand::Forward, phase: -1, end_phase: 0, rank: 1 },
-                Exon { stable_id: "E2".into(), start: 2000, end: 2300, strand: Strand::Forward, phase: 0, end_phase: 1, rank: 2 },
-                Exon { stable_id: "E3".into(), start: 4000, end: 5000, strand: Strand::Forward, phase: 1, end_phase: -1, rank: 3 },
+                Exon {
+                    stable_id: "E1".into(),
+                    start: 1000,
+                    end: 1200,
+                    strand: Strand::Forward,
+                    phase: -1,
+                    end_phase: 0,
+                    rank: 1,
+                },
+                Exon {
+                    stable_id: "E2".into(),
+                    start: 2000,
+                    end: 2300,
+                    strand: Strand::Forward,
+                    phase: 0,
+                    end_phase: 1,
+                    rank: 2,
+                },
+                Exon {
+                    stable_id: "E3".into(),
+                    start: 4000,
+                    end: 5000,
+                    strand: Strand::Forward,
+                    phase: 1,
+                    end_phase: -1,
+                    rank: 3,
+                },
             ],
             translation: Some(Translation {
                 stable_id: "ENSP00000001".into(),
@@ -833,12 +935,21 @@ mod tests {
             translateable_seq: Some(translateable),
             peptide: None,
             canonical: true,
-            mane_select: None, mane_plus_clinical: None,
-            tsl: Some(1), appris: None, ccds: None,
+            mane_select: None,
+            mane_plus_clinical: None,
+            tsl: Some(1),
+            appris: None,
+            ccds: None,
             protein_id: Some("ENSP00000001".into()),
             protein_version: None,
-            swissprot: vec![], trembl: vec![], uniparc: vec![],
-            refseq_id: None, source: None, gencode_primary: false, flags: vec![], codon_table_start_phase: 0,
+            swissprot: vec![],
+            trembl: vec![],
+            uniparc: vec![],
+            refseq_id: None,
+            source: None,
+            gencode_primary: false,
+            flags: vec![],
+            codon_table_start_phase: 0,
         }
     }
 
@@ -849,28 +960,63 @@ mod tests {
             gene: Gene {
                 stable_id: "ENSG_NC".into(),
                 symbol: Some("NCRNA1".into()),
-                symbol_source: None, hgnc_id: None,
+                symbol_source: None,
+                hgnc_id: None,
                 biotype: "lncRNA".into(),
                 chromosome: "chr1".into(),
-                start: 10000, end: 12000,
+                start: 10000,
+                end: 12000,
                 strand: Strand::Forward,
             },
             biotype: "lncRNA".into(),
             chromosome: "chr1".into(),
-            start: 10000, end: 12000,
+            start: 10000,
+            end: 12000,
             strand: Strand::Forward,
             exons: vec![
-                Exon { stable_id: "E1".into(), start: 10000, end: 10500, strand: Strand::Forward, phase: -1, end_phase: -1, rank: 1 },
-                Exon { stable_id: "E2".into(), start: 11500, end: 12000, strand: Strand::Forward, phase: -1, end_phase: -1, rank: 2 },
+                Exon {
+                    stable_id: "E1".into(),
+                    start: 10000,
+                    end: 10500,
+                    strand: Strand::Forward,
+                    phase: -1,
+                    end_phase: -1,
+                    rank: 1,
+                },
+                Exon {
+                    stable_id: "E2".into(),
+                    start: 11500,
+                    end: 12000,
+                    strand: Strand::Forward,
+                    phase: -1,
+                    end_phase: -1,
+                    rank: 2,
+                },
             ],
             translation: None,
-            cdna_coding_start: None, cdna_coding_end: None,
-            coding_region_start: None, coding_region_end: None,
-            spliced_seq: None, translateable_seq: None, peptide: None,
-            canonical: false, mane_select: None, mane_plus_clinical: None,
-            tsl: None, appris: None, ccds: None, protein_id: None, protein_version: None,
-            swissprot: vec![], trembl: vec![], uniparc: vec![],
-            refseq_id: None, source: None, gencode_primary: false, flags: vec![], codon_table_start_phase: 0,
+            cdna_coding_start: None,
+            cdna_coding_end: None,
+            coding_region_start: None,
+            coding_region_end: None,
+            spliced_seq: None,
+            translateable_seq: None,
+            peptide: None,
+            canonical: false,
+            mane_select: None,
+            mane_plus_clinical: None,
+            tsl: None,
+            appris: None,
+            ccds: None,
+            protein_id: None,
+            protein_version: None,
+            swissprot: vec![],
+            trembl: vec![],
+            uniparc: vec![],
+            refseq_id: None,
+            source: None,
+            gencode_primary: false,
+            flags: vec![],
+            codon_table_start_phase: 0,
         }
     }
 
@@ -879,12 +1025,20 @@ mod tests {
         let predictor = ConsequencePredictor::default();
         let tr = make_coding_transcript();
         let pos = GenomicPosition::new("chr1", 500, 500, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("A"), &[Allele::from_str("G")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
 
         assert_eq!(result.transcript_consequences.len(), 1);
         let tc = &result.transcript_consequences[0];
         assert_eq!(tc.allele_consequences.len(), 1);
-        assert!(tc.allele_consequences[0].consequences.contains(&Consequence::UpstreamGeneVariant));
+        assert!(tc.allele_consequences[0]
+            .consequences
+            .contains(&Consequence::UpstreamGeneVariant));
         assert_eq!(tc.allele_consequences[0].distance, Some(500));
     }
 
@@ -893,10 +1047,18 @@ mod tests {
         let predictor = ConsequencePredictor::default();
         let tr = make_coding_transcript();
         let pos = GenomicPosition::new("chr1", 5500, 5500, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("A"), &[Allele::from_str("G")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
 
         let ac = &result.transcript_consequences[0].allele_consequences[0];
-        assert!(ac.consequences.contains(&Consequence::DownstreamGeneVariant));
+        assert!(ac
+            .consequences
+            .contains(&Consequence::DownstreamGeneVariant));
         assert_eq!(ac.distance, Some(500));
     }
 
@@ -906,7 +1068,13 @@ mod tests {
         let tr = make_coding_transcript();
         // Very far away
         let pos = GenomicPosition::new("chr1", 100000, 100000, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("A"), &[Allele::from_str("G")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
 
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(ac.consequences.contains(&Consequence::IntergenicVariant));
@@ -918,7 +1086,13 @@ mod tests {
         let tr = make_coding_transcript();
         // Position 1020 is in exon1 (1000-1200), before CDS start (1050)
         let pos = GenomicPosition::new("chr1", 1020, 1020, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("A"), &[Allele::from_str("G")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
 
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(ac.consequences.contains(&Consequence::FivePrimeUtrVariant));
@@ -930,7 +1104,13 @@ mod tests {
         let tr = make_coding_transcript();
         // Position 4600 is in exon3 (4000-5000), after CDS end (4500)
         let pos = GenomicPosition::new("chr1", 4600, 4600, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("A"), &[Allele::from_str("G")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
 
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(ac.consequences.contains(&Consequence::ThreePrimeUtrVariant));
@@ -942,7 +1122,13 @@ mod tests {
         let tr = make_coding_transcript();
         // Position 1500 is in intron1 (1201-1999), away from splice sites
         let pos = GenomicPosition::new("chr1", 1500, 1500, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("A"), &[Allele::from_str("G")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
 
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(ac.consequences.contains(&Consequence::IntronVariant));
@@ -954,7 +1140,13 @@ mod tests {
         let tr = make_coding_transcript();
         // Position 1201 is first base of intron1 → splice donor
         let pos = GenomicPosition::new("chr1", 1201, 1201, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("G"), &[Allele::from_str("A")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("G"),
+            &[Allele::from_str("A")],
+            &[&tr],
+            None,
+        );
 
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(ac.consequences.contains(&Consequence::SpliceDonorVariant));
@@ -967,10 +1159,18 @@ mod tests {
         let tr = make_coding_transcript();
         // Position 1999 is last base of intron1 → splice acceptor
         let pos = GenomicPosition::new("chr1", 1999, 1999, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("G"), &[Allele::from_str("A")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("G"),
+            &[Allele::from_str("A")],
+            &[&tr],
+            None,
+        );
 
         let ac = &result.transcript_consequences[0].allele_consequences[0];
-        assert!(ac.consequences.contains(&Consequence::SpliceAcceptorVariant));
+        assert!(ac
+            .consequences
+            .contains(&Consequence::SpliceAcceptorVariant));
         assert_eq!(ac.impact, Impact::High);
     }
 
@@ -997,7 +1197,8 @@ mod tests {
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(
             ac.consequences.contains(&Consequence::SynonymousVariant),
-            "Expected synonymous, got: {:?}", ac.consequences
+            "Expected synonymous, got: {:?}",
+            ac.consequences
         );
         assert_eq!(ac.impact, Impact::Low);
     }
@@ -1020,7 +1221,8 @@ mod tests {
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(
             ac.consequences.contains(&Consequence::MissenseVariant),
-            "Expected missense, got: {:?}", ac.consequences
+            "Expected missense, got: {:?}",
+            ac.consequences
         );
         assert_eq!(ac.impact, Impact::Moderate);
     }
@@ -1077,7 +1279,8 @@ mod tests {
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(
             ac.consequences.contains(&Consequence::FrameshiftVariant),
-            "Expected frameshift, got: {:?}", ac.consequences
+            "Expected frameshift, got: {:?}",
+            ac.consequences
         );
         assert_eq!(ac.impact, Impact::High);
     }
@@ -1099,7 +1302,8 @@ mod tests {
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(
             ac.consequences.contains(&Consequence::InframeDeletion),
-            "Expected inframe_deletion, got: {:?}", ac.consequences
+            "Expected inframe_deletion, got: {:?}",
+            ac.consequences
         );
         assert_eq!(ac.impact, Impact::Moderate);
     }
@@ -1109,10 +1313,18 @@ mod tests {
         let predictor = ConsequencePredictor::default();
         let tr = make_noncoding_transcript();
         let pos = GenomicPosition::new("chr1", 10100, 10100, Strand::Forward);
-        let result = predictor.predict(&pos, &Allele::from_str("A"), &[Allele::from_str("G")], &[&tr], None);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
 
         let ac = &result.transcript_consequences[0].allele_consequences[0];
-        assert!(ac.consequences.contains(&Consequence::NonCodingTranscriptExonVariant));
+        assert!(ac
+            .consequences
+            .contains(&Consequence::NonCodingTranscriptExonVariant));
     }
 
     #[test]
@@ -1133,7 +1345,8 @@ mod tests {
         let ac = &result.transcript_consequences[0].allele_consequences[0];
         assert!(
             ac.consequences.contains(&Consequence::StartLost),
-            "Expected start_lost, got: {:?}", ac.consequences
+            "Expected start_lost, got: {:?}",
+            ac.consequences
         );
     }
 
@@ -1155,9 +1368,13 @@ mod tests {
 
         assert_eq!(result.transcript_consequences.len(), 2);
         // tr1: intron variant
-        assert!(result.transcript_consequences[0].allele_consequences[0].consequences.contains(&Consequence::IntronVariant));
+        assert!(result.transcript_consequences[0].allele_consequences[0]
+            .consequences
+            .contains(&Consequence::IntronVariant));
         // tr2: 8500bp away (>5000), so intergenic
-        assert!(result.transcript_consequences[1].allele_consequences[0].consequences.contains(&Consequence::IntergenicVariant));
+        assert!(result.transcript_consequences[1].allele_consequences[0]
+            .consequences
+            .contains(&Consequence::IntergenicVariant));
     }
 
     #[test]

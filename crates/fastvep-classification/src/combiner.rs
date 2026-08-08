@@ -212,10 +212,7 @@ mod tests {
 
     #[test]
     fn test_two_bs_benign() {
-        let criteria = vec![
-            met("BS1", Benign, Strong),
-            met("BS2", Benign, Strong),
-        ];
+        let criteria = vec![met("BS1", Benign, Strong), met("BS2", Benign, Strong)];
         let (cls, rule) = combine(&criteria);
         assert_eq!(cls, AcmgClassification::Benign);
         assert_eq!(rule.unwrap(), ">=2 BS");
@@ -374,10 +371,7 @@ mod tests {
 
     #[test]
     fn test_bs_plus_bp_likely_benign() {
-        let criteria = vec![
-            met("BS1", Benign, Strong),
-            met("BP7", Benign, Supporting),
-        ];
+        let criteria = vec![met("BS1", Benign, Strong), met("BP7", Benign, Supporting)];
         let (cls, rule) = combine(&criteria);
         assert_eq!(cls, AcmgClassification::LikelyBenign);
         assert_eq!(rule.unwrap(), "BS + BP");

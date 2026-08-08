@@ -34,7 +34,10 @@ fn serialize_gene_record(gene: String, variants: &[ProteinVariant]) -> GeneRecor
 
     let mut unique: Vec<_> = unique.into_iter().collect();
     unique.sort_by(|((pos_a, ref_a, alt_a), _), ((pos_b, ref_b, alt_b), _)| {
-        pos_a.cmp(pos_b).then(ref_a.cmp(ref_b)).then(alt_a.cmp(alt_b))
+        pos_a
+            .cmp(pos_b)
+            .then(ref_a.cmp(ref_b))
+            .then(alt_a.cmp(alt_b))
     });
 
     let variant_jsons: Vec<String> = unique
@@ -42,7 +45,10 @@ fn serialize_gene_record(gene: String, variants: &[ProteinVariant]) -> GeneRecor
         .map(|((pos, ref_aa, alt_aa), sig)| {
             format!(
                 r#"{{"pos":{},"refAa":"{}","altAa":"{}","sig":"{}"}}"#,
-                pos, escape_json(ref_aa), escape_json(alt_aa), escape_json(sig)
+                pos,
+                escape_json(ref_aa),
+                escape_json(alt_aa),
+                escape_json(sig)
             )
         })
         .collect();
@@ -204,10 +210,15 @@ where
     I: Iterator<Item = std::io::Result<String>>,
 {
     let header_fields: Vec<&str> = header.trim_start_matches('#').split('\t').collect();
-    let find = |needle: &str| header_fields.iter().position(|f| f.eq_ignore_ascii_case(needle));
+    let find = |needle: &str| {
+        header_fields
+            .iter()
+            .position(|f| f.eq_ignore_ascii_case(needle))
+    };
     let i_name = find("Name").context("variant_summary missing Name column")?;
     let i_gene = find("GeneSymbol").context("variant_summary missing GeneSymbol column")?;
-    let i_sig = find("ClinicalSignificance").context("variant_summary missing ClinicalSignificance column")?;
+    let i_sig = find("ClinicalSignificance")
+        .context("variant_summary missing ClinicalSignificance column")?;
 
     let mut gene_variants: HashMap<String, Vec<ProteinVariant>> = HashMap::new();
     for line in lines {
@@ -304,7 +315,10 @@ fn parse_protein_hgvs(hgvs: &str) -> Option<(u64, String, String)> {
         let first = p_str.chars().next()?;
         if first.is_ascii_uppercase() {
             // Extract digits
-            let digits: String = p_str[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let digits: String = p_str[1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             if let Ok(pos) = digits.parse::<u64>() {
                 let rest = &p_str[1 + digits.len()..];
                 if let Some(alt_aa) = rest.chars().next() {
@@ -322,11 +336,29 @@ fn parse_protein_hgvs(hgvs: &str) -> Option<(u64, String, String)> {
 /// Parse three-letter amino acid protein change like "Arg175His"
 fn parse_three_letter_protein(s: &str) -> Option<(u64, String, String)> {
     let aa_map: HashMap<&str, &str> = [
-        ("Ala", "A"), ("Arg", "R"), ("Asn", "N"), ("Asp", "D"), ("Cys", "C"),
-        ("Gln", "Q"), ("Glu", "E"), ("Gly", "G"), ("His", "H"), ("Ile", "I"),
-        ("Leu", "L"), ("Lys", "K"), ("Met", "M"), ("Phe", "F"), ("Pro", "P"),
-        ("Ser", "S"), ("Thr", "T"), ("Trp", "W"), ("Tyr", "Y"), ("Val", "V"),
-        ("Sec", "U"), ("Pyl", "O"), ("Ter", "*"),
+        ("Ala", "A"),
+        ("Arg", "R"),
+        ("Asn", "N"),
+        ("Asp", "D"),
+        ("Cys", "C"),
+        ("Gln", "Q"),
+        ("Glu", "E"),
+        ("Gly", "G"),
+        ("His", "H"),
+        ("Ile", "I"),
+        ("Leu", "L"),
+        ("Lys", "K"),
+        ("Met", "M"),
+        ("Phe", "F"),
+        ("Pro", "P"),
+        ("Ser", "S"),
+        ("Thr", "T"),
+        ("Trp", "W"),
+        ("Tyr", "Y"),
+        ("Val", "V"),
+        ("Sec", "U"),
+        ("Pyl", "O"),
+        ("Ter", "*"),
     ]
     .iter()
     .copied()
@@ -470,7 +502,12 @@ mod tests {
         let header = "#AlleleID\tType\tName\tGeneID\tGeneSymbol\tHGNC_ID\tClinicalSignificance\tClinSigSimple\tLastEvaluated\tRS# (dbSNP)\tnsv/esv (dbVar)\tRCVaccession\tPhenotypeIDS\tPhenotypeList\tOrigin\tOriginSimple\tAssembly\tChromosomeAccession\tChromosome\tStart\tStop\tReferenceAllele\tAlternateAllele\tCytogenetic\tReviewStatus\tNumberSubmitters\tGuidelines\tTestedInGTR\tOtherIDs\tSubmitterCategories\tVariationID\tPositionVCF\tReferenceAlleleVCF\tAlternateAlleleVCF\tSomaticClinicalImpact\tSomaticClinicalImpactLastEvaluated\tReviewStatusClinicalImpact\tOncogenicity\tOncogenicityLastEvaluated\tReviewStatusOncogenicity";
         let mut rows = vec![header.to_string()];
         // Deliberately out of position order in the input.
-        for (variation_id, pos_aa) in [(1, "p.Arg175His"), (2, "p.Gly245Ser"), (3, "p.Cys135Tyr"), (4, "p.Arg273Cys")] {
+        for (variation_id, pos_aa) in [
+            (1, "p.Arg175His"),
+            (2, "p.Gly245Ser"),
+            (3, "p.Cys135Tyr"),
+            (4, "p.Arg273Cys"),
+        ] {
             rows.push(format!(
                 "{vid}\tsingle nucleotide variant\tNM_000546.6(TP53):c.1A>T ({pos_aa})\t7157\tTP53\tHGNC:11998\tPathogenic\t1\t-\t-\t-\tRCV000\t-\t-\tgermline\tgermline\tGRCh38\tNC_000017.11\t17\t1\t1\tG\tA\t17p13.1\tcriteria provided, multiple submitters, no conflicts\t5\t-\t-\t-\t1\t{vid}\t1\tG\tA\t-\t-\t-\t-\t-\t-",
                 vid = variation_id,

@@ -313,8 +313,17 @@ impl SaReader {
         })
     }
 
-    /// Reopen and fully validate every indexed OSA block.
+    /// Fully validate every indexed OSA block.
     pub fn verify(&self, expected_chromosome: Option<&str>) -> Result<SaVerificationReport> {
+        self.verify_with_visitor(expected_chromosome, |_, _| Ok(()))
+    }
+
+    /// Validate every indexed OSA block and visit each verified record once.
+    pub fn verify_with_visitor(
+        &self,
+        expected_chromosome: Option<&str>,
+        mut visitor: impl FnMut(&str, &BlockEntry) -> Result<()>,
+    ) -> Result<SaVerificationReport> {
         let mut chromosomes: Vec<_> = self.index.chromosomes.keys().cloned().collect();
         chromosomes.sort();
         if chromosomes.is_empty() {
@@ -400,8 +409,11 @@ impl SaReader {
                     }
                     lookup_count += 1;
                 }
+                for entry in &entries {
+                    visitor(chromosome, entry)?;
+                    record_count += 1;
+                }
                 block_count += 1;
-                record_count += entries.len() as u64;
             }
         }
 

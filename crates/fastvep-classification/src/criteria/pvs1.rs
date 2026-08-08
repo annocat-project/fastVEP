@@ -61,7 +61,10 @@ pub fn evaluate_pvs1(input: &ClassificationInput, config: &AcmgConfig) -> Eviden
             EvidenceStrength::VeryStrong,
             false,
             true,
-            format!("Null variant but gene {} is not established as LOF-intolerant", gene),
+            format!(
+                "Null variant but gene {} is not established as LOF-intolerant",
+                gene
+            ),
             details,
         );
     }
@@ -305,7 +308,10 @@ fn grade_start_lost(
         // silently abs() it (which would let upstream / invalid distances
         // qualify the variant for PVS1_Moderate or _Supporting).
         if d < 0 {
-            details.insert("alt_start_codon_distance_invalid".into(), serde_json::json!(true));
+            details.insert(
+                "alt_start_codon_distance_invalid".into(),
+                serde_json::json!(true),
+            );
         } else {
             let d_codons = d as u64;
             if d_codons <= 100 && input.in_critical_region == Some(true) {
@@ -384,11 +390,7 @@ fn is_lof_intolerant_gene(input: &ClassificationInput, config: &AcmgConfig) -> b
     // Validity (preferred — Strong/Definitive/Moderate only) or OMIM
     // `genemap2.txt` (legacy). Both share the `omim` json_key.
     if let Some(ref omim) = input.omim {
-        if omim
-            .phenotypes
-            .as_ref()
-            .map_or(false, |p| !p.is_empty())
-        {
+        if omim.phenotypes.as_ref().map_or(false, |p| !p.is_empty()) {
             return true;
         }
     }
@@ -402,7 +404,11 @@ mod tests {
     use crate::sa_extract::{GnomadGeneData, OmimData};
     use fastvep_core::Impact;
 
-    fn make_input(consequences: Vec<Consequence>, gene_constraints: Option<GnomadGeneData>, omim: Option<OmimData>) -> ClassificationInput {
+    fn make_input(
+        consequences: Vec<Consequence>,
+        gene_constraints: Option<GnomadGeneData>,
+        omim: Option<OmimData>,
+    ) -> ClassificationInput {
         ClassificationInput {
             consequences,
             impact: Impact::High,
@@ -441,7 +447,11 @@ mod tests {
     fn test_pvs1_frameshift_lof_gene() {
         let input = make_input(
             vec![Consequence::FrameshiftVariant],
-            Some(GnomadGeneData { pli: Some(1.0), loeuf: Some(0.03), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                loeuf: Some(0.03),
+                ..Default::default()
+            }),
             None,
         );
         let result = evaluate_pvs1(&input, &AcmgConfig::default());
@@ -454,7 +464,11 @@ mod tests {
     fn test_pvs1_missense_not_null() {
         let input = make_input(
             vec![Consequence::MissenseVariant],
-            Some(GnomadGeneData { pli: Some(1.0), loeuf: Some(0.03), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                loeuf: Some(0.03),
+                ..Default::default()
+            }),
             None,
         );
         let result = evaluate_pvs1(&input, &AcmgConfig::default());
@@ -473,7 +487,10 @@ mod tests {
         let input = make_input(
             vec![Consequence::StopGained],
             None,
-            Some(OmimData { mim_number: Some(113705), phenotypes: Some(vec!["Breast cancer".to_string()]) }),
+            Some(OmimData {
+                mim_number: Some(113705),
+                phenotypes: Some(vec!["Breast cancer".to_string()]),
+            }),
         );
         let result = evaluate_pvs1(&input, &AcmgConfig::default());
         assert!(result.met); // OMIM disease association is proxy for LOF gene
@@ -486,7 +503,11 @@ mod tests {
         // must not fire — splicing signal is left to SpliceAI/PP3.
         let mut input = make_input(
             vec![Consequence::SpliceDonorVariant],
-            Some(GnomadGeneData { pli: Some(1.0), loeuf: Some(0.03), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                loeuf: Some(0.03),
+                ..Default::default()
+            }),
             None,
         );
         input.intronic_offset = Some(12);
@@ -500,7 +521,11 @@ mod tests {
         // Canonical ±1/2 splice (offset = -2) keeps PVS1.
         let mut input = make_input(
             vec![Consequence::SpliceAcceptorVariant],
-            Some(GnomadGeneData { pli: Some(1.0), loeuf: Some(0.03), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                loeuf: Some(0.03),
+                ..Default::default()
+            }),
             None,
         );
         input.intronic_offset = Some(-2);
@@ -515,13 +540,23 @@ mod tests {
         // deletion) AND frameshift must keep PVS1 via the frameshift track — the
         // genuine coding LOF must not be discarded by the splice offset gate.
         let mut input = make_input(
-            vec![Consequence::SpliceDonorVariant, Consequence::FrameshiftVariant],
-            Some(GnomadGeneData { pli: Some(1.0), loeuf: Some(0.03), ..Default::default() }),
+            vec![
+                Consequence::SpliceDonorVariant,
+                Consequence::FrameshiftVariant,
+            ],
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                loeuf: Some(0.03),
+                ..Default::default()
+            }),
             None,
         );
         input.intronic_offset = Some(7); // outside canonical ±1/±2
         let r = evaluate_pvs1(&input, &AcmgConfig::default());
-        assert!(r.met, "frameshift LOF should keep PVS1 despite deep splice offset");
+        assert!(
+            r.met,
+            "frameshift LOF should keep PVS1 despite deep splice offset"
+        );
         // No NMD/grading signals → frameshift legacy fallback → Very Strong.
         assert_eq!(r.strength, EvidenceStrength::VeryStrong);
     }
@@ -532,7 +567,11 @@ mod tests {
         // it downgrades to PVS1_Moderate instead of the legacy Very Strong.
         let mut input = make_input(
             vec![Consequence::StopGained],
-            Some(GnomadGeneData { pli: Some(1.0), loeuf: Some(0.03), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                loeuf: Some(0.03),
+                ..Default::default()
+            }),
             None,
         );
         input.predicted_nmd = Some(false);
@@ -549,7 +588,11 @@ mod tests {
     fn test_pvs1_nonsense_nmd_predicted_full_strength() {
         let mut input = make_input(
             vec![Consequence::StopGained],
-            Some(GnomadGeneData { pli: Some(1.0), loeuf: Some(0.03), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                loeuf: Some(0.03),
+                ..Default::default()
+            }),
             None,
         );
         input.predicted_nmd = Some(true);
@@ -563,7 +606,10 @@ mod tests {
     fn test_pvs1_nmd_escape_critical_region_strong() {
         let mut input = make_input(
             vec![Consequence::FrameshiftVariant],
-            Some(GnomadGeneData { pli: Some(1.0), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                ..Default::default()
+            }),
             None,
         );
         input.predicted_nmd = Some(false);
@@ -578,7 +624,10 @@ mod tests {
     fn test_pvs1_nmd_escape_noncritical_large_truncation_moderate() {
         let mut input = make_input(
             vec![Consequence::FrameshiftVariant],
-            Some(GnomadGeneData { pli: Some(1.0), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                ..Default::default()
+            }),
             None,
         );
         input.predicted_nmd = Some(false);
@@ -593,7 +642,10 @@ mod tests {
     fn test_pvs1_nmd_escape_noncritical_small_truncation_supporting() {
         let mut input = make_input(
             vec![Consequence::FrameshiftVariant],
-            Some(GnomadGeneData { pli: Some(1.0), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                ..Default::default()
+            }),
             None,
         );
         input.predicted_nmd = Some(false);
@@ -608,7 +660,10 @@ mod tests {
     fn test_pvs1_canonical_splice_last_exon_moderate() {
         let mut input = make_input(
             vec![Consequence::SpliceDonorVariant],
-            Some(GnomadGeneData { pli: Some(1.0), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                ..Default::default()
+            }),
             None,
         );
         input.predicted_nmd = Some(false);
@@ -622,7 +677,10 @@ mod tests {
     fn test_pvs1_start_lost_no_signals_supporting() {
         let input = make_input(
             vec![Consequence::StartLost],
-            Some(GnomadGeneData { pli: Some(1.0), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                ..Default::default()
+            }),
             None,
         );
         let r = evaluate_pvs1(&input, &AcmgConfig::default());
@@ -635,7 +693,10 @@ mod tests {
     fn test_pvs1_start_lost_alt_start_with_pathogenic_upstream_moderate() {
         let mut input = make_input(
             vec![Consequence::StartLost],
-            Some(GnomadGeneData { pli: Some(1.0), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                ..Default::default()
+            }),
             None,
         );
         input.alt_start_codon_distance = Some(50);
@@ -650,7 +711,10 @@ mod tests {
         // No predicted_nmd → falls back to legacy full PVS1.
         let input = make_input(
             vec![Consequence::FrameshiftVariant],
-            Some(GnomadGeneData { pli: Some(1.0), ..Default::default() }),
+            Some(GnomadGeneData {
+                pli: Some(1.0),
+                ..Default::default()
+            }),
             None,
         );
         let r = evaluate_pvs1(&input, &AcmgConfig::default());

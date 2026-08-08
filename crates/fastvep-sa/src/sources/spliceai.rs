@@ -4,10 +4,28 @@
 //! for acceptor/donor gain/loss and their positions.
 
 use crate::common::AnnotationRecord;
+use crate::writer_v2::Osa2Metadata;
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
+
+/// OSA2 metadata that preserves the SpliceAI OSA1 annotation contract.
+pub fn spliceai_osa2_metadata(assembly: &str) -> Osa2Metadata {
+    Osa2Metadata {
+        format_version: 2,
+        name: "SpliceAI".into(),
+        version: "latest".into(),
+        assembly: assembly.into(),
+        json_key: "spliceAI".into(),
+        match_by_allele: true,
+        is_array: false,
+        record_list: false,
+        is_positional: false,
+        chunk_bits: 16,
+        description: format!("SpliceAI splice site predictions for {assembly}"),
+    }
+}
 
 /// Parse a SpliceAI VCF and produce sorted AnnotationRecords.
 ///

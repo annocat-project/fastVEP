@@ -1,6 +1,6 @@
 use fastvep_core::{
-    Allele, Consequence, GeneAnnotation, GenomicPosition, Impact, Strand,
-    SupplementaryAnnotation, VariantType,
+    Allele, Consequence, GeneAnnotation, GenomicPosition, Impact, Strand, SupplementaryAnnotation,
+    VariantType,
 };
 use std::sync::Arc;
 
@@ -147,6 +147,9 @@ impl VariationFeature {
     pub fn is_indel(&self) -> bool {
         self.ref_allele == Allele::Deletion
             || self.alt_alleles.iter().any(|a| *a == Allele::Deletion)
-            || self.alt_alleles.iter().any(|a| a.len() != self.ref_allele.len())
+            || self
+                .alt_alleles
+                .iter()
+                .any(|a| a.len() != self.ref_allele.len())
     }
 }

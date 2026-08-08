@@ -1,5 +1,5 @@
-use fastvep_core::{GeneAnnotation, SupplementaryAnnotation};
 use fastvep_core::{Consequence, Impact};
+use fastvep_core::{GeneAnnotation, SupplementaryAnnotation};
 use serde::Deserialize;
 
 /// gnomAD population frequency data.
@@ -40,8 +40,17 @@ impl GnomadData {
     /// gnomAD v2.1 codes (`oth`) and v4.1 codes (`mid`, `remaining`).
     pub fn max_pop_af(&self) -> Option<f64> {
         [
-            self.all_af, self.afr_af, self.nfe_af, self.eas_af, self.amr_af, self.asj_af,
-            self.fin_af, self.mid_af, self.oth_af, self.remaining_af, self.sas_af,
+            self.all_af,
+            self.afr_af,
+            self.nfe_af,
+            self.eas_af,
+            self.amr_af,
+            self.asj_af,
+            self.fin_af,
+            self.mid_af,
+            self.oth_af,
+            self.remaining_af,
+            self.sas_af,
         ]
         .into_iter()
         .flatten()
@@ -113,7 +122,8 @@ impl ClinvarData {
             Some(s) if s.contains("multiple_submitters") || s.contains("multiple submitters") => 2,
             Some(s)
                 if (s.contains("criteria_provided") || s.contains("criteria provided"))
-                    && !s.contains("no_assertion") && !s.contains("no assertion") =>
+                    && !s.contains("no_assertion")
+                    && !s.contains("no assertion") =>
             {
                 1
             }
@@ -182,17 +192,16 @@ impl DbNsfpData {
 
     /// Parse PolyPhen prediction from format "probably_damaging(0.998)".
     pub fn parse_polyphen(&self) -> Option<PredictionResult> {
-        self.polyphen.as_ref().and_then(|s| parse_prediction_string(s))
+        self.polyphen
+            .as_ref()
+            .and_then(|s| parse_prediction_string(s))
     }
 }
 
 fn parse_prediction_string(s: &str) -> Option<PredictionResult> {
     if let Some(paren_pos) = s.find('(') {
         let prediction = s[..paren_pos].to_string();
-        let score = s[paren_pos + 1..]
-            .trim_end_matches(')')
-            .parse::<f64>()
-            .ok();
+        let score = s[paren_pos + 1..].trim_end_matches(')').parse::<f64>().ok();
         Some(PredictionResult { prediction, score })
     } else {
         Some(PredictionResult {
@@ -503,7 +512,11 @@ pub fn extract_classification_input(
             let k = key.to_lowercase();
             k.contains("repeat") || k.contains("repeatmasker") || k.contains("simple_repeat")
         });
-        if has_repeat { Some(true) } else { None }
+        if has_repeat {
+            Some(true)
+        } else {
+            None
+        }
     };
 
     // ── PVS1 / BP7 decision-tree signals derived from data the pipeline
@@ -588,7 +601,9 @@ fn parse_intronic_offset(hgvs_c: &str) -> Option<i64> {
             let mut val: i64 = 0;
             let mut any = false;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                val = val.saturating_mul(10).saturating_add((bytes[j] - b'0') as i64);
+                val = val
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as i64);
                 any = true;
                 j += 1;
             }
@@ -651,7 +666,7 @@ mod tests {
     fn test_clinvar_conflicting_not_pathogenic() {
         let c = ClinvarData {
             significance: Some(vec![
-                "Conflicting_interpretations_of_pathogenicity".to_string(),
+                "Conflicting_interpretations_of_pathogenicity".to_string()
             ]),
             ..Default::default()
         };
@@ -759,7 +774,10 @@ mod tests {
         assert_eq!(parse_intronic_offset("c.*1411T>A"), None);
         // Canonical splice positions.
         assert_eq!(parse_intronic_offset("c.964+1G>A"), Some(1));
-        assert_eq!(parse_intronic_offset("ENST00000378156.9:c.2818-2A>."), Some(-2));
+        assert_eq!(
+            parse_intronic_offset("ENST00000378156.9:c.2818-2A>."),
+            Some(-2)
+        );
         // Deep-intronic single position.
         assert_eq!(parse_intronic_offset("c.4001+12_4001+15del"), Some(12));
         assert_eq!(parse_intronic_offset("n.162-24414C>T"), Some(-24414));

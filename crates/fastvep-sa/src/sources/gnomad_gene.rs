@@ -140,10 +140,7 @@ impl GnomadGeneCols {
         let fields: Vec<&str> = header.split('\t').collect();
         let find = |needles: &[&str]| {
             for n in needles {
-                if let Some(i) = fields
-                    .iter()
-                    .position(|f| f.eq_ignore_ascii_case(n))
-                {
+                if let Some(i) = fields.iter().position(|f| f.eq_ignore_ascii_case(n)) {
                     return Some(i);
                 }
             }

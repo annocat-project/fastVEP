@@ -278,47 +278,88 @@ impl AcmgConfig {
 
     /// Check if a criterion is disabled for a given gene.
     pub fn is_criterion_disabled(&self, gene: &str, criterion_code: &str) -> bool {
-        self.gene_overrides
-            .get(gene)
-            .map_or(false, |o| o.disabled_criteria.iter().any(|c| c == criterion_code))
+        self.gene_overrides.get(gene).map_or(false, |o| {
+            o.disabled_criteria.iter().any(|c| c == criterion_code)
+        })
     }
 
     /// Get effective BS1 threshold for a gene (gene-specific or default).
     pub fn effective_bs1_threshold(&self, gene: Option<&str>) -> f64 {
-        gene.and_then(|g| {
-            self.gene_overrides
-                .get(g)
-                .and_then(|o| o.bs1_af_threshold)
-        })
-        .unwrap_or(self.bs1_af_threshold)
+        gene.and_then(|g| self.gene_overrides.get(g).and_then(|o| o.bs1_af_threshold))
+            .unwrap_or(self.bs1_af_threshold)
     }
-
 }
 
 // Default value functions for serde
-fn default_ba1() -> f64 { 0.05 }
-fn default_bs1() -> f64 { 0.01 }
-fn default_pm2() -> f64 { 0.0001 }
-fn default_pm2_ad() -> f64 { 0.0 }
-fn default_pm2_ar() -> f64 { 0.00007 }
-fn default_bs2_ad_min_ac() -> u64 { 5 }
-fn default_pp3_supporting() -> f64 { 0.644 }
-fn default_pp3_moderate() -> f64 { 0.773 }
-fn default_pp3_strong() -> f64 { 0.932 }
-fn default_bp4_supporting() -> f64 { 0.290 }
-fn default_bp4_moderate() -> f64 { 0.183 }
-fn default_bp4_strong() -> f64 { 0.016 }
-fn default_bp4_very_strong() -> f64 { 0.003 }
-fn default_spliceai_pathogenic() -> f64 { 0.2 }
-fn default_spliceai_benign() -> f64 { 0.1 }
-fn default_phylop() -> f64 { 2.0 }
-fn default_pli() -> f64 { 0.9 }
-fn default_loeuf() -> f64 { 0.35 }
-fn default_misz() -> f64 { 3.09 }
-fn default_pm1_window() -> u64 { 5 }
-fn default_pm1_threshold() -> u32 { 3 }
-fn default_true() -> bool { true }
-fn default_min_an() -> u64 { 2000 }
+fn default_ba1() -> f64 {
+    0.05
+}
+fn default_bs1() -> f64 {
+    0.01
+}
+fn default_pm2() -> f64 {
+    0.0001
+}
+fn default_pm2_ad() -> f64 {
+    0.0
+}
+fn default_pm2_ar() -> f64 {
+    0.00007
+}
+fn default_bs2_ad_min_ac() -> u64 {
+    5
+}
+fn default_pp3_supporting() -> f64 {
+    0.644
+}
+fn default_pp3_moderate() -> f64 {
+    0.773
+}
+fn default_pp3_strong() -> f64 {
+    0.932
+}
+fn default_bp4_supporting() -> f64 {
+    0.290
+}
+fn default_bp4_moderate() -> f64 {
+    0.183
+}
+fn default_bp4_strong() -> f64 {
+    0.016
+}
+fn default_bp4_very_strong() -> f64 {
+    0.003
+}
+fn default_spliceai_pathogenic() -> f64 {
+    0.2
+}
+fn default_spliceai_benign() -> f64 {
+    0.1
+}
+fn default_phylop() -> f64 {
+    2.0
+}
+fn default_pli() -> f64 {
+    0.9
+}
+fn default_loeuf() -> f64 {
+    0.35
+}
+fn default_misz() -> f64 {
+    3.09
+}
+fn default_pm1_window() -> u64 {
+    5
+}
+fn default_pm1_threshold() -> u32 {
+    3
+}
+fn default_true() -> bool {
+    true
+}
+fn default_min_an() -> u64 {
+    2000
+}
 
 /// Default BA1 exception list (Ghosh et al. 2018, Hum Mutat — 9 variants).
 fn default_ba1_exceptions() -> Vec<Ba1Exception> {
@@ -328,15 +369,35 @@ fn default_ba1_exceptions() -> Vec<Ba1Exception> {
         reason: Some(reason.to_string()),
     };
     vec![
-        mk("ACAD9", "c.-44_-41dupTAAG", "Ghosh 2018 BA1 exception (VUS)"),
-        mk("GJB2", "c.109G>A", "Ghosh 2018 BA1 exception (Pathogenic) — DFNB1 hearing loss"),
-        mk("HFE", "c.187C>G", "Ghosh 2018 BA1 exception (Pathogenic) — hereditary hemochromatosis"),
-        mk("HFE", "c.845G>A", "Ghosh 2018 BA1 exception (Pathogenic) — hereditary hemochromatosis (p.Cys282Tyr)"),
+        mk(
+            "ACAD9",
+            "c.-44_-41dupTAAG",
+            "Ghosh 2018 BA1 exception (VUS)",
+        ),
+        mk(
+            "GJB2",
+            "c.109G>A",
+            "Ghosh 2018 BA1 exception (Pathogenic) — DFNB1 hearing loss",
+        ),
+        mk(
+            "HFE",
+            "c.187C>G",
+            "Ghosh 2018 BA1 exception (Pathogenic) — hereditary hemochromatosis",
+        ),
+        mk(
+            "HFE",
+            "c.845G>A",
+            "Ghosh 2018 BA1 exception (Pathogenic) — hereditary hemochromatosis (p.Cys282Tyr)",
+        ),
         mk("MEFV", "c.1105C>T", "Ghosh 2018 BA1 exception (VUS)"),
         mk("MEFV", "c.1223G>A", "Ghosh 2018 BA1 exception (VUS)"),
         mk("PIBF1", "c.1214G>A", "Ghosh 2018 BA1 exception (VUS)"),
         mk("ACADS", "c.511C>T", "Ghosh 2018 BA1 exception (VUS)"),
-        mk("BTD", "c.1330G>C", "Ghosh 2018 BA1 exception (Pathogenic) — biotinidase deficiency"),
+        mk(
+            "BTD",
+            "c.1330G>C",
+            "Ghosh 2018 BA1 exception (Pathogenic) — biotinidase deficiency",
+        ),
     ]
 }
 

@@ -26,7 +26,12 @@ pub struct Chunk {
 impl Chunk {
     /// Create an empty chunk.
     pub fn empty() -> Self {
-        Self { var32s: Vec::new(), longs: Vec::new(), values: Vec::new(), json_blobs: None }
+        Self {
+            var32s: Vec::new(),
+            longs: Vec::new(),
+            values: Vec::new(),
+            json_blobs: None,
+        }
     }
 
     /// Number of variants in this chunk (short + long).
@@ -74,12 +79,7 @@ impl Chunk {
             .map(|variant| variant.idx as usize)
     }
 
-    pub fn find_all_long(
-        &self,
-        position: u32,
-        ref_allele: &[u8],
-        alt_allele: &[u8],
-    ) -> Vec<usize> {
+    pub fn find_all_long(&self, position: u32, ref_allele: &[u8], alt_allele: &[u8]) -> Vec<usize> {
         let Some(sequence) = crate::kmer16::encode_var(ref_allele, alt_allele) else {
             return Vec::new();
         };
@@ -145,7 +145,8 @@ impl Chunk {
                 continue; // Skip missing values in output
             }
 
-            let val_str = crate::fields::format_value(field, stored, strings.get(fi).map(|v| v.as_slice()));
+            let val_str =
+                crate::fields::format_value(field, stored, strings.get(fi).map(|v| v.as_slice()));
             if val_str != "null" {
                 parts.push(format!("\"{}\":{}", field.alias, val_str));
             }
@@ -232,19 +233,34 @@ mod tests {
         // after a JsonBlob field. Verify the trailing Integer is emitted.
         let fields = vec![
             Field {
-                field: "AF".into(), alias: "af".into(), ftype: FieldType::Float,
-                multiplier: 1_000_000, zigzag: false, missing_value: u32::MAX,
-                missing_string: ".".into(), description: String::new(),
+                field: "AF".into(),
+                alias: "af".into(),
+                ftype: FieldType::Float,
+                multiplier: 1_000_000,
+                zigzag: false,
+                missing_value: u32::MAX,
+                missing_string: ".".into(),
+                description: String::new(),
             },
             Field {
-                field: "blob".into(), alias: "blob".into(), ftype: FieldType::JsonBlob,
-                multiplier: 1, zigzag: false, missing_value: u32::MAX,
-                missing_string: ".".into(), description: String::new(),
+                field: "blob".into(),
+                alias: "blob".into(),
+                ftype: FieldType::JsonBlob,
+                multiplier: 1,
+                zigzag: false,
+                missing_value: u32::MAX,
+                missing_string: ".".into(),
+                description: String::new(),
             },
             Field {
-                field: "AC".into(), alias: "ac".into(), ftype: FieldType::Integer,
-                multiplier: 1, zigzag: false, missing_value: u32::MAX,
-                missing_string: ".".into(), description: String::new(),
+                field: "AC".into(),
+                alias: "ac".into(),
+                ftype: FieldType::Integer,
+                multiplier: 1,
+                zigzag: false,
+                missing_value: u32::MAX,
+                missing_string: ".".into(),
+                description: String::new(),
             },
         ];
 
@@ -257,7 +273,11 @@ mod tests {
         let json = chunk.reconstruct_json(0, &fields, &[]);
         assert!(json.contains("\"af\":"), "missing af in: {}", json);
         assert!(json.contains("\"ac\":42"), "missing ac in: {}", json);
-        assert!(json.contains("\"blob\":{\"k\":1}"), "missing blob in: {}", json);
+        assert!(
+            json.contains("\"blob\":{\"k\":1}"),
+            "missing blob in: {}",
+            json
+        );
     }
 
     #[test]
@@ -266,9 +286,14 @@ mod tests {
         // the complete record object; reconstruct_json must return it verbatim
         // (not nested under a key), so v2 reproduces the v1 JSON exactly.
         let fields = vec![Field {
-            field: String::new(), alias: String::new(), ftype: FieldType::JsonBlob,
-            multiplier: 1, zigzag: false, missing_value: u32::MAX,
-            missing_string: ".".into(), description: String::new(),
+            field: String::new(),
+            alias: String::new(),
+            ftype: FieldType::JsonBlob,
+            multiplier: 1,
+            zigzag: false,
+            missing_value: u32::MAX,
+            missing_string: ".".into(),
+            description: String::new(),
         }];
         let mut chunk = Chunk::empty();
         chunk.var32s = vec![var32::encode(100, b"A", b"G").unwrap()];
@@ -283,22 +308,32 @@ mod tests {
     fn test_chunk_reconstruct_json() {
         let fields = vec![
             Field {
-                field: "AF".into(), alias: "allAf".into(), ftype: FieldType::Float,
-                multiplier: 1_000_000, zigzag: false, missing_value: u32::MAX,
-                missing_string: ".".into(), description: String::new(),
+                field: "AF".into(),
+                alias: "allAf".into(),
+                ftype: FieldType::Float,
+                multiplier: 1_000_000,
+                zigzag: false,
+                missing_value: u32::MAX,
+                missing_string: ".".into(),
+                description: String::new(),
             },
             Field {
-                field: "AC".into(), alias: "allAc".into(), ftype: FieldType::Integer,
-                multiplier: 1, zigzag: false, missing_value: u32::MAX,
-                missing_string: ".".into(), description: String::new(),
+                field: "AC".into(),
+                alias: "allAc".into(),
+                ftype: FieldType::Integer,
+                multiplier: 1,
+                zigzag: false,
+                missing_value: u32::MAX,
+                missing_string: ".".into(),
+                description: String::new(),
             },
         ];
 
         let mut chunk = Chunk::empty();
         chunk.var32s = vec![var32::encode(100, b"A", b"G").unwrap()];
         chunk.values = vec![
-            vec![1234],   // AF * 1_000_000 = 0.001234
-            vec![42],     // AC = 42
+            vec![1234], // AF * 1_000_000 = 0.001234
+            vec![42],   // AC = 42
         ];
 
         let json = chunk.reconstruct_json(0, &fields, &[]);
