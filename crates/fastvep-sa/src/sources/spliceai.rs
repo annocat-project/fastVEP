@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
-/// OSA2 metadata that preserves the SpliceAI OSA1 annotation contract.
+/// OSA2 metadata that preserves every gene-specific SpliceAI record per allele.
 pub fn spliceai_osa2_metadata(assembly: &str) -> Osa2Metadata {
     Osa2Metadata {
         format_version: 2,
@@ -20,7 +20,7 @@ pub fn spliceai_osa2_metadata(assembly: &str) -> Osa2Metadata {
         json_key: "spliceAI".into(),
         match_by_allele: true,
         is_array: false,
-        record_list: false,
+        record_list: true,
         is_positional: false,
         chunk_bits: 16,
         description: format!("SpliceAI splice site predictions for {assembly}"),

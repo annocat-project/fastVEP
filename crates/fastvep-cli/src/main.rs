@@ -272,9 +272,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_progress: bool,
 
-        /// Skip source records whose alleles contain ambiguity codes that OSA2 cannot encode.
+        /// Repair a scalar SpliceAI shard by preserving every gene record per allele.
         #[arg(long, default_value_t = false)]
-        skip_non_acgt: bool,
+        repair_record_list: bool,
     },
 
     /// Reopen and fully validate an OSA v1 or OSA2 database.
@@ -422,8 +422,8 @@ fn main() -> Result<()> {
             input,
             output,
             no_progress,
-            skip_non_acgt,
-        } => pipeline::run_sa_convert(&input, &output, !no_progress, skip_non_acgt)?,
+            repair_record_list,
+        } => pipeline::run_sa_convert(&input, &output, repair_record_list, !no_progress)?,
         Commands::SaVerify {
             input,
             chromosome,

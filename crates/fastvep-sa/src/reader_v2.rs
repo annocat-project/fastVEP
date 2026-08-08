@@ -166,6 +166,15 @@ pub struct Osa2Reader {
     chrom_index: HashMap<String, u32>,
 }
 
+/// One fully decoded OSA2 record used by conversion parity checks.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VerifiedOsa2Record {
+    pub position: u32,
+    pub ref_allele: Vec<u8>,
+    pub alt_allele: Vec<u8>,
+    pub json: String,
+}
+
 impl Osa2Reader {
     /// Open an .osa2 file. Chunks are cached in the shared `GLOBAL_CHUNK_CACHE`.
     pub fn open(path: &Path) -> Result<Self> {
@@ -575,6 +584,33 @@ impl Osa2Reader {
             record_count,
             lookup_count,
         })
+    }
+
+    /// Decode every record in one declared chunk through the production reader.
+    pub fn verified_chunk_records(
+        &self,
+        chromosome: &str,
+        chunk_id: u32,
+    ) -> Result<Vec<VerifiedOsa2Record>> {
+        let chunk = self.build_chunk(chromosome, chunk_id)?;
+        let mut records = Vec::with_capacity(chunk.len());
+        for index in 0..chunk.len() {
+            let (position, ref_allele, alt_allele) = self.variant_at(&chunk, chunk_id, index)?;
+            let json = chunk.reconstruct_json(index, &self.fields, &self.string_tables);
+            serde_json::from_str::<serde_json::Value>(&json).with_context(|| {
+                format!(
+                    "Invalid OSA2 JSON at {}/{} record {}",
+                    chromosome, chunk_id, index
+                )
+            })?;
+            records.push(VerifiedOsa2Record {
+                position,
+                ref_allele,
+                alt_allele,
+                json,
+            });
+        }
+        Ok(records)
     }
 
     fn variant_at(

@@ -9,8 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
-/// Standard REVEL `.osa2` metadata. REVEL's payload is a single `{"score":..}`
-/// object per allele; it is stored as a whole-record JSON blob (see
+/// Standard REVEL `.osa2` metadata. REVEL can provide transcript-specific
+/// records for one allele; each record is stored as a whole-record JSON blob (see
 /// [`crate::writer_v2::raw_json_blob_fields`]) so v2 output is byte-identical
 /// to v1 — the score's fixed-decimal text rides through untouched — while v2's
 /// chunk-level zstd of the blob column shrinks the database.
@@ -23,7 +23,7 @@ pub fn revel_osa2_metadata(assembly: &str) -> Osa2Metadata {
         json_key: "revel".into(),
         match_by_allele: true,
         is_array: false,
-        record_list: false,
+        record_list: true,
         is_positional: false,
         chunk_bits: 20,
         description: format!("REVEL missense pathogenicity scores for {assembly}"),

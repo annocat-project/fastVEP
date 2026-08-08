@@ -838,8 +838,20 @@ fn format_spliceai_projection(vf: &VariationFeature) -> Option<String> {
     }
 }
 
-fn format_spliceai_entry(allele: &str, json_str: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(json_str).ok()?;
+fn format_spliceai_entries(allele: &str, json_str: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(json_str) else {
+        return Vec::new();
+    };
+    match value {
+        Value::Array(records) => records
+            .iter()
+            .filter_map(|record| format_spliceai_entry(allele, record))
+            .collect(),
+        record => format_spliceai_entry(allele, &record).into_iter().collect(),
+    }
+}
+
+fn format_spliceai_entry(allele: &str, value: &Value) -> Option<String> {
     let obj = value.as_object()?;
     let gene = obj.get("gene")?.as_str()?;
 
@@ -958,7 +970,7 @@ fn format_spliceai_for_allele(vf: &VariationFeature, aa: &AlleleAnnotation) -> O
         if key != "spliceAI" {
             continue;
         }
-        if let Some(value) = format_spliceai_entry(&allele, json_str) {
+        for value in format_spliceai_entries(&allele, json_str) {
             if seen.insert(value.clone()) {
                 values.push(value);
             }
@@ -2066,6 +2078,19 @@ mod tests {
 
         let projections = format_supplementary_vcf_info(&vf);
         assert!(projections.iter().any(|(id, _)| id == "FV_GNOMAD"));
+    }
+
+    #[test]
+    fn spliceai_vcf_projection_accepts_scalar_and_record_list_payloads() {
+        let first = r#"{"gene":"GENE1","dsAg":0.01,"dsAl":0.0,"dsDg":0.85,"dsDl":0.0,"dpAg":5,"dpAl":-28,"dpDg":2,"dpDl":-13}"#;
+        let second = r#"{"gene":"GENE2","dsAg":0.02,"dsAl":0.0,"dsDg":0.75,"dsDl":0.0,"dpAg":6,"dpAl":-27,"dpDg":3,"dpDl":-12}"#;
+        assert_eq!(format_spliceai_entries("G", first).len(), 1);
+
+        let list = format!("[{first},{second}]");
+        let entries = format_spliceai_entries("G", &list);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("G|GENE1|0.01|0.00|0.85"));
+        assert!(entries[1].contains("G|GENE2|0.02|0.00|0.75"));
     }
 
     #[test]

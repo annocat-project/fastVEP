@@ -3207,7 +3207,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
-            record_list: false,
+            record_list: true,
             is_positional: false,
         },
         "spliceai" => IndexHeader {
@@ -3219,7 +3219,7 @@ pub fn run_sa_build_inputs(
             assembly: assembly.into(),
             match_by_allele: true,
             is_array: false,
-            record_list: false,
+            record_list: true,
             is_positional: false,
         },
         "primateai" => IndexHeader {
@@ -3871,10 +3871,9 @@ pub fn run_sa_build_v2(
                 assembly,
             )
         }
-        // REVEL: single `{"score":..}` object per allele, stored as a
-        // whole-record blob (its fixed-decimal score text rides through
-        // untouched). The v1 parser buffers+sorts the CSV; column 2 is the
-        // GRCh38 position, matching the v1 build path.
+        // REVEL: transcript-specific records per allele, stored as whole-record
+        // blobs. The v1 parser buffers+sorts the CSV; column 2 is the GRCh38
+        // position, matching the v1 build path.
         "revel" => run_streaming_osa2_v1_build(
             source,
             inputs,
@@ -4228,14 +4227,71 @@ where
     })
 }
 
+fn verify_converted_chunk(
+    converted: &fastvep_sa::reader_v2::Osa2Reader,
+    chromosome: &str,
+    chunk_id: u32,
+    mut expected: Vec<fastvep_sa::reader_v2::VerifiedOsa2Record>,
+) -> Result<()> {
+    let mut actual = converted.verified_chunk_records(chromosome, chunk_id)?;
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if actual != expected {
+        anyhow::bail!(
+            "converted OSA2 records differ in {chromosome}/{chunk_id}: expected {}, found {}",
+            expected.len(),
+            actual.len()
+        );
+    }
+    Ok(())
+}
+
+fn verify_conversion_parity(
+    source: &fastvep_sa::reader::SaReader,
+    converted: &fastvep_sa::reader_v2::Osa2Reader,
+    chunk_bits: u32,
+) -> Result<fastvep_sa::reader::SaVerificationReport> {
+    use fastvep_sa::reader_v2::VerifiedOsa2Record;
+
+    let mut pending: Option<(String, u32, Vec<VerifiedOsa2Record>)> = None;
+    let report = source.verify_with_visitor(None, |chromosome, entry| {
+        let chunk_id = entry.position >> chunk_bits;
+        let same_chunk = pending
+            .as_ref()
+            .is_some_and(|(chrom, id, _)| chrom == chromosome && *id == chunk_id);
+        if !same_chunk {
+            if let Some((chrom, id, records)) = pending.take() {
+                verify_converted_chunk(converted, &chrom, id, records)?;
+            }
+            pending = Some((chromosome.to_string(), chunk_id, Vec::new()));
+        }
+        pending
+            .as_mut()
+            .expect("chunk initialized")
+            .2
+            .push(VerifiedOsa2Record {
+                position: entry.position,
+                ref_allele: entry.ref_allele.as_bytes().to_vec(),
+                alt_allele: entry.alt_allele.as_bytes().to_vec(),
+                json: entry.json.clone(),
+            });
+        Ok(())
+    })?;
+    if let Some((chrom, id, records)) = pending {
+        verify_converted_chunk(converted, &chrom, id, records)?;
+    }
+    Ok(report)
+}
+
 /// Convert one verified CADD or SpliceAI OSA v1 shard without reparsing or
-/// changing its allele keys and JSON values. The source remains untouched;
-/// the destination becomes visible only after OSA2 verification succeeds.
+/// changing its allele keys and JSON values. SpliceAI scalar shards require
+/// explicit record-list repair. The destination is published only after exact
+/// per-chunk record parity and normal OSA2 verification succeed.
 pub fn run_sa_convert(
     input: &str,
     output: &str,
+    repair_record_list: bool,
     show_progress: bool,
-    skip_non_acgt: bool,
 ) -> Result<()> {
     use fastvep_sa::reader::SaReader;
     use fastvep_sa::reader_v2::Osa2Reader;
@@ -4267,10 +4323,16 @@ pub fn run_sa_convert(
             source_metadata.json_key
         );
     }
-    if !source_metadata.match_by_allele
-        || source_metadata.is_array
-        || source_metadata.record_list
-        || source_metadata.is_positional
+    if repair_record_list && source_metadata.json_key != "spliceAI" {
+        anyhow::bail!("record-list repair is supported for SpliceAI only");
+    }
+    if repair_record_list && source_metadata.record_list {
+        anyhow::bail!(
+            "{} already uses the record-list contract",
+            source_metadata.name
+        );
+    }
+    if !source_metadata.match_by_allele || source_metadata.is_array || source_metadata.is_positional
     {
         anyhow::bail!(
             "{} uses an unsupported OSA v1 metadata contract",
@@ -4286,7 +4348,7 @@ pub fn run_sa_convert(
         json_key: source_metadata.json_key.clone(),
         match_by_allele: source_metadata.match_by_allele,
         is_array: source_metadata.is_array,
-        record_list: source_metadata.record_list,
+        record_list: source_metadata.record_list || repair_record_list,
         is_positional: source_metadata.is_positional,
         chunk_bits: 16,
         description: source_metadata.description.clone(),
@@ -4301,7 +4363,7 @@ pub fn run_sa_convert(
         std::process::id()
     ));
     let mut owns_temp = false;
-    let result = (|| -> Result<(fastvep_sa::reader::SaVerificationReport, u64, u64)> {
+    let result = (|| -> Result<(fastvep_sa::reader::SaVerificationReport, u64)> {
         let out_file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -4313,31 +4375,10 @@ pub fn run_sa_convert(
             Osa2StreamWriter::new(BufWriter::new(out_file), &metadata, raw_json_blob_fields())?;
         let mut meter = crate::progress::ProgressMeter::new(show_progress);
         let mut visited = 0_u64;
-        let mut written = 0_u64;
-        let mut skipped = 0_u64;
-        let mut samples = Vec::new();
         let source_report = source
             .verify_with_visitor(None, |chromosome, entry| {
                 visited += 1;
                 meter.update();
-                if fastvep_sa::kmer16::encode_var(
-                    entry.ref_allele.as_bytes(),
-                    entry.alt_allele.as_bytes(),
-                )
-                .is_none()
-                    && skip_non_acgt
-                {
-                    skipped += 1;
-                    return Ok(());
-                }
-                if written < 1024 || written % 1_000_000 == 0 {
-                    samples.push((
-                        chromosome.to_string(),
-                        entry.position,
-                        entry.ref_allele.clone(),
-                        entry.alt_allele.clone(),
-                    ));
-                }
                 writer.push(Osa2Record {
                     chrom: chromosome.to_string(),
                     position: entry.position,
@@ -4346,7 +4387,6 @@ pub fn run_sa_convert(
                     values: Vec::new(),
                     json_blob: Some(entry.json.clone()),
                 })?;
-                written += 1;
                 Ok(())
             })
             .with_context(|| format!("Verifying OSA v1 source: {}", input_path.display()))?;
@@ -4360,14 +4400,6 @@ pub fn run_sa_convert(
                 visited
             );
         }
-        if written + skipped != source_report.record_count {
-            anyhow::bail!(
-                "OSA conversion accounting mismatch: source={}, written={}, skipped={}",
-                source_report.record_count,
-                written,
-                skipped
-            );
-        }
         let converted = Osa2Reader::open_with_cache_budget(&temp_path, VERIFY_CACHE_BYTES)
             .with_context(|| format!("Opening converted OSA2 file: {}", temp_path.display()))?;
         let converted_report = converted
@@ -4377,48 +4409,24 @@ pub fn run_sa_convert(
             || converted_report.version != source_report.version
             || converted_report.assembly != source_report.assembly
             || converted_report.json_key != source_report.json_key
-            || (skipped == 0 && converted_report.chromosomes != source_report.chromosomes)
-            || converted_report.record_count != written
+            || converted_report.chromosomes != source_report.chromosomes
+            || converted_report.record_count != source_report.record_count
         {
             anyhow::bail!("converted OSA2 metadata or record count differs from OSA v1");
         }
         let converted_metadata = converted.metadata();
         if converted_metadata.match_by_allele != source_metadata.match_by_allele
             || converted_metadata.is_array != source_metadata.is_array
-            || converted_metadata.record_list != source_metadata.record_list
+            || converted_metadata.record_list != metadata.record_list
             || converted_metadata.is_positional != source_metadata.is_positional
         {
             anyhow::bail!("converted OSA2 annotation contract differs from OSA v1");
         }
 
-        for (chromosome, position, reference, alternate) in samples {
-            // Compare provider lookup semantics, not the sampled raw record.
-            // Dense sources can contain multiple records for one allele; both
-            // readers intentionally return the first deterministic match.
-            let expected =
-                source.annotate_position(&chromosome, position as u64, &reference, &alternate)?;
-            let actual = converted.annotate_position(
-                &chromosome,
-                position as u64,
-                &reference,
-                &alternate,
-            )?;
-            let matches = matches!(
-                (expected, actual),
-                (
-                    Some(AnnotationValue::Json(expected)),
-                    Some(AnnotationValue::Json(actual))
-                ) if actual == expected
-            );
-            if !matches {
-                anyhow::bail!(
-                    "converted OSA2 lookup differs at {}:{} {}>{}",
-                    chromosome,
-                    position,
-                    reference,
-                    alternate
-                );
-            }
+        let parity_report = verify_conversion_parity(&source, &converted, metadata.chunk_bits)
+            .context("Comparing every converted OSA2 record with its OSA v1 source")?;
+        if parity_report.record_count != source_report.record_count {
+            anyhow::bail!("OSA conversion parity check did not visit every source record");
         }
         drop(source);
         drop(converted);
@@ -4431,22 +4439,19 @@ pub fn run_sa_convert(
             )
         })?;
         owns_temp = false;
-        Ok((converted_report, source_report.record_count, skipped))
+        Ok((converted_report, source_report.record_count))
     })();
 
     if owns_temp {
         let _ = std::fs::remove_file(&temp_path);
     }
-    let (report, source_record_count, skipped_non_acgt_records) = result?;
+    let (report, source_record_count) = result?;
     let mut json = serde_json::to_value(&report)?;
     let object = json
         .as_object_mut()
         .context("OSA conversion report must be a JSON object")?;
     object.insert("sourceRecordCount".into(), source_record_count.into());
-    object.insert(
-        "skippedNonAcgtRecords".into(),
-        skipped_non_acgt_records.into(),
-    );
+    object.insert("recordListRepair".into(), repair_record_list.into());
     println!("{}", serde_json::to_string(&json)?);
     Ok(())
 }
@@ -4457,7 +4462,7 @@ mod osa2_build_tests {
     use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue};
     use fastvep_sa::reader::SaReader;
     use fastvep_sa::reader_v2::Osa2Reader;
-    use fastvep_sa::sources::{cadd, gnomad, spliceai};
+    use fastvep_sa::sources::{cadd, gnomad, revel, spliceai};
 
     fn annotation_json(
         reader: &impl AnnotationProvider,
@@ -4594,6 +4599,8 @@ chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
         assert!(source_supports_osa2("spliceai"));
         assert_eq!(cadd::cadd_osa2_metadata("GRCh38").chunk_bits, 16);
         assert_eq!(spliceai::spliceai_osa2_metadata("GRCh38").chunk_bits, 16);
+        assert!(spliceai::spliceai_osa2_metadata("GRCh38").record_list);
+        assert!(revel::revel_osa2_metadata("GRCh38").record_list);
 
         let dir = tempfile::tempdir().unwrap();
         let cadd_input = dir.path().join("cadd.tsv");
@@ -4738,6 +4745,108 @@ chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
             .annotate_position("chr1", 201, "C", "G")
             .unwrap()
             .is_none());
+        let records: serde_json::Value =
+            serde_json::from_str(&annotation_json(&spliceai_v2, "chr1", 200, "A", "G")).unwrap();
+        assert_eq!(records.as_array().unwrap().len(), 2);
+
+        let expected = spliceai_v2.verified_chunk_records("chr1", 0).unwrap();
+        let mut changed_payload = expected.clone();
+        changed_payload[0].json = r#"{"gene":"CHANGED"}"#.into();
+        assert!(verify_converted_chunk(&spliceai_v2, "chr1", 0, changed_payload).is_err());
+
+        let mut replaced_duplicate = expected;
+        replaced_duplicate[1] = replaced_duplicate[0].clone();
+        assert!(verify_converted_chunk(&spliceai_v2, "chr1", 0, replaced_duplicate).is_err());
+    }
+
+    #[test]
+    fn osa_conversion_repairs_scalar_spliceai_duplicates() {
+        use fastvep_sa::common::AnnotationRecord;
+        use fastvep_sa::index::IndexHeader;
+        use fastvep_sa::writer::SaWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("spliceai-v1");
+        let output = dir.path().join("spliceai-v2.osa2");
+        let header = IndexHeader {
+            schema_version: fastvep_sa::common::SCHEMA_VERSION,
+            json_key: "spliceAI".into(),
+            name: "SpliceAI".into(),
+            version: "latest".into(),
+            description: "fixture".into(),
+            assembly: "GRCh38".into(),
+            match_by_allele: true,
+            is_array: false,
+            record_list: false,
+            is_positional: false,
+        };
+        let records = ["GENE1", "GENE2"].into_iter().map(|gene| AnnotationRecord {
+            chrom_idx: 0,
+            position: 200,
+            ref_allele: "A".into(),
+            alt_allele: "G".into(),
+            json: format!(r#"{{"gene":"{gene}","dsAg":0.1}}"#),
+        });
+        SaWriter::new(header)
+            .write_to_files(&source, records, &["chr1".into()])
+            .unwrap();
+
+        run_sa_convert(
+            source.with_extension("osa").to_str().unwrap(),
+            output.to_str().unwrap(),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let converted = Osa2Reader::open(&output).unwrap();
+        assert!(converted.metadata().record_list);
+        let value: serde_json::Value =
+            serde_json::from_str(&annotation_json(&converted, "chr1", 200, "A", "G")).unwrap();
+        let genes = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["gene"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(genes, std::collections::BTreeSet::from(["GENE1", "GENE2"]));
+    }
+
+    #[test]
+    fn revel_osa2_preserves_transcript_records_for_one_allele() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("revel.csv");
+        let output = dir.path().join("revel-v2");
+        std::fs::write(
+            &input,
+            "chr,hg19_pos,grch38_pos,ref,alt,aaref,aaalt,REVEL,transcript\n\
+             1,100,101,G,A,R,H,0.1,ENST1\n\
+             1,100,101,G,A,Arg,His,0.8,ENST2\n",
+        )
+        .unwrap();
+
+        run_sa_build_v2(
+            "revel",
+            &[input.to_string_lossy().into_owned()],
+            &[],
+            None,
+            output.to_str().unwrap(),
+            "GRCh38",
+            false,
+        )
+        .unwrap();
+
+        let reader = Osa2Reader::open(&output.with_extension("osa2")).unwrap();
+        assert!(reader.metadata().record_list);
+        let records: serde_json::Value =
+            serde_json::from_str(&annotation_json(&reader, "chr1", 101, "G", "A")).unwrap();
+        assert_eq!(
+            records,
+            serde_json::json!([
+                {"aaAlt": "H", "aaRef": "R", "score": 0.1, "transcriptId": "ENST1"},
+                {"aaAlt": "His", "aaRef": "Arg", "score": 0.8, "transcriptId": "ENST2"}
+            ])
+        );
     }
 
     #[test]
@@ -4783,32 +4892,6 @@ chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
                 .record_count,
             2
         );
-
-        run_sa_convert(
-            source.with_extension("osa").to_str().unwrap(),
-            output.to_str().unwrap(),
-            false,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            Osa2Reader::open(&output)
-                .unwrap()
-                .verify(None)
-                .unwrap()
-                .record_count,
-            1
-        );
-        assert!(Osa2Reader::open(&output)
-            .unwrap()
-            .annotate_position("chr1", 100, "N", "A")
-            .unwrap()
-            .is_none());
-        assert!(Osa2Reader::open(&output)
-            .unwrap()
-            .annotate_position("chr1", 101, "C", "T")
-            .unwrap()
-            .is_some());
     }
 }
 
