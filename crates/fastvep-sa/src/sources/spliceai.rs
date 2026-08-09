@@ -10,6 +10,10 @@ use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
+/// SpliceAI is dense and can retain multiple gene records per allele. A
+/// 32-Kbp chunk keeps its decompressed record-list JSON below the OSA2 limit.
+pub const SPLICEAI_CHUNK_BITS: u32 = 15;
+
 /// OSA2 metadata that preserves every gene-specific SpliceAI record per allele.
 pub fn spliceai_osa2_metadata(assembly: &str) -> Osa2Metadata {
     Osa2Metadata {
@@ -22,7 +26,7 @@ pub fn spliceai_osa2_metadata(assembly: &str) -> Osa2Metadata {
         is_array: false,
         record_list: true,
         is_positional: false,
-        chunk_bits: 16,
+        chunk_bits: SPLICEAI_CHUNK_BITS,
         description: format!("SpliceAI splice site predictions for {assembly}"),
     }
 }
@@ -204,6 +208,11 @@ fn normalize_chrom(chrom: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osa2_uses_bounded_chunks_for_dense_record_lists() {
+        assert_eq!(spliceai_osa2_metadata("GRCh38").chunk_bits, 15);
+    }
 
     #[test]
     fn test_parse_spliceai_vcf() {

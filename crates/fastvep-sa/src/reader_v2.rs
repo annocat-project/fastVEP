@@ -12,13 +12,13 @@
 //! queried in parallel neither serializes on a lock nor thrashes a too-small
 //! per-reader cache. See [`crate::common::sa_cache_budget_bytes`].
 
-use crate::chunk::{delta_decode, Chunk};
+use crate::chunk::{delta_decode, Chunk, RawVariant};
 use crate::common::chrom_aliases;
 use crate::fields::{Field, FieldType};
 use crate::kmer16::LongVariant;
 use crate::reader::SaVerificationReport;
 use crate::var32;
-use crate::writer_v2::{read_u32_array, Osa2Metadata};
+use crate::writer_v2::{read_u32_array, Osa2Metadata, MAX_JSON_BLOB_DECOMPRESSED};
 use anyhow::{Context, Result};
 use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
 use flate2::read::DeflateDecoder;
@@ -31,10 +31,6 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// Hard cap on a per-chunk zstd-decompressed JSON blob (256 MiB). Defends
-/// against zstd bombs in maliciously crafted .osa2 files.
-const MAX_JSON_BLOB_DECOMPRESSED: usize = 256 * 1024 * 1024;
 
 /// Soft cap on cached chunk *entries*; the byte budget is the real gate.
 const CHUNK_CACHE_MAX_ENTRIES: usize = 4096;
@@ -60,6 +56,13 @@ type ChunkKey = (u64, u64);
 fn chunk_bytes(c: &Chunk) -> usize {
     let v32 = c.var32s.len() * std::mem::size_of::<u32>();
     let longs = c.longs.len() * std::mem::size_of::<LongVariant>();
+    let raws: usize = c
+        .raws
+        .iter()
+        .map(|variant| {
+            std::mem::size_of::<RawVariant>() + variant.ref_allele.len() + variant.alt_allele.len()
+        })
+        .sum();
     let vals: usize = c
         .values
         .iter()
@@ -71,6 +74,7 @@ fn chunk_bytes(c: &Chunk) -> usize {
             .sum()
     });
     v32.saturating_add(longs)
+        .saturating_add(raws)
         .saturating_add(vals)
         .saturating_add(blobs)
 }
@@ -316,8 +320,10 @@ impl Osa2Reader {
                 .parse()
                 .with_context(|| format!("Invalid OSA2 chunk id in '{}'", name))?;
             let file = parts[2];
-            if !matches!(file, "var32.bin" | "too-long.enc" | "json_blobs.zst")
-                && !value_files.contains(file)
+            if !matches!(
+                file,
+                "var32.bin" | "too-long.enc" | "raw-alleles.enc" | "json_blobs.zst"
+            ) && !value_files.contains(file)
             {
                 anyhow::bail!("Unexpected OSA2 chunk entry '{}'", name);
             }
@@ -460,6 +466,13 @@ impl Osa2Reader {
                     chunk_id
                 );
             }
+            if chunk.raws.windows(2).any(|pair| pair[0] > pair[1]) {
+                anyhow::bail!(
+                    "OSA2 raw allele keys are not ordered in {}/{}",
+                    chromosome,
+                    chunk_id
+                );
+            }
 
             let chunk_size = 1_u32 << self.metadata.chunk_bits;
             for key in &chunk.var32s {
@@ -491,6 +504,38 @@ impl Osa2Reader {
                 crate::kmer16::decode_var(&variant.sequence).with_context(|| {
                     format!("Decoding OSA2 long key in {}/{}", chromosome, chunk_id)
                 })?;
+            }
+            for (rank, variant) in chunk.raws.iter().enumerate() {
+                if variant.position >> self.metadata.chunk_bits != *chunk_id {
+                    anyhow::bail!(
+                        "OSA2 raw allele key falls outside chunk {}/{}",
+                        chromosome,
+                        chunk_id
+                    );
+                }
+                let expected_index = chunk.var32s.len() + chunk.longs.len() + rank;
+                if variant.idx as usize != expected_index {
+                    anyhow::bail!(
+                        "OSA2 raw allele key has invalid value index in {}/{}",
+                        chromosome,
+                        chunk_id
+                    );
+                }
+                let compact = if var32::is_long(variant.ref_allele.len(), variant.alt_allele.len())
+                {
+                    crate::kmer16::encode_var(&variant.ref_allele, &variant.alt_allele).is_some()
+                } else {
+                    let within_position = variant.position & (chunk_size - 1);
+                    var32::encode(within_position, &variant.ref_allele, &variant.alt_allele)
+                        .is_some()
+                };
+                if compact {
+                    anyhow::bail!(
+                        "OSA2 raw allele key is representable by a compact key in {}/{}",
+                        chromosome,
+                        chunk_id
+                    );
+                }
             }
 
             let total = chunk.len();
@@ -637,12 +682,23 @@ impl Osa2Reader {
         let long_index = index
             .checked_sub(chunk.var32s.len())
             .ok_or_else(|| anyhow::anyhow!("OSA2 variant index underflow"))?;
+        if let Some(variant) = chunk.longs.get(long_index) {
+            let (ref_allele, alt_allele) = crate::kmer16::decode_var(&variant.sequence)?;
+            return Ok((variant.position, ref_allele, alt_allele));
+        }
+
+        let raw_index = long_index
+            .checked_sub(chunk.longs.len())
+            .ok_or_else(|| anyhow::anyhow!("OSA2 raw variant index underflow"))?;
         let variant = chunk
-            .longs
-            .get(long_index)
+            .raws
+            .get(raw_index)
             .ok_or_else(|| anyhow::anyhow!("OSA2 variant index is out of bounds"))?;
-        let (ref_allele, alt_allele) = crate::kmer16::decode_var(&variant.sequence)?;
-        Ok((variant.position, ref_allele, alt_allele))
+        Ok((
+            variant.position,
+            variant.ref_allele.clone(),
+            variant.alt_allele.clone(),
+        ))
     }
 
     /// Read and decompress one ZIP entry straight from the mmap, with no lock.
@@ -722,6 +778,17 @@ impl Osa2Reader {
             })?,
             None => Vec::new(),
         };
+        let raws: Vec<RawVariant> = match self.read_entry(&format!("{}raw-alleles.enc", prefix))? {
+            Some(buf) => bincode::deserialize(&buf).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to deserialize raw-allele block for chunk {}/{}: {}",
+                    chrom,
+                    chunk_id,
+                    e
+                )
+            })?,
+            None => Vec::new(),
+        };
 
         // Parallel value arrays (one per non-JsonBlob field, in field order).
         let mut values = Vec::new();
@@ -731,7 +798,10 @@ impl Osa2Reader {
             }
             match self.read_entry(&format!("{}{}.bin", prefix, field.alias))? {
                 Some(buf) => values.push(read_u32_array(&buf)?),
-                None => values.push(vec![field.missing_value; var32s.len() + longs.len()]),
+                None => values.push(vec![
+                    field.missing_value;
+                    var32s.len() + longs.len() + raws.len()
+                ]),
             }
         }
 
@@ -758,6 +828,7 @@ impl Osa2Reader {
         Ok(Chunk {
             var32s,
             longs,
+            raws,
             values,
             json_blobs,
         })
@@ -825,11 +896,18 @@ impl Osa2Reader {
                     .find_all_short(var32::positional_key(within_pos))
                     .collect()
             } else if var32::is_long(ref_allele.len(), alt_allele.len()) {
-                chunk.find_all_long(pos, ref_allele, alt_allele)
+                let indices = chunk.find_all_long(pos, ref_allele, alt_allele);
+                if indices.is_empty() && crate::kmer16::encode_var(ref_allele, alt_allele).is_none()
+                {
+                    chunk.find_all_raw(pos, ref_allele, alt_allele)
+                } else {
+                    indices
+                }
             } else {
-                var32::encode(within_pos, ref_allele, alt_allele)
-                    .map(|key| chunk.find_all_short(key).collect())
-                    .unwrap_or_default()
+                match var32::encode(within_pos, ref_allele, alt_allele) {
+                    Some(key) => chunk.find_all_short(key).collect(),
+                    None => chunk.find_all_raw(pos, ref_allele, alt_allele),
+                }
             };
             if indices.is_empty() {
                 return Ok(None);
@@ -845,9 +923,17 @@ impl Osa2Reader {
             // Positional sources match by coordinate alone.
             chunk.find_short(var32::positional_key(within_pos))
         } else if var32::is_long(ref_allele.len(), alt_allele.len()) {
-            chunk.find_long(pos, ref_allele, alt_allele)
+            let index = chunk.find_long(pos, ref_allele, alt_allele);
+            if index.is_none() && crate::kmer16::encode_var(ref_allele, alt_allele).is_none() {
+                chunk.find_raw(pos, ref_allele, alt_allele)
+            } else {
+                index
+            }
         } else {
-            var32::encode(within_pos, ref_allele, alt_allele).and_then(|key| chunk.find_short(key))
+            match var32::encode(within_pos, ref_allele, alt_allele) {
+                Some(key) => chunk.find_short(key),
+                None => chunk.find_raw(pos, ref_allele, alt_allele),
+            }
         };
 
         match idx {

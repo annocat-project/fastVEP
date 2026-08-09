@@ -6,12 +6,51 @@
 use crate::fields::{Field, FieldType};
 use crate::kmer16::LongVariant;
 
+/// A variant whose allele bytes cannot use the compact A/C/G/T encodings.
+/// These records are rare and stay in a separate sorted overflow array so
+/// ordinary OSA2 lookups keep the existing fast path.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RawVariant {
+    pub position: u32,
+    pub idx: u32,
+    pub ref_allele: Vec<u8>,
+    pub alt_allele: Vec<u8>,
+}
+
+impl PartialEq for RawVariant {
+    fn eq(&self, other: &Self) -> bool {
+        self.position == other.position
+            && self.ref_allele == other.ref_allele
+            && self.alt_allele == other.alt_allele
+    }
+}
+
+impl Eq for RawVariant {}
+
+impl PartialOrd for RawVariant {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RawVariant {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.position
+            .cmp(&other.position)
+            .then_with(|| self.ref_allele.cmp(&other.ref_allele))
+            .then_with(|| self.alt_allele.cmp(&other.alt_allele))
+    }
+}
+
 /// A loaded genomic chunk (~1MB region) with sorted variant keys and values.
 pub struct Chunk {
     /// Sorted Var32-encoded variant keys for binary search.
     pub var32s: Vec<u32>,
     /// Long variants (ref+alt > 4 bases) sorted for binary search.
     pub longs: Vec<LongVariant>,
+    /// Alleles containing N/IUPAC or other bytes not representable by the
+    /// compact two-bit encodings, sorted for binary search.
+    pub raws: Vec<RawVariant>,
     /// Parallel value arrays, one per non-JsonBlob field in field-config order:
     /// `values[non_jsonblob_position][variant_idx]`. JsonBlob fields do not
     /// contribute a column here (their payloads live in `json_blobs`), so this
@@ -29,21 +68,20 @@ impl Chunk {
         Self {
             var32s: Vec::new(),
             longs: Vec::new(),
+            raws: Vec::new(),
             values: Vec::new(),
             json_blobs: None,
         }
     }
 
-    /// Number of variants in this chunk (short + long).
+    /// Number of variants in this chunk across all key encodings.
     pub fn len(&self) -> usize {
-        self.var32s.len() + self.longs.len()
+        self.var32s.len() + self.longs.len() + self.raws.len()
     }
 
-    /// A chunk is empty only when it holds neither short nor long variants.
-    /// Long-only chunks (all indels) must not be treated as empty, or every
-    /// lookup against them would miss.
+    /// Long-only or raw-only chunks must not be treated as empty.
     pub fn is_empty(&self) -> bool {
-        self.var32s.is_empty() && self.longs.is_empty()
+        self.var32s.is_empty() && self.longs.is_empty() && self.raws.is_empty()
     }
 
     /// Look up a variant by Var32 key. Returns the index into value arrays.
@@ -90,6 +128,35 @@ impl Chunk {
         };
         let start = self.longs.partition_point(|variant| variant < &query);
         self.longs[start..]
+            .iter()
+            .take_while(|variant| *variant == &query)
+            .map(|variant| variant.idx as usize)
+            .collect()
+    }
+
+    pub fn find_raw(&self, position: u32, ref_allele: &[u8], alt_allele: &[u8]) -> Option<usize> {
+        let query = RawVariant {
+            position,
+            idx: 0,
+            ref_allele: ref_allele.to_vec(),
+            alt_allele: alt_allele.to_vec(),
+        };
+        let index = self.raws.partition_point(|variant| variant < &query);
+        self.raws
+            .get(index)
+            .filter(|variant| *variant == &query)
+            .map(|variant| variant.idx as usize)
+    }
+
+    pub fn find_all_raw(&self, position: u32, ref_allele: &[u8], alt_allele: &[u8]) -> Vec<usize> {
+        let query = RawVariant {
+            position,
+            idx: 0,
+            ref_allele: ref_allele.to_vec(),
+            alt_allele: alt_allele.to_vec(),
+        };
+        let start = self.raws.partition_point(|variant| variant < &query);
+        self.raws[start..]
             .iter()
             .take_while(|variant| *variant == &query)
             .map(|variant| variant.idx as usize)

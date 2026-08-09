@@ -3,13 +3,18 @@
 //! Organizes annotations into ~1MB genomic chunks with parallel u32 value
 //! arrays, sorted Var32 keys, and delta encoding for efficient compression.
 
-use crate::chunk::delta_encode;
+use crate::chunk::{delta_encode, RawVariant};
 use crate::common::AnnotationRecord;
 use crate::fields::{Field, FieldType};
 use crate::kmer16::{self, LongVariant};
 use crate::var32;
 use anyhow::{Context, Result};
 use std::io::{Seek, Write};
+
+/// Hard cap shared by the writer and reader for one decompressed JSON value
+/// column. Dense sources must use smaller genomic chunks instead of requiring
+/// unbounded annotation-time allocations.
+pub(crate) const MAX_JSON_BLOB_DECOMPRESSED: usize = 256 * 1024 * 1024;
 
 /// Metadata for the .osa2 file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -185,6 +190,7 @@ fn write_chunk_entries<W: Write + Seek>(
     // in the combined short-then-long order.
     let mut short_entries: Vec<(u32, usize)> = Vec::new(); // (var32_key, local_idx)
     let mut long_entries: Vec<(LongVariant, usize)> = Vec::new(); // (variant, local_idx)
+    let mut raw_entries: Vec<(RawVariant, usize)> = Vec::new(); // (variant, local_idx)
 
     for (local_idx, record) in chunk_records.iter().enumerate() {
         let within_chunk_pos = record.position & chunk_mask;
@@ -194,41 +200,46 @@ fn write_chunk_entries<W: Write + Seek>(
             // only (alleles are empty) and never take the long-variant path.
             short_entries.push((var32::positional_key(within_chunk_pos), local_idx));
         } else if var32::is_long(record.ref_allele.len(), record.alt_allele.len()) {
-            let sequence =
-                kmer16::encode_var(&record.ref_allele, &record.alt_allele).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "OSA2 cannot encode non-ACGT allele at {}:{} (ref={:?} alt={:?})",
-                        chrom,
-                        record.position,
-                        String::from_utf8_lossy(&record.ref_allele),
-                        String::from_utf8_lossy(&record.alt_allele),
-                    )
-                })?;
-            long_entries.push((
-                LongVariant {
-                    position: record.position,
-                    idx: 0,
-                    sequence,
-                },
-                local_idx,
-            ));
+            if let Some(sequence) = kmer16::encode_var(&record.ref_allele, &record.alt_allele) {
+                long_entries.push((
+                    LongVariant {
+                        position: record.position,
+                        idx: 0,
+                        sequence,
+                    },
+                    local_idx,
+                ));
+            } else {
+                raw_entries.push((
+                    RawVariant {
+                        position: record.position,
+                        idx: 0,
+                        ref_allele: record.ref_allele.clone(),
+                        alt_allele: record.alt_allele.clone(),
+                    },
+                    local_idx,
+                ));
+            }
         } else if let Some(key) =
             var32::encode(within_chunk_pos, &record.ref_allele, &record.alt_allele)
         {
             short_entries.push((key, local_idx));
         } else {
-            anyhow::bail!(
-                "OSA2 cannot encode non-ACGT allele at {}:{} (ref={:?} alt={:?})",
-                chrom,
-                record.position,
-                String::from_utf8_lossy(&record.ref_allele),
-                String::from_utf8_lossy(&record.alt_allele),
-            );
+            raw_entries.push((
+                RawVariant {
+                    position: record.position,
+                    idx: 0,
+                    ref_allele: record.ref_allele.clone(),
+                    alt_allele: record.alt_allele.clone(),
+                },
+                local_idx,
+            ));
         }
     }
 
     short_entries.sort_by_key(|(key, _)| *key);
     long_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    raw_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     // Value slot layout: short variants first (parallel to the sorted var32
     // key array, so `binary_search` positions map directly), then long
@@ -237,10 +248,15 @@ fn write_chunk_entries<W: Write + Seek>(
     for (rank, (lv, _)) in long_entries.iter_mut().enumerate() {
         lv.idx = (short_count + rank) as u32;
     }
+    let long_count = long_entries.len();
+    for (rank, (variant, _)) in raw_entries.iter_mut().enumerate() {
+        variant.idx = (short_count + long_count + rank) as u32;
+    }
     let value_order: Vec<usize> = short_entries
         .iter()
         .map(|(_, li)| *li)
         .chain(long_entries.iter().map(|(_, li)| *li))
+        .chain(raw_entries.iter().map(|(_, li)| *li))
         .collect();
 
     let var32s: Vec<u32> = short_entries.iter().map(|(k, _)| *k).collect();
@@ -255,6 +271,11 @@ fn write_chunk_entries<W: Write + Seek>(
         zip.start_file(format!("{}too-long.enc", prefix), options)?;
         let data = bincode::serialize(&longs)?;
         zip.write_all(&data)?;
+    }
+    if !raw_entries.is_empty() {
+        let variants: Vec<&RawVariant> = raw_entries.iter().map(|(variant, _)| variant).collect();
+        zip.start_file(format!("{}raw-alleles.enc", prefix), options)?;
+        zip.write_all(&bincode::serialize(&variants)?)?;
     }
 
     // Parallel value arrays, one per non-JsonBlob field, in the combined
@@ -284,6 +305,15 @@ fn write_chunk_entries<W: Write + Seek>(
             .map(|&li| chunk_records[li].json_blob.as_deref().unwrap_or(""))
             .collect();
         if blobs.iter().any(|b| !b.is_empty()) {
+            let joined_len =
+                blobs.iter().map(|blob| blob.len()).sum::<usize>() + blobs.len().saturating_sub(1);
+            if joined_len > MAX_JSON_BLOB_DECOMPRESSED {
+                anyhow::bail!(
+                    "JSON blob for chunk {chrom}/{chunk_id} is {} bytes; maximum is {} bytes",
+                    joined_len,
+                    MAX_JSON_BLOB_DECOMPRESSED
+                );
+            }
             zip.start_file(format!("{}json_blobs.zst", prefix), options)?;
             let joined = blobs.join("\n");
             let compressed = zstd::encode_all(joined.as_bytes(), 3)?;
@@ -570,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn osa2_writer_rejects_unrepresentable_alleles() {
+    fn osa2_writer_preserves_ambiguous_alleles() {
         let metadata = Osa2Metadata {
             format_version: 2,
             name: "test".into(),
@@ -594,9 +624,6 @@ mod tests {
             json_blob: None,
         }];
 
-        let error = writer
-            .write_all(Cursor::new(Vec::new()), &records)
-            .unwrap_err();
-        assert!(error.to_string().contains("cannot encode non-ACGT allele"));
+        writer.write_all(Cursor::new(Vec::new()), &records).unwrap();
     }
 }

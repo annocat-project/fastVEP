@@ -26,6 +26,10 @@ fn write_fixture(path: &std::path::Path, record_list: bool) {
         record(10_000, b"A", b"G", 2),
         record(10_100, b"ACGTA", b"A", 3),
         record(10_100, b"ACGTA", b"A", 4),
+        record(10_200, b"N", b"A", 5),
+        record(10_200, b"N", b"A", 6),
+        record(10_300, b"ANNNN", b"A", 7),
+        record(10_300, b"ANNNN", b"A", 8),
     ];
     let metadata = Osa2Metadata {
         format_version: 2,
@@ -47,13 +51,13 @@ fn write_fixture(path: &std::path::Path, record_list: bool) {
 }
 
 #[test]
-fn record_list_returns_all_duplicate_short_and_long_records() {
+fn record_list_returns_all_duplicate_compact_long_and_raw_records() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("duplicate_keys.osa2");
     write_fixture(&path, true);
 
     let reader = Osa2Reader::open(&path).unwrap();
-    assert_eq!(reader.verify(Some("1")).unwrap().record_count, 4);
+    assert_eq!(reader.verify(Some("1")).unwrap().record_count, 8);
     assert_eq!(
         json(
             reader
@@ -71,6 +75,24 @@ fn record_list_returns_all_duplicate_short_and_long_records() {
                 .unwrap()
         ),
         r#"[{"row":3},{"row":4}]"#
+    );
+    assert_eq!(
+        json(
+            reader
+                .annotate_position("1", 10_200, "N", "A")
+                .unwrap()
+                .unwrap()
+        ),
+        r#"[{"row":5},{"row":6}]"#
+    );
+    assert_eq!(
+        json(
+            reader
+                .annotate_position("1", 10_300, "ANNNN", "A")
+                .unwrap()
+                .unwrap()
+        ),
+        r#"[{"row":7},{"row":8}]"#
     );
 }
 

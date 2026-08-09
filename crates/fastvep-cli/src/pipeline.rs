@@ -4350,7 +4350,11 @@ pub fn run_sa_convert(
         is_array: source_metadata.is_array,
         record_list: source_metadata.record_list || repair_record_list,
         is_positional: source_metadata.is_positional,
-        chunk_bits: 16,
+        chunk_bits: if source_metadata.json_key == "spliceAI" {
+            fastvep_sa::sources::spliceai::SPLICEAI_CHUNK_BITS
+        } else {
+            16
+        },
         description: source_metadata.description.clone(),
     };
 
@@ -4598,7 +4602,10 @@ chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
         assert!(source_supports_osa2("cadd"));
         assert!(source_supports_osa2("spliceai"));
         assert_eq!(cadd::cadd_osa2_metadata("GRCh38").chunk_bits, 16);
-        assert_eq!(spliceai::spliceai_osa2_metadata("GRCh38").chunk_bits, 16);
+        assert_eq!(
+            spliceai::spliceai_osa2_metadata("GRCh38").chunk_bits,
+            spliceai::SPLICEAI_CHUNK_BITS
+        );
         assert!(spliceai::spliceai_osa2_metadata("GRCh38").record_list);
         assert!(revel::revel_osa2_metadata("GRCh38").record_list);
 
@@ -4850,7 +4857,7 @@ chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
     }
 
     #[test]
-    fn osa_conversion_rejects_unrepresentable_alleles_without_publishing_output() {
+    fn osa_conversion_preserves_ambiguous_alleles() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("cadd.tsv");
         let source = dir.path().join("cadd-v1");
@@ -4875,15 +4882,19 @@ chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
         )
         .unwrap();
 
-        let error = run_sa_convert(
+        run_sa_convert(
             source.with_extension("osa").to_str().unwrap(),
             output.to_str().unwrap(),
             false,
             false,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("non-ACGT allele"));
-        assert!(!output.exists());
+        .unwrap();
+        assert!(output.exists());
+        let converted = Osa2Reader::open(&output).unwrap();
+        assert_eq!(
+            annotation_json(&converted, "chr1", 100, "N", "A"),
+            r#"{"phred":10.0,"raw":0.1}"#
+        );
         assert_eq!(
             SaReader::open(&source.with_extension("osa"))
                 .unwrap()
