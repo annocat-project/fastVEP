@@ -133,6 +133,11 @@ enum Commands {
         #[arg(long)]
         structured_output: Option<String>,
 
+        /// Omit supplementary INFO projections from VCF output. Structured
+        /// output, when requested, still contains all supplementary evidence.
+        #[arg(long, default_value_t = false)]
+        omit_supplementary_vcf: bool,
+
         /// Suppress periodic progress output
         #[arg(long, default_value_t = false)]
         no_progress: bool,
@@ -343,6 +348,7 @@ fn main() -> Result<()> {
             explicit_alleles,
             qc_rules,
             structured_output,
+            omit_supplementary_vcf,
             no_progress,
             profile_output,
         } => {
@@ -369,6 +375,7 @@ fn main() -> Result<()> {
                 explicit_alleles,
                 qc_rules,
                 structured_output,
+                omit_supplementary_vcf,
                 show_progress: !no_progress,
                 profile_output,
             })?;

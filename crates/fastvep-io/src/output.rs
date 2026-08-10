@@ -774,8 +774,18 @@ pub fn format_supplementary_vcf_info(vf: &VariationFeature) -> Vec<(String, Stri
 /// re-added only when `csq` is non-empty. This prevents stale `CSQ=` from a
 /// re-annotated VCF from leaking through in `--sa-only` mode where the CSQ
 /// header has already been removed.
-pub fn format_vcf_info_fields(original_info: &str, vf: &VariationFeature, csq: &str) -> String {
-    let mut projections = format_supplementary_vcf_info(vf);
+pub fn format_vcf_info_fields(
+    original_info: &str,
+    vf: &VariationFeature,
+    csq: &str,
+    owned_info_ids: &[&str],
+    include_supplementary: bool,
+) -> String {
+    let mut projections = if include_supplementary {
+        format_supplementary_vcf_info(vf)
+    } else {
+        Vec::new()
+    };
     if !csq.is_empty() {
         projections.push(("CSQ".to_string(), csq.to_string()));
     }
@@ -787,10 +797,7 @@ pub fn format_vcf_info_fields(original_info: &str, vf: &VariationFeature, csq: &
             .split(';')
             .filter(|field| {
                 let key = field.split_once('=').map_or(*field, |(key, _)| key);
-                if key == "CSQ" {
-                    return false;
-                }
-                !projections.iter().any(|(id, _)| id == key)
+                key != "CSQ" && !owned_info_ids.contains(&key)
             })
             .map(ToOwned::to_owned)
             .collect()
@@ -2154,8 +2161,14 @@ mod tests {
     fn vcf_info_replaces_existing_fastvep_owned_fields() {
         let vf = projection_test_variant();
         let csq = "G|missense_variant|MODERATE";
-        let info =
-            format_vcf_info_fields("DP=12;CSQ=old;SpliceAI=old;FV_CLINVAR=old;KEEP=1", &vf, csq);
+        let owned = ["CSQ", "SpliceAI", "FV_CLINVAR"];
+        let info = format_vcf_info_fields(
+            "DP=12;CSQ=old;SpliceAI=old;FV_CLINVAR=old;KEEP=1",
+            &vf,
+            csq,
+            &owned,
+            true,
+        );
 
         assert!(info.contains("DP=12"));
         assert!(info.contains("KEEP=1"));
@@ -2165,6 +2178,21 @@ mod tests {
         assert!(!info.contains("CSQ=old"));
         assert!(!info.contains("SpliceAI=old"));
         assert!(!info.contains("FV_CLINVAR=old"));
+    }
+
+    #[test]
+    fn compact_vcf_keeps_csq_but_omits_supplementary_fields() {
+        let vf = projection_test_variant();
+        let owned = ["CSQ", "SpliceAI", "FV_CLINVAR"];
+        let info = format_vcf_info_fields(
+            "DP=12;CSQ=old;SpliceAI=old;FV_CLINVAR=old;KEEP=1",
+            &vf,
+            "G|missense_variant|MODERATE",
+            &owned,
+            false,
+        );
+
+        assert_eq!(info, "DP=12;KEEP=1;CSQ=G|missense_variant|MODERATE");
     }
 
     fn all_supplementary_sa_keys() -> Vec<String> {

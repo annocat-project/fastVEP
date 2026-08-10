@@ -309,6 +309,8 @@ pub struct AnnotateConfig {
     /// This is written from the already-annotated batch, so it does not repeat
     /// consequence prediction or supplementary lookups.
     pub structured_output: Option<String>,
+    /// Omit duplicate supplementary INFO projections from VCF output.
+    pub omit_supplementary_vcf: bool,
     /// Show periodic progress output.
     pub show_progress: bool,
     /// Optional aggregate-only annotation performance profile.
@@ -782,9 +784,14 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
         .map(|gp| gp.json_key().to_string())
         .collect();
     let owned_vcf_info_ids = output::vcf_owned_info_ids(&sa_json_keys, &gene_json_keys);
+    let (vcf_sa_keys, vcf_gene_keys) = if config.omit_supplementary_vcf {
+        (&[][..], &[][..])
+    } else {
+        (sa_json_keys.as_slice(), gene_json_keys.as_slice())
+    };
     let generated_vcf_headers = output::vcf_info_header_lines(
-        &sa_json_keys,
-        &gene_json_keys,
+        vcf_sa_keys,
+        vcf_gene_keys,
         output::DEFAULT_CSQ_FIELDS,
         sa_only,
     );
@@ -1741,7 +1748,13 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             }
             let primary_output_started = phase_start(&performance);
             match config.output_format.as_str() {
-                "vcf" => write_vcf_line(&mut writer, vf, sa_only)?,
+                "vcf" => write_vcf_line(
+                    &mut writer,
+                    vf,
+                    sa_only,
+                    &owned_vcf_info_ids,
+                    !config.omit_supplementary_vcf,
+                )?,
                 "tab" => {
                     // Classify variant against QC rules (if any). The
                     // classifier reads the VCF INFO column once via a
@@ -2215,14 +2228,26 @@ fn supplementary_query_alleles(vf: &VariationFeature) -> Vec<(String, u64, Strin
         .collect()
 }
 
-fn write_vcf_line(writer: &mut impl Write, vf: &VariationFeature, sa_only: bool) -> Result<()> {
+fn write_vcf_line(
+    writer: &mut impl Write,
+    vf: &VariationFeature,
+    sa_only: bool,
+    owned_info_ids: &[&str],
+    include_supplementary: bool,
+) -> Result<()> {
     if let Some(ref fields) = vf.vcf_fields {
         let csq = if sa_only {
             String::new()
         } else {
             output::format_csq(vf, output::DEFAULT_CSQ_FIELDS)
         };
-        let info = output::format_vcf_info_fields(&fields.info, vf, &csq);
+        let info = output::format_vcf_info_fields(
+            &fields.info,
+            vf,
+            &csq,
+            owned_info_ids,
+            include_supplementary,
+        );
 
         write!(
             writer,
