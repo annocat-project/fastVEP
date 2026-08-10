@@ -136,6 +136,10 @@ enum Commands {
         /// Suppress periodic progress output
         #[arg(long, default_value_t = false)]
         no_progress: bool,
+
+        /// Write aggregate annotation performance metrics to a JSON file
+        #[arg(long)]
+        profile_output: Option<String>,
     },
 
     /// Launch the web interface for interactive variant annotation
@@ -340,6 +344,7 @@ fn main() -> Result<()> {
             qc_rules,
             structured_output,
             no_progress,
+            profile_output,
         } => {
             pipeline::run_annotate(pipeline::AnnotateConfig {
                 input,
@@ -365,6 +370,7 @@ fn main() -> Result<()> {
                 qc_rules,
                 structured_output,
                 show_progress: !no_progress,
+                profile_output,
             })?;
         }
         Commands::Cache {

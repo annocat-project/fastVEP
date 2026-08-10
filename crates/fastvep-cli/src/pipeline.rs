@@ -20,8 +20,194 @@ use std::fs::File;
 use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::parallel_records::{BatchParser, OrderedParallelRecordIter};
+
+struct TimedWriter<W> {
+    inner: W,
+    enabled: bool,
+    blocked: Duration,
+}
+
+impl<W> TimedWriter<W> {
+    fn new(inner: W, enabled: bool) -> Self {
+        Self {
+            inner,
+            enabled,
+            blocked: Duration::ZERO,
+        }
+    }
+
+    fn blocked(&self) -> Duration {
+        self.blocked
+    }
+}
+
+impl<W: Write> Write for TimedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.enabled {
+            return self.inner.write(buf);
+        }
+        let started = Instant::now();
+        let result = self.inner.write(buf);
+        self.blocked += started.elapsed();
+        result
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.enabled {
+            return self.inner.flush();
+        }
+        let started = Instant::now();
+        let result = self.inner.flush();
+        self.blocked += started.elapsed();
+        result
+    }
+}
+
+#[derive(Default)]
+struct PhaseTimings {
+    vcf_parse: Duration,
+    variation_lookup: Duration,
+    consequence: Duration,
+    supplementary_query_preparation: Duration,
+    supplementary_lookup: Duration,
+    supplementary_merge: Duration,
+    evidence_attachment: Duration,
+    compound_het: Duration,
+    primary_output: Duration,
+    structured_output: Duration,
+}
+
+struct SourceTiming {
+    name: String,
+    key: String,
+    queries: u64,
+    annotations_found: u64,
+    errors: u64,
+    elapsed: Duration,
+    cache_loads_start: Option<u64>,
+}
+
+struct PerformanceProfile {
+    started: Instant,
+    output_format: String,
+    buffer_size: usize,
+    source_loading: Duration,
+    phases: PhaseTimings,
+    sources: Vec<SourceTiming>,
+    batches: u64,
+    variants: u64,
+}
+
+struct OutputTimings {
+    primary_serialization: Duration,
+    structured_serialization: Duration,
+    output_sink_blocking: Duration,
+    structured_sink_blocking: Duration,
+}
+
+impl PerformanceProfile {
+    fn new(output_format: &str, buffer_size: usize) -> Self {
+        Self {
+            started: Instant::now(),
+            output_format: output_format.to_string(),
+            buffer_size,
+            source_loading: Duration::ZERO,
+            phases: PhaseTimings::default(),
+            sources: Vec::new(),
+            batches: 0,
+            variants: 0,
+        }
+    }
+
+    fn initialize_sources(&mut self, providers: &[Box<dyn AnnotationProvider>]) {
+        self.sources = providers
+            .iter()
+            .map(|provider| SourceTiming {
+                name: provider.name().to_string(),
+                key: provider.json_key().to_string(),
+                queries: 0,
+                annotations_found: 0,
+                errors: 0,
+                elapsed: Duration::ZERO,
+                cache_loads_start: provider.cache_load_count(),
+            })
+            .collect();
+    }
+
+    fn write(
+        &self,
+        path: &str,
+        providers: &[Box<dyn AnnotationProvider>],
+        output: OutputTimings,
+    ) -> Result<()> {
+        let sources = self
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let cache_loads = source.cache_loads_start.and_then(|start| {
+                    providers
+                        .get(index)
+                        .and_then(|provider| provider.cache_load_count())
+                        .map(|end| end.saturating_sub(start))
+                });
+                serde_json::json!({
+                    "name": source.name,
+                    "key": source.key,
+                    "queries": source.queries,
+                    "annotationsFound": source.annotations_found,
+                    "errors": source.errors,
+                    "seconds": seconds(source.elapsed),
+                    "cacheLoads": cache_loads,
+                })
+            })
+            .collect::<Vec<_>>();
+        let report = serde_json::json!({
+            "schemaVersion": 1,
+            "aggregateOnly": true,
+            "outputFormat": self.output_format,
+            "bufferSize": self.buffer_size,
+            "batches": self.batches,
+            "variants": self.variants,
+            "totalSeconds": seconds(self.started.elapsed()),
+            "phases": {
+                "supplementarySourceLoadingSeconds": seconds(self.source_loading),
+                "vcfParsingSeconds": seconds(self.phases.vcf_parse),
+                "variationLookupSeconds": seconds(self.phases.variation_lookup),
+                "consequenceCalculationSeconds": seconds(self.phases.consequence),
+                "supplementaryQueryPreparationSeconds": seconds(self.phases.supplementary_query_preparation),
+                "supplementaryLookupWallSeconds": seconds(self.phases.supplementary_lookup),
+                "supplementaryMergeSeconds": seconds(self.phases.supplementary_merge),
+                "evidenceAttachmentSeconds": seconds(self.phases.evidence_attachment),
+                "compoundHetSeconds": seconds(self.phases.compound_het),
+                "primarySerializationSeconds": seconds(output.primary_serialization),
+                "structuredSerializationSeconds": seconds(output.structured_serialization),
+                "outputSinkBlockingSeconds": seconds(output.output_sink_blocking),
+                "structuredSinkBlockingSeconds": seconds(output.structured_sink_blocking),
+            },
+            "sources": sources,
+        });
+        let bytes = serde_json::to_vec_pretty(&report)?;
+        std::fs::write(path, bytes)
+            .with_context(|| format!("Writing aggregate performance profile: {}", path))?;
+        Ok(())
+    }
+}
+
+fn seconds(duration: Duration) -> f64 {
+    duration.as_secs_f64()
+}
+
+fn phase_start(profile: &Option<PerformanceProfile>) -> Option<Instant> {
+    profile.as_ref().map(|_| Instant::now())
+}
+
+fn phase_elapsed(started: Option<Instant>) -> Duration {
+    started.map_or(Duration::ZERO, |start| start.elapsed())
+}
 
 fn open_vcf_input_reader(input: &str) -> Result<Box<dyn io::Read>> {
     let reader: Box<dyn io::Read> = if input == "-" {
@@ -94,10 +280,16 @@ pub struct AnnotateConfig {
     pub structured_output: Option<String>,
     /// Show periodic progress output.
     pub show_progress: bool,
+    /// Optional aggregate-only annotation performance profile.
+    pub profile_output: Option<String>,
 }
 
 pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     eprintln!("Annotating: {} -> {}", config.input, config.output);
+    let mut performance = config
+        .profile_output
+        .as_ref()
+        .map(|_| PerformanceProfile::new(&config.output_format, config.buffer_size.max(1)));
     let sa_only = config.sa_only;
     if sa_only {
         if config.sa_dir.is_none() {
@@ -381,6 +573,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     // Load supplementary annotation providers from --sa-dir
     // Shared load_sa_providers returns Mutex-wrapped providers; unwrap for batch pipeline
     // (batch pipeline processes variants sequentially per chunk, no concurrent access).
+    let source_loading_started = phase_start(&performance);
     let sa_providers: Vec<Box<dyn AnnotationProvider>> = if let Some(ref dir) = config.sa_dir {
         load_sa_providers(Path::new(dir))?
             .into_iter()
@@ -389,6 +582,10 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     } else {
         Vec::new()
     };
+    if let Some(profile) = performance.as_mut() {
+        profile.source_loading = phase_elapsed(source_loading_started);
+        profile.initialize_sources(&sa_providers);
+    }
 
     if sa_only && sa_providers.is_empty() {
         eprintln!(
@@ -531,14 +728,18 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     // emits dozens of small `write!` calls per row, so a larger buffer cuts
     // the number of syscalls on a typical VCF (millions of variants) by
     // roughly two orders of magnitude.
-    let mut writer = BufWriter::with_capacity(1 << 20, output_writer);
+    let profiling_enabled = performance.is_some();
+    let mut writer =
+        BufWriter::with_capacity(1 << 20, TimedWriter::new(output_writer, profiling_enabled));
     let mut structured_writer = config
         .structured_output
         .as_ref()
         .map(|path| {
             File::create(path)
                 .with_context(|| format!("Creating structured output: {}", path))
-                .map(|file| BufWriter::with_capacity(1 << 20, file))
+                .map(|file| {
+                    BufWriter::with_capacity(1 << 20, TimedWriter::new(file, profiling_enabled))
+                })
         })
         .transpose()?;
     let sa_json_keys: Vec<String> = sa_providers
@@ -615,6 +816,11 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
         _ => {}
     }
 
+    let output_sink_baseline = writer.get_ref().blocked();
+    let structured_sink_baseline = structured_writer
+        .as_ref()
+        .map_or(Duration::ZERO, |sidecar| sidecar.get_ref().blocked());
+
     // Process variants in batches for parallel annotation
     let mut meter = crate::progress::ProgressMeter::new(config.show_progress);
     let mut first_json = true;
@@ -625,9 +831,15 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
         let mut batch: Vec<(VariationFeature, HashMap<String, Vec<MatchedVariant>>)> =
             Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
-            match vcf_parser.next_variant()? {
+            let parsing_started = phase_start(&performance);
+            let next_variant = vcf_parser.next_variant()?;
+            if let Some(profile) = performance.as_mut() {
+                profile.phases.vcf_parse += phase_elapsed(parsing_started);
+            }
+            match next_variant {
                 Some(mut vf) => {
                     // Variation lookup (sequential - TabixVariationProvider is not Sync)
+                    let variation_started = phase_start(&performance);
                     let matched_by_allele: HashMap<String, Vec<MatchedVariant>> =
                         if let Some(ref vp) = var_provider {
                             let mut by_allele = HashMap::new();
@@ -651,6 +863,9 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                         } else {
                             HashMap::new()
                         };
+                    if let Some(profile) = performance.as_mut() {
+                        profile.phases.variation_lookup += phase_elapsed(variation_started);
+                    }
 
                     // Populate existing_variants on the VF for output access
                     for matches in matched_by_allele.values() {
@@ -681,8 +896,13 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
         if batch.is_empty() {
             break;
         }
+        if let Some(profile) = performance.as_mut() {
+            profile.batches += 1;
+            profile.variants += batch.len() as u64;
+        }
 
         // Phase 2: Annotate batch in parallel (transcript lookup + consequence prediction + HGVS)
+        let consequence_started = phase_start(&performance);
         batch.par_iter_mut().for_each(|(vf, matched_by_allele)| {
             // In --sa-only mode, skip transcript lookup + consequence
             // prediction + HGVS entirely. Use a neutral scaffold so the SA
@@ -1234,9 +1454,13 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                 }
             }
         });
+        if let Some(profile) = performance.as_mut() {
+            profile.phases.consequence += phase_elapsed(consequence_started);
+        }
 
         // Query each supplementary provider in input order so its block cache
         // advances monotonically. Independent providers still run in parallel.
+        let query_preparation_started = phase_start(&performance);
         let sa_queries_by_variant: Vec<Vec<(String, u64, String, String)>> = batch
             .iter()
             .map(|(vf, _)| {
@@ -1268,16 +1492,28 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                 queries
             })
             .collect();
+        if let Some(profile) = performance.as_mut() {
+            profile.phases.supplementary_query_preparation +=
+                phase_elapsed(query_preparation_started);
+        }
+        let supplementary_lookup_started = phase_start(&performance);
         let provider_results = sa_providers
             .par_iter()
             .map(|sa| {
+                let provider_started = profiling_enabled.then(Instant::now);
                 let source_key = sa.json_key().to_string();
                 let mut results = Vec::new();
+                let mut queries_run = 0_u64;
+                let mut annotations_found = 0_u64;
+                let mut errors = 0_u64;
                 for (variant_index, ((vf, _), queries)) in
                     batch.iter().zip(&sa_queries_by_variant).enumerate()
                 {
                     let chrom = &vf.position.chromosome;
                     for (allele_key, query_pos, ref_str, alt_str) in queries {
+                        if profiling_enabled {
+                            queries_run += 1;
+                        }
                         // gnomAD stores normalized alleles; other providers use
                         // the uploaded representation retained above.
                         let gnomad_norm = if source_key == "gnomad" {
@@ -1303,31 +1539,60 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                         } else {
                             (vf.position.start, "", "")
                         };
-                        if let Ok(Some(annotation)) =
-                            sa.annotate_position(chrom, sa_pos, sa_ref, sa_alt)
-                        {
-                            let json = match annotation {
-                                AnnotationValue::Json(json) => json,
-                                AnnotationValue::Positional(json) => json,
-                                AnnotationValue::Interval(values) => {
-                                    format!("[{}]", values.join(","))
+                        match sa.annotate_position(chrom, sa_pos, sa_ref, sa_alt) {
+                            Ok(Some(annotation)) => {
+                                if profiling_enabled {
+                                    annotations_found += 1;
                                 }
-                            };
-                            results.push((
-                                variant_index,
-                                allele_key.clone(),
-                                source_key.clone(),
-                                json,
-                            ));
+                                let json = match annotation {
+                                    AnnotationValue::Json(json) => json,
+                                    AnnotationValue::Positional(json) => json,
+                                    AnnotationValue::Interval(values) => {
+                                        format!("[{}]", values.join(","))
+                                    }
+                                };
+                                results.push((
+                                    variant_index,
+                                    allele_key.clone(),
+                                    source_key.clone(),
+                                    json,
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                if profiling_enabled {
+                                    errors += 1;
+                                }
+                            }
                         }
                     }
                 }
-                results
+                (
+                    results,
+                    queries_run,
+                    annotations_found,
+                    errors,
+                    phase_elapsed(provider_started),
+                )
             })
             .collect::<Vec<_>>();
+        if let Some(profile) = performance.as_mut() {
+            profile.phases.supplementary_lookup += phase_elapsed(supplementary_lookup_started);
+        }
+        let supplementary_merge_started = phase_start(&performance);
         let mut batch_sa_results =
             vec![HashMap::<String, Vec<(String, String)>>::new(); batch.len()];
-        for results in provider_results {
+        for (provider_index, (results, queries, found, errors, elapsed)) in
+            provider_results.into_iter().enumerate()
+        {
+            if let Some(profile) = performance.as_mut() {
+                if let Some(source) = profile.sources.get_mut(provider_index) {
+                    source.queries += queries;
+                    source.annotations_found += found;
+                    source.errors += errors;
+                    source.elapsed += elapsed;
+                }
+            }
             for (variant_index, allele_key, source_key, json) in results {
                 batch_sa_results[variant_index]
                     .entry(allele_key)
@@ -1335,7 +1600,11 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                     .push((source_key, json));
             }
         }
+        if let Some(profile) = performance.as_mut() {
+            profile.phases.supplementary_merge += phase_elapsed(supplementary_merge_started);
+        }
 
+        let evidence_attachment_started = phase_start(&performance);
         batch
             .par_iter_mut()
             .zip(batch_sa_results.par_iter())
@@ -1411,8 +1680,12 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                     vf.compute_most_severe();
                 }
             }); // end par_iter_mut
+        if let Some(profile) = performance.as_mut() {
+            profile.phases.evidence_attachment += phase_elapsed(evidence_attachment_started);
+        }
 
         // Phase 2.5: Compound-het enrichment pass (sequential, after parallel annotation)
+        let compound_het_started = phase_start(&performance);
         if let Some(ref acmg_cfg) = acmg_config {
             if acmg_cfg.trio.is_some() {
                 let mut vfs: Vec<&mut VariationFeature> =
@@ -1420,14 +1693,22 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                 enrich_compound_het_batch(&mut vfs, acmg_cfg, &sample_names);
             }
         }
+        if let Some(profile) = performance.as_mut() {
+            profile.phases.compound_het += phase_elapsed(compound_het_started);
+        }
 
         // Phase 3: Write output sequentially (preserves VCF order)
         for (vf, _) in &batch {
             if let Some(sidecar) = structured_writer.as_mut() {
+                let structured_started = phase_start(&performance);
                 let json = output::format_json(vf, sa_only);
                 serde_json::to_writer(&mut *sidecar, &json)?;
                 writeln!(sidecar)?;
+                if let Some(profile) = performance.as_mut() {
+                    profile.phases.structured_output += phase_elapsed(structured_started);
+                }
             }
+            let primary_output_started = phase_start(&performance);
             match config.output_format.as_str() {
                 "vcf" => write_vcf_line(&mut writer, vf, sa_only)?,
                 "tab" => {
@@ -1471,21 +1752,66 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                 }
                 _ => {}
             }
+            if let Some(profile) = performance.as_mut() {
+                profile.phases.primary_output += phase_elapsed(primary_output_started);
+            }
         }
 
         meter.update_n(batch.len() as u64);
     } // end batch loop
 
     // Close JSON array
+    let output_close_started = phase_start(&performance);
     if config.output_format == "json" {
         writeln!(writer, "\n]")?;
     }
+    if let Some(profile) = performance.as_mut() {
+        profile.phases.primary_output += phase_elapsed(output_close_started);
+    }
+
+    let output_sink_during_rows = writer
+        .get_ref()
+        .blocked()
+        .saturating_sub(output_sink_baseline);
+    let structured_sink_during_rows =
+        structured_writer
+            .as_ref()
+            .map_or(Duration::ZERO, |sidecar| {
+                sidecar
+                    .get_ref()
+                    .blocked()
+                    .saturating_sub(structured_sink_baseline)
+            });
     if let Some(sidecar) = structured_writer.as_mut() {
         sidecar.flush()?;
     }
 
     writer.flush()?;
     meter.finish();
+
+    if let (Some(profile), Some(path)) = (performance.as_ref(), config.profile_output.as_deref()) {
+        let primary_serialization = profile
+            .phases
+            .primary_output
+            .saturating_sub(output_sink_during_rows);
+        let structured_serialization = profile
+            .phases
+            .structured_output
+            .saturating_sub(structured_sink_during_rows);
+        let structured_sink_blocking = structured_writer
+            .as_ref()
+            .map_or(Duration::ZERO, |sidecar| sidecar.get_ref().blocked());
+        profile.write(
+            path,
+            &sa_providers,
+            OutputTimings {
+                primary_serialization,
+                structured_serialization,
+                output_sink_blocking: writer.get_ref().blocked(),
+                structured_sink_blocking,
+            },
+        )?;
+    }
 
     Ok(())
 }

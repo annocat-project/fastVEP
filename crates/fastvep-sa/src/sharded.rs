@@ -166,6 +166,14 @@ impl AnnotationProvider for ShardedSaReader {
         &self.metadata
     }
 
+    fn cache_load_count(&self) -> Option<u64> {
+        let mut total = 0_u64;
+        for reader in &self.readers {
+            total = total.checked_add(reader.cache_load_count()?)?;
+        }
+        Some(total)
+    }
+
     fn annotate_position(
         &self,
         chrom: &str,

@@ -93,6 +93,13 @@ impl AnnotationProvider for AnySaReader {
         }
     }
 
+    fn cache_load_count(&self) -> Option<u64> {
+        match self {
+            Self::OsaV1(reader) => Some(reader.decompress_count()),
+            Self::OsaV2(reader) => Some(reader.chunk_load_count()),
+        }
+    }
+
     fn annotate_position(
         &self,
         chrom: &str,
@@ -604,6 +611,10 @@ impl AnnotationProvider for SaReader {
 
     fn metadata(&self) -> &SaMetadata {
         &self.metadata
+    }
+
+    fn cache_load_count(&self) -> Option<u64> {
+        Some(self.decompress_count())
     }
 
     fn annotate_position(

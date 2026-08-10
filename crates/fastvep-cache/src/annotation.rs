@@ -60,6 +60,12 @@ pub trait AnnotationProvider: Send + Sync {
     /// Metadata about this annotation source.
     fn metadata(&self) -> &SaMetadata;
 
+    /// Number of underlying cache blocks or chunks loaded since this provider
+    /// was opened. Providers without a block cache return `None`.
+    fn cache_load_count(&self) -> Option<u64> {
+        None
+    }
+
     /// Look up annotations for a specific variant position and alleles.
     ///
     /// Returns `None` if no annotation exists for this position/allele combination.

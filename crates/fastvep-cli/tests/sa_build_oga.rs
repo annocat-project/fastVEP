@@ -231,6 +231,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
     let output_v2_vcf = tmp.path().join("annotated-v2.vcf");
     let output_v1_json = tmp.path().join("annotated-v1.jsonl");
     let output_v2_json = tmp.path().join("annotated-v2.jsonl");
+    let performance_profile = tmp.path().join("annotation-performance.json");
     let transcript_cache = tmp.path().join("mini.fastvep.cache");
 
     fs::write(&spliceai_source, SPLICEAI_SOURCE_VCF).unwrap();
@@ -290,8 +291,27 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         qc_rules: None,
         structured_output: Some(output_v1_json.to_string_lossy().into_owned()),
         show_progress: false,
+        profile_output: Some(performance_profile.to_string_lossy().into_owned()),
     })
     .unwrap();
+
+    let profile: serde_json::Value =
+        serde_json::from_slice(&fs::read(&performance_profile).unwrap()).unwrap();
+    assert_eq!(profile["schemaVersion"], 1);
+    assert_eq!(profile["aggregateOnly"], true);
+    assert!(profile["variants"].as_u64().unwrap() > 0);
+    assert!(profile["phases"]["vcfParsingSeconds"].is_number());
+    assert!(
+        profile["sources"].as_array().unwrap().iter().any(|source| {
+            source["key"] == "spliceAI"
+                && source["queries"].is_number()
+                && source["cacheLoads"].is_number()
+        }),
+        "profile: {}",
+        profile
+    );
+    assert!(profile.get("input").is_none());
+    assert!(profile.get("output").is_none());
 
     let annotated = fs::read_to_string(&output_v1_vcf).unwrap();
 
@@ -360,6 +380,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         qc_rules: None,
         structured_output: Some(output_v2_json.to_string_lossy().into_owned()),
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -456,6 +477,7 @@ chr1\t26011\t2.71
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -537,6 +559,7 @@ fn annotate_vcf_replaces_existing_fastvep_info() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -607,6 +630,7 @@ fn annotate_vcf_emits_fastsa_projection_for_gnomad() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -676,6 +700,7 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -802,6 +827,7 @@ fn sa_only_vcf_omits_csq_and_default_pipeline() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -865,6 +891,7 @@ fn sa_only_tab_emits_minimal_columns() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -936,6 +963,7 @@ fn sa_only_json_omits_transcript_consequences() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -1032,6 +1060,7 @@ fn sa_only_requires_sa_dir() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .expect_err("--sa-only without --sa-dir must error");
     assert!(
@@ -1102,6 +1131,7 @@ fn sa_only_multi_allelic_emits_per_alt_rows_with_independent_sa_columns() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -1180,6 +1210,7 @@ fn sa_only_strips_preexisting_csq_from_input_info() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -1252,6 +1283,7 @@ fn sa_only_strips_csq_when_in_middle_of_info_field() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -1348,6 +1380,7 @@ fn intergenic_variant_with_sa_dir_in_default_mode_emits_fv_clinvar() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -1410,6 +1443,7 @@ fn annotate_tab_gene_list_filters_to_panel_genes() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -1464,6 +1498,7 @@ fn annotate_tab_explicit_alleles_inserts_ref_column() {
         qc_rules: None,
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 
@@ -1550,6 +1585,7 @@ min_dp = 8
         qc_rules: Some(qc_rules_path.to_string_lossy().into_owned()),
         structured_output: None,
         show_progress: false,
+        profile_output: None,
     })
     .unwrap();
 

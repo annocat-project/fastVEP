@@ -1001,6 +1001,10 @@ impl AnnotationProvider for Osa2Reader {
         &self.sa_metadata
     }
 
+    fn cache_load_count(&self) -> Option<u64> {
+        Some(self.chunk_load_count())
+    }
+
     fn annotate_position(
         &self,
         chrom: &str,
