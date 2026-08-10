@@ -12,7 +12,7 @@
 //! queried in parallel neither serializes on a lock nor thrashes a too-small
 //! per-reader cache. See [`crate::common::sa_cache_budget_bytes`].
 
-use crate::chunk::{delta_decode, Chunk, RawVariant};
+use crate::chunk::{delta_decode, Chunk, JsonBlobLines, RawVariant};
 use crate::common::chrom_aliases;
 use crate::fields::{Field, FieldType};
 use crate::kmer16::LongVariant;
@@ -71,11 +71,7 @@ fn chunk_bytes(c: &Chunk) -> usize {
         .iter()
         .map(|col| col.len() * std::mem::size_of::<u32>())
         .sum();
-    let blobs: usize = c.json_blobs.as_ref().map_or(0, |b| {
-        b.iter()
-            .map(|s| s.len() + std::mem::size_of::<String>())
-            .sum()
-    });
+    let blobs = c.json_blobs.as_ref().map_or(0, JsonBlobLines::heap_bytes);
     v32.saturating_add(longs)
         .saturating_add(raws)
         .saturating_add(vals)
@@ -885,7 +881,7 @@ impl Osa2Reader {
                         .fetch_add(decompressed.len() as u64, Ordering::Relaxed);
                 }
                 let text = String::from_utf8(decompressed)?;
-                let blobs = text.split('\n').map(str::to_string).collect();
+                let blobs = JsonBlobLines::from_text(text);
                 Self::add_elapsed(&self.json_blob_decode_nanos, decode_started);
                 Some(blobs)
             }

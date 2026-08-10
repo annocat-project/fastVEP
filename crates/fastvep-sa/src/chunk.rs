@@ -6,6 +6,47 @@
 use crate::fields::{Field, FieldType};
 use crate::kmer16::LongVariant;
 
+/// Newline-delimited JSON records stored as one allocation plus compact line
+/// ends. OSA2 chunks are capped well below `u32::MAX` bytes by the reader.
+pub struct JsonBlobLines {
+    text: String,
+    ends: Vec<u32>,
+}
+
+impl JsonBlobLines {
+    pub fn from_text(text: String) -> Self {
+        debug_assert!(u32::try_from(text.len()).is_ok());
+        let mut ends = Vec::new();
+        for (index, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                ends.push(index as u32);
+            }
+        }
+        ends.push(text.len() as u32);
+        Self { text, ends }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&str> {
+        let end = *self.ends.get(index)? as usize;
+        let start = if index == 0 {
+            0
+        } else {
+            self.ends[index - 1] as usize + 1
+        };
+        self.text.get(start..end)
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.text
+            .capacity()
+            .saturating_add(self.ends.capacity() * std::mem::size_of::<u32>())
+    }
+}
+
 /// A variant whose allele bytes cannot use the compact A/C/G/T encodings.
 /// These records are rare and stay in a separate sorted overflow array so
 /// ordinary OSA2 lookups keep the existing fast path.
@@ -58,8 +99,8 @@ pub struct Chunk {
     /// `reconstruct_json` tracks a separate counter that advances only for
     /// non-JsonBlob fields when indexing into this array.
     pub values: Vec<Vec<u32>>,
-    /// Optional JSON blob strings for JsonBlob fields.
-    pub json_blobs: Option<Vec<String>>,
+    /// Optional newline-delimited JSON blobs for JsonBlob fields.
+    pub json_blobs: Option<JsonBlobLines>,
 }
 
 impl Chunk {
@@ -180,16 +221,16 @@ impl Chunk {
         for (fi, field) in fields.iter().enumerate() {
             if field.ftype == FieldType::JsonBlob {
                 if let Some(ref blobs) = self.json_blobs {
-                    if idx < blobs.len() && !blobs[idx].is_empty() {
+                    if let Some(blob) = blobs.get(idx).filter(|blob| !blob.is_empty()) {
                         // An empty alias marks a whole-record blob (see
                         // `writer_v2::raw_json_blob_fields`): the stored blob is
                         // the complete record object, so emit it verbatim rather
                         // than nesting it under a key. Such sources carry this
                         // as their sole field, so returning here is correct.
                         if field.alias.is_empty() {
-                            return blobs[idx].clone();
+                            return blob.to_owned();
                         }
-                        parts.push(format!("\"{}\":{}", field.alias, blobs[idx]));
+                        parts.push(format!("\"{}\":{}", field.alias, blob));
                     }
                 }
                 continue;
@@ -335,7 +376,7 @@ mod tests {
         chunk.var32s = vec![var32::encode(100, b"A", b"G").unwrap()];
         // Two non-JsonBlob columns, in field order: AF then AC.
         chunk.values = vec![vec![1234], vec![42]];
-        chunk.json_blobs = Some(vec![r#"{"k":1}"#.to_string()]);
+        chunk.json_blobs = Some(JsonBlobLines::from_text(r#"{"k":1}"#.to_string()));
 
         let json = chunk.reconstruct_json(0, &fields, &[]);
         assert!(json.contains("\"af\":"), "missing af in: {}", json);
@@ -365,7 +406,7 @@ mod tests {
         let mut chunk = Chunk::empty();
         chunk.var32s = vec![var32::encode(100, b"A", b"G").unwrap()];
         let blob = r#"{"significance":["Pathogenic"],"reviewStatus":"criteria_provided"}"#;
-        chunk.json_blobs = Some(vec![blob.to_string()]);
+        chunk.json_blobs = Some(JsonBlobLines::from_text(blob.to_string()));
 
         let json = chunk.reconstruct_json(0, &fields, &[]);
         assert_eq!(json, blob, "whole-record blob must round-trip verbatim");
@@ -406,5 +447,20 @@ mod tests {
         let json = chunk.reconstruct_json(0, &fields, &[]);
         assert!(json.contains("\"allAf\":"));
         assert!(json.contains("\"allAc\":42"));
+    }
+
+    #[test]
+    fn json_blob_lines_match_split_semantics() {
+        let lines = JsonBlobLines::from_text("first\n\nthird\n".to_string());
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.get(0), Some("first"));
+        assert_eq!(lines.get(1), Some(""));
+        assert_eq!(lines.get(2), Some("third"));
+        assert_eq!(lines.get(3), Some(""));
+        assert_eq!(lines.get(4), None);
+
+        let empty = JsonBlobLines::from_text(String::new());
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty.get(0), Some(""));
     }
 }
