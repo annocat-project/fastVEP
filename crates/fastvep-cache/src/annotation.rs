@@ -55,6 +55,8 @@ pub struct ProviderPerformanceSnapshot {
     pub decompressed_bytes: u64,
     pub chunk_build_nanos: u64,
     pub inflate_nanos: u64,
+    pub json_blob_bytes: u64,
+    pub json_blob_decode_nanos: u64,
     pub reconstruction_nanos: u64,
 }
 
@@ -73,6 +75,10 @@ impl ProviderPerformanceSnapshot {
                 .chunk_build_nanos
                 .saturating_sub(earlier.chunk_build_nanos),
             inflate_nanos: self.inflate_nanos.saturating_sub(earlier.inflate_nanos),
+            json_blob_bytes: self.json_blob_bytes.saturating_sub(earlier.json_blob_bytes),
+            json_blob_decode_nanos: self
+                .json_blob_decode_nanos
+                .saturating_sub(earlier.json_blob_decode_nanos),
             reconstruction_nanos: self
                 .reconstruction_nanos
                 .saturating_sub(earlier.reconstruction_nanos),
@@ -92,6 +98,10 @@ impl std::ops::AddAssign for ProviderPerformanceSnapshot {
             .chunk_build_nanos
             .saturating_add(other.chunk_build_nanos);
         self.inflate_nanos = self.inflate_nanos.saturating_add(other.inflate_nanos);
+        self.json_blob_bytes = self.json_blob_bytes.saturating_add(other.json_blob_bytes);
+        self.json_blob_decode_nanos = self
+            .json_blob_decode_nanos
+            .saturating_add(other.json_blob_decode_nanos);
         self.reconstruction_nanos = self
             .reconstruction_nanos
             .saturating_add(other.reconstruction_nanos);

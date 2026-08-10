@@ -297,7 +297,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
 
     let profile: serde_json::Value =
         serde_json::from_slice(&fs::read(&performance_profile).unwrap()).unwrap();
-    assert_eq!(profile["schemaVersion"], 2);
+    assert_eq!(profile["schemaVersion"], 3);
     assert_eq!(profile["aggregateOnly"], true);
     assert!(profile["variants"].as_u64().unwrap() > 0);
     assert!(profile["phases"]["vcfParsingSeconds"].is_number());
@@ -312,6 +312,8 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
                 && source["reader"]["decompressedBytes"].is_number()
                 && source["reader"]["chunkBuildSeconds"].is_number()
                 && source["reader"]["inflateSeconds"].is_number()
+                && source["reader"]["jsonBlobBytes"].is_number()
+                && source["reader"]["jsonBlobDecodeSeconds"].is_number()
                 && source["reader"]["reconstructionSeconds"].is_number()
         }),
         "profile: {}",

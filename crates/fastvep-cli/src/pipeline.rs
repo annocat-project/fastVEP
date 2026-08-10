@@ -175,6 +175,8 @@ impl PerformanceProfile {
                         "decompressedBytes": reader.decompressed_bytes,
                         "chunkBuildSeconds": seconds_from_nanos(reader.chunk_build_nanos),
                         "inflateSeconds": seconds_from_nanos(reader.inflate_nanos),
+                        "jsonBlobBytes": reader.json_blob_bytes,
+                        "jsonBlobDecodeSeconds": seconds_from_nanos(reader.json_blob_decode_nanos),
                         "reconstructionSeconds": seconds_from_nanos(reader.reconstruction_nanos),
                     })
                 });
@@ -191,7 +193,7 @@ impl PerformanceProfile {
             })
             .collect::<Vec<_>>();
         let report = serde_json::json!({
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "aggregateOnly": true,
             "outputFormat": self.output_format,
             "bufferSize": self.buffer_size,

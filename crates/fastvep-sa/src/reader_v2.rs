@@ -164,6 +164,8 @@ pub struct Osa2Reader {
     decompressed_bytes: AtomicU64,
     chunk_build_nanos: AtomicU64,
     inflate_nanos: AtomicU64,
+    json_blob_bytes: AtomicU64,
+    json_blob_decode_nanos: AtomicU64,
     reconstruction_nanos: AtomicU64,
     metadata: Osa2Metadata,
     sa_metadata: SaMetadata,
@@ -388,6 +390,8 @@ impl Osa2Reader {
             decompressed_bytes: AtomicU64::new(0),
             chunk_build_nanos: AtomicU64::new(0),
             inflate_nanos: AtomicU64::new(0),
+            json_blob_bytes: AtomicU64::new(0),
+            json_blob_decode_nanos: AtomicU64::new(0),
             reconstruction_nanos: AtomicU64::new(0),
             metadata,
             sa_metadata,
@@ -425,6 +429,8 @@ impl Osa2Reader {
             decompressed_bytes: self.decompressed_bytes.load(Ordering::Relaxed),
             chunk_build_nanos: self.chunk_build_nanos.load(Ordering::Relaxed),
             inflate_nanos: self.inflate_nanos.load(Ordering::Relaxed),
+            json_blob_bytes: self.json_blob_bytes.load(Ordering::Relaxed),
+            json_blob_decode_nanos: self.json_blob_decode_nanos.load(Ordering::Relaxed),
             reconstruction_nanos: self.reconstruction_nanos.load(Ordering::Relaxed),
         }
     }
@@ -862,6 +868,7 @@ impl Osa2Reader {
         // JSON blobs, if any (content is zstd-compressed inside the ZIP entry).
         let json_blobs = match self.read_entry(&format!("{}json_blobs.zst", prefix))? {
             Some(buf) => {
+                let decode_started = self.profiling_started();
                 let mut decoder = zstd::stream::Decoder::new(buf.as_slice())?;
                 let mut decompressed = Vec::new();
                 (&mut decoder)
@@ -873,8 +880,14 @@ impl Osa2Reader {
                         MAX_JSON_BLOB_DECOMPRESSED
                     );
                 }
+                if decode_started.is_some() {
+                    self.json_blob_bytes
+                        .fetch_add(decompressed.len() as u64, Ordering::Relaxed);
+                }
                 let text = String::from_utf8(decompressed)?;
-                Some(text.split('\n').map(str::to_string).collect())
+                let blobs = text.split('\n').map(str::to_string).collect();
+                Self::add_elapsed(&self.json_blob_decode_nanos, decode_started);
+                Some(blobs)
             }
             None => None,
         };

@@ -495,6 +495,7 @@ impl SaReader {
             chunk_build_nanos: self.chunk_build_nanos.load(Ordering::Relaxed),
             inflate_nanos: self.inflate_nanos.load(Ordering::Relaxed),
             reconstruction_nanos: self.reconstruction_nanos.load(Ordering::Relaxed),
+            ..ProviderPerformanceSnapshot::default()
         }
     }
 
