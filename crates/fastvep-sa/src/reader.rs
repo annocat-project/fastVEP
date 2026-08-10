@@ -10,14 +10,17 @@ use crate::common::{chrom_aliases, OSA_MAGIC, OSA_SCHEMA_VERSION, SCHEMA_VERSION
 use crate::index::{BlockRef, SaIndex};
 use crate::reader_v2::Osa2Reader;
 use anyhow::Result;
-use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
+use fastvep_cache::annotation::{
+    AnnotationProvider, AnnotationValue, ProviderPerformanceSnapshot, SaMetadata,
+};
 use lru::LruCache;
 use memmap2::Mmap;
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +100,20 @@ impl AnnotationProvider for AnySaReader {
         match self {
             Self::OsaV1(reader) => Some(reader.decompress_count()),
             Self::OsaV2(reader) => Some(reader.chunk_load_count()),
+        }
+    }
+
+    fn set_performance_profiling(&self, enabled: bool) {
+        match self {
+            Self::OsaV1(reader) => reader.set_performance_profiling(enabled),
+            Self::OsaV2(reader) => reader.set_performance_profiling(enabled),
+        }
+    }
+
+    fn performance_snapshot(&self) -> Option<ProviderPerformanceSnapshot> {
+        match self {
+            Self::OsaV1(reader) => reader.performance_snapshot(),
+            Self::OsaV2(reader) => reader.performance_snapshot(),
         }
     }
 
@@ -258,6 +275,13 @@ pub struct SaReader {
     /// touched indicates the block cache is too small for the parallel working
     /// set. Exposed via `decompress_count()`.
     decompress_count: AtomicU64,
+    profiling_enabled: AtomicBool,
+    cache_hit_count: AtomicU64,
+    compressed_bytes: AtomicU64,
+    decompressed_bytes: AtomicU64,
+    chunk_build_nanos: AtomicU64,
+    inflate_nanos: AtomicU64,
+    reconstruction_nanos: AtomicU64,
 }
 
 impl SaReader {
@@ -317,6 +341,13 @@ impl SaReader {
             reader_id: NEXT_READER_ID.fetch_add(1, Ordering::Relaxed),
             local_cache: local_budget.map(|b| Mutex::new(BlockCache::new(b))),
             decompress_count: AtomicU64::new(0),
+            profiling_enabled: AtomicBool::new(false),
+            cache_hit_count: AtomicU64::new(0),
+            compressed_bytes: AtomicU64::new(0),
+            decompressed_bytes: AtomicU64::new(0),
+            chunk_build_nanos: AtomicU64::new(0),
+            inflate_nanos: AtomicU64::new(0),
+            reconstruction_nanos: AtomicU64::new(0),
         })
     }
 
@@ -442,6 +473,31 @@ impl SaReader {
         self.decompress_count.load(Ordering::Relaxed)
     }
 
+    fn profiling_started(&self) -> Option<Instant> {
+        self.profiling_enabled
+            .load(Ordering::Relaxed)
+            .then(Instant::now)
+    }
+
+    fn add_elapsed(counter: &AtomicU64, started: Option<Instant>) {
+        if let Some(started) = started {
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            counter.fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    fn performance_snapshot_value(&self) -> ProviderPerformanceSnapshot {
+        ProviderPerformanceSnapshot {
+            cache_hits: self.cache_hit_count.load(Ordering::Relaxed),
+            cache_misses: self.decompress_count.load(Ordering::Relaxed),
+            compressed_bytes: self.compressed_bytes.load(Ordering::Relaxed),
+            decompressed_bytes: self.decompressed_bytes.load(Ordering::Relaxed),
+            chunk_build_nanos: self.chunk_build_nanos.load(Ordering::Relaxed),
+            inflate_nanos: self.inflate_nanos.load(Ordering::Relaxed),
+            reconstruction_nanos: self.reconstruction_nanos.load(Ordering::Relaxed),
+        }
+    }
+
     /// The block cache this reader writes to: its private one if configured,
     /// otherwise the process-wide shared cache.
     fn cache(&self) -> &Mutex<BlockCache> {
@@ -503,6 +559,9 @@ impl SaReader {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("SA block cache mutex poisoned"))?;
             if let Some(arc) = cache.get(key) {
+                if self.profiling_enabled.load(Ordering::Relaxed) {
+                    self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(arc);
             }
         }
@@ -511,7 +570,20 @@ impl SaReader {
         // serve their own queries from the cache concurrently. If two threads
         // race on the same missing block they each decompress once; the second
         // `put` simply replaces an identical entry — acceptable for an LRU.
+        let profiling_enabled = self.profiling_enabled.load(Ordering::Relaxed);
+        if profiling_enabled {
+            self.compressed_bytes
+                .fetch_add(block_ref.compressed_len as u64, Ordering::Relaxed);
+        }
+        let inflate_started = profiling_enabled.then(Instant::now);
+        let chunk_started = inflate_started;
         let entries = self.decompress_block(block_ref.file_offset, block_ref.compressed_len)?;
+        Self::add_elapsed(&self.inflate_nanos, inflate_started);
+        Self::add_elapsed(&self.chunk_build_nanos, chunk_started);
+        if profiling_enabled {
+            self.decompressed_bytes
+                .fetch_add(block_bytes(&entries) as u64, Ordering::Relaxed);
+        }
         self.decompress_count.fetch_add(1, Ordering::Relaxed);
         let bytes = block_bytes(&entries);
         let arc = Arc::new(entries);
@@ -536,13 +608,24 @@ impl SaReader {
             let mut matches = Vec::new();
             for block_ref in block_refs {
                 let entries = self.get_block(block_ref)?;
+                let reconstruction_started = self.profiling_started();
                 self.find_matches(&entries, position, ref_allele, alt_allele, &mut matches);
+                Self::add_elapsed(&self.reconstruction_nanos, reconstruction_started);
             }
-            return Ok((!matches.is_empty()).then(|| format!("[{}]", matches.join(","))));
+            if matches.is_empty() {
+                return Ok(None);
+            }
+            let reconstruction_started = self.profiling_started();
+            let result = format!("[{}]", matches.join(","));
+            Self::add_elapsed(&self.reconstruction_nanos, reconstruction_started);
+            return Ok(Some(result));
         }
         for block_ref in block_refs {
             let entries = self.get_block(block_ref)?;
-            if let Some(json) = self.find_match(&entries, position, ref_allele, alt_allele) {
+            let reconstruction_started = self.profiling_started();
+            let result = self.find_match(&entries, position, ref_allele, alt_allele);
+            Self::add_elapsed(&self.reconstruction_nanos, reconstruction_started);
+            if let Some(json) = result {
                 return Ok(Some(json));
             }
         }
@@ -615,6 +698,14 @@ impl AnnotationProvider for SaReader {
 
     fn cache_load_count(&self) -> Option<u64> {
         Some(self.decompress_count())
+    }
+
+    fn set_performance_profiling(&self, enabled: bool) {
+        self.profiling_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn performance_snapshot(&self) -> Option<ProviderPerformanceSnapshot> {
+        Some(self.performance_snapshot_value())
     }
 
     fn annotate_position(

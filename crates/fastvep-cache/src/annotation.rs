@@ -46,6 +46,58 @@ pub struct SaMetadata {
     pub is_positional: bool,
 }
 
+/// Aggregate cache-reader work collected only when profiling is enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderPerformanceSnapshot {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub compressed_bytes: u64,
+    pub decompressed_bytes: u64,
+    pub chunk_build_nanos: u64,
+    pub inflate_nanos: u64,
+    pub reconstruction_nanos: u64,
+}
+
+impl ProviderPerformanceSnapshot {
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            cache_misses: self.cache_misses.saturating_sub(earlier.cache_misses),
+            compressed_bytes: self
+                .compressed_bytes
+                .saturating_sub(earlier.compressed_bytes),
+            decompressed_bytes: self
+                .decompressed_bytes
+                .saturating_sub(earlier.decompressed_bytes),
+            chunk_build_nanos: self
+                .chunk_build_nanos
+                .saturating_sub(earlier.chunk_build_nanos),
+            inflate_nanos: self.inflate_nanos.saturating_sub(earlier.inflate_nanos),
+            reconstruction_nanos: self
+                .reconstruction_nanos
+                .saturating_sub(earlier.reconstruction_nanos),
+        }
+    }
+}
+
+impl std::ops::AddAssign for ProviderPerformanceSnapshot {
+    fn add_assign(&mut self, other: Self) {
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
+        self.compressed_bytes = self.compressed_bytes.saturating_add(other.compressed_bytes);
+        self.decompressed_bytes = self
+            .decompressed_bytes
+            .saturating_add(other.decompressed_bytes);
+        self.chunk_build_nanos = self
+            .chunk_build_nanos
+            .saturating_add(other.chunk_build_nanos);
+        self.inflate_nanos = self.inflate_nanos.saturating_add(other.inflate_nanos);
+        self.reconstruction_nanos = self
+            .reconstruction_nanos
+            .saturating_add(other.reconstruction_nanos);
+    }
+}
+
 /// Trait for providing supplementary annotations at the variant level.
 ///
 /// Implementations must be `Send + Sync` to support parallel annotation via rayon.
@@ -63,6 +115,14 @@ pub trait AnnotationProvider: Send + Sync {
     /// Number of underlying cache blocks or chunks loaded since this provider
     /// was opened. Providers without a block cache return `None`.
     fn cache_load_count(&self) -> Option<u64> {
+        None
+    }
+
+    /// Enable aggregate cache-reader profiling. The default is a no-op.
+    fn set_performance_profiling(&self, _enabled: bool) {}
+
+    /// Return aggregate cache-reader counters when supported.
+    fn performance_snapshot(&self) -> Option<ProviderPerformanceSnapshot> {
         None
     }
 

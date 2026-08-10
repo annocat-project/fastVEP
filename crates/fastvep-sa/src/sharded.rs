@@ -3,7 +3,9 @@
 use crate::common::chrom_aliases;
 use crate::reader::{AnySaReader, SaCacheFormat};
 use anyhow::{Context, Result};
-use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
+use fastvep_cache::annotation::{
+    AnnotationProvider, AnnotationValue, ProviderPerformanceSnapshot, SaMetadata,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -170,6 +172,20 @@ impl AnnotationProvider for ShardedSaReader {
         let mut total = 0_u64;
         for reader in &self.readers {
             total = total.checked_add(reader.cache_load_count()?)?;
+        }
+        Some(total)
+    }
+
+    fn set_performance_profiling(&self, enabled: bool) {
+        for reader in &self.readers {
+            reader.set_performance_profiling(enabled);
+        }
+    }
+
+    fn performance_snapshot(&self) -> Option<ProviderPerformanceSnapshot> {
+        let mut total = ProviderPerformanceSnapshot::default();
+        for reader in &self.readers {
+            total += reader.performance_snapshot()?;
         }
         Some(total)
     }

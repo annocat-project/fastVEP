@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, GeneAnnotationProvider};
+use fastvep_cache::annotation::{
+    AnnotationProvider, AnnotationValue, GeneAnnotationProvider, ProviderPerformanceSnapshot,
+};
 use fastvep_cache::fasta::FastaReader;
 use fastvep_cache::gff::parse_gff3_with_source;
 use fastvep_cache::info::CacheInfo;
@@ -88,6 +90,7 @@ struct SourceTiming {
     errors: u64,
     elapsed: Duration,
     cache_loads_start: Option<u64>,
+    reader_start: Option<ProviderPerformanceSnapshot>,
 }
 
 struct PerformanceProfile {
@@ -123,6 +126,9 @@ impl PerformanceProfile {
     }
 
     fn initialize_sources(&mut self, providers: &[Box<dyn AnnotationProvider>]) {
+        for provider in providers {
+            provider.set_performance_profiling(true);
+        }
         self.sources = providers
             .iter()
             .map(|provider| SourceTiming {
@@ -133,6 +139,7 @@ impl PerformanceProfile {
                 errors: 0,
                 elapsed: Duration::ZERO,
                 cache_loads_start: provider.cache_load_count(),
+                reader_start: provider.performance_snapshot(),
             })
             .collect();
     }
@@ -154,6 +161,23 @@ impl PerformanceProfile {
                         .and_then(|provider| provider.cache_load_count())
                         .map(|end| end.saturating_sub(start))
                 });
+                let reader = source.reader_start.and_then(|start| {
+                    providers
+                        .get(index)
+                        .and_then(|provider| provider.performance_snapshot())
+                        .map(|end| end.saturating_sub(start))
+                });
+                let reader = reader.map(|reader| {
+                    serde_json::json!({
+                        "cacheHits": reader.cache_hits,
+                        "cacheMisses": reader.cache_misses,
+                        "compressedBytes": reader.compressed_bytes,
+                        "decompressedBytes": reader.decompressed_bytes,
+                        "chunkBuildSeconds": seconds_from_nanos(reader.chunk_build_nanos),
+                        "inflateSeconds": seconds_from_nanos(reader.inflate_nanos),
+                        "reconstructionSeconds": seconds_from_nanos(reader.reconstruction_nanos),
+                    })
+                });
                 serde_json::json!({
                     "name": source.name,
                     "key": source.key,
@@ -162,11 +186,12 @@ impl PerformanceProfile {
                     "errors": source.errors,
                     "seconds": seconds(source.elapsed),
                     "cacheLoads": cache_loads,
+                    "reader": reader,
                 })
             })
             .collect::<Vec<_>>();
         let report = serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "aggregateOnly": true,
             "outputFormat": self.output_format,
             "bufferSize": self.buffer_size,
@@ -199,6 +224,10 @@ impl PerformanceProfile {
 
 fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
+}
+
+fn seconds_from_nanos(nanos: u64) -> f64 {
+    Duration::from_nanos(nanos).as_secs_f64()
 }
 
 fn phase_start(profile: &Option<PerformanceProfile>) -> Option<Instant> {

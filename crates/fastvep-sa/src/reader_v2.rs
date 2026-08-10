@@ -20,7 +20,9 @@ use crate::reader::SaVerificationReport;
 use crate::var32;
 use crate::writer_v2::{read_u32_array, Osa2Metadata, MAX_JSON_BLOB_DECOMPRESSED};
 use anyhow::{Context, Result};
-use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
+use fastvep_cache::annotation::{
+    AnnotationProvider, AnnotationValue, ProviderPerformanceSnapshot, SaMetadata,
+};
 use flate2::read::DeflateDecoder;
 use lru::LruCache;
 use memmap2::Mmap;
@@ -29,8 +31,9 @@ use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Soft cap on cached chunk *entries*; the byte budget is the real gate.
 const CHUNK_CACHE_MAX_ENTRIES: usize = 4096;
@@ -155,6 +158,13 @@ pub struct Osa2Reader {
     /// Count of chunks built (cache misses) — a thrash diagnostic, exposed via
     /// `chunk_load_count()`.
     chunk_load_count: AtomicU64,
+    profiling_enabled: AtomicBool,
+    cache_hit_count: AtomicU64,
+    compressed_bytes: AtomicU64,
+    decompressed_bytes: AtomicU64,
+    chunk_build_nanos: AtomicU64,
+    inflate_nanos: AtomicU64,
+    reconstruction_nanos: AtomicU64,
     metadata: Osa2Metadata,
     sa_metadata: SaMetadata,
     fields: Vec<Field>,
@@ -372,6 +382,13 @@ impl Osa2Reader {
             reader_id: NEXT_READER_ID.fetch_add(1, Ordering::Relaxed),
             local_cache: local_budget.map(|b| Mutex::new(ChunkCache::new(b))),
             chunk_load_count: AtomicU64::new(0),
+            profiling_enabled: AtomicBool::new(false),
+            cache_hit_count: AtomicU64::new(0),
+            compressed_bytes: AtomicU64::new(0),
+            decompressed_bytes: AtomicU64::new(0),
+            chunk_build_nanos: AtomicU64::new(0),
+            inflate_nanos: AtomicU64::new(0),
+            reconstruction_nanos: AtomicU64::new(0),
             metadata,
             sa_metadata,
             fields,
@@ -385,6 +402,31 @@ impl Osa2Reader {
     /// by benchmarks/tests to detect chunk-cache thrashing.
     pub fn chunk_load_count(&self) -> u64 {
         self.chunk_load_count.load(Ordering::Relaxed)
+    }
+
+    fn profiling_started(&self) -> Option<Instant> {
+        self.profiling_enabled
+            .load(Ordering::Relaxed)
+            .then(Instant::now)
+    }
+
+    fn add_elapsed(counter: &AtomicU64, started: Option<Instant>) {
+        if let Some(started) = started {
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            counter.fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    fn performance_snapshot_value(&self) -> ProviderPerformanceSnapshot {
+        ProviderPerformanceSnapshot {
+            cache_hits: self.cache_hit_count.load(Ordering::Relaxed),
+            cache_misses: self.chunk_load_count.load(Ordering::Relaxed),
+            compressed_bytes: self.compressed_bytes.load(Ordering::Relaxed),
+            decompressed_bytes: self.decompressed_bytes.load(Ordering::Relaxed),
+            chunk_build_nanos: self.chunk_build_nanos.load(Ordering::Relaxed),
+            inflate_nanos: self.inflate_nanos.load(Ordering::Relaxed),
+            reconstruction_nanos: self.reconstruction_nanos.load(Ordering::Relaxed),
+        }
     }
 
     /// The chunk cache this reader writes to: its private one if configured,
@@ -716,6 +758,13 @@ impl Osa2Reader {
             anyhow::bail!("entry '{}' extends beyond .osa2 file", name);
         }
         let raw = &self.mmap[start..end];
+        let profiling_enabled = self.profiling_enabled.load(Ordering::Relaxed);
+        if profiling_enabled {
+            self.compressed_bytes
+                .fetch_add(loc.comp_size, Ordering::Relaxed);
+        }
+        let inflate_started =
+            (profiling_enabled && loc.method == EntryMethod::Deflated).then(Instant::now);
         let out = match loc.method {
             EntryMethod::Stored => raw.to_vec(),
             EntryMethod::Deflated => {
@@ -726,6 +775,11 @@ impl Osa2Reader {
                 out
             }
         };
+        Self::add_elapsed(&self.inflate_nanos, inflate_started);
+        if profiling_enabled {
+            self.decompressed_bytes
+                .fetch_add(out.len() as u64, Ordering::Relaxed);
+        }
         if out.len() as u64 != loc.size {
             anyhow::bail!(
                 "entry '{}' has invalid decompressed size: expected {}, got {}",
@@ -852,12 +906,17 @@ impl Osa2Reader {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("chunk cache mutex poisoned"))?;
             if let Some(arc) = cache.get(key) {
+                if self.profiling_enabled.load(Ordering::Relaxed) {
+                    self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(arc);
             }
         }
 
         // Build without holding the lock (lock-free mmap reads + inflate).
+        let chunk_started = self.profiling_started();
         let chunk = Arc::new(self.build_chunk(chrom, chunk_id)?);
+        Self::add_elapsed(&self.chunk_build_nanos, chunk_started);
         self.chunk_load_count.fetch_add(1, Ordering::Relaxed);
         let bytes = chunk_bytes(&chunk);
 
@@ -912,11 +971,14 @@ impl Osa2Reader {
             if indices.is_empty() {
                 return Ok(None);
             }
+            let reconstruction_started = self.profiling_started();
             let records = indices
                 .into_iter()
                 .map(|index| chunk.reconstruct_json(index, &self.fields, &self.string_tables))
                 .collect::<Vec<_>>();
-            return Ok(Some(format!("[{}]", records.join(","))));
+            let result = format!("[{}]", records.join(","));
+            Self::add_elapsed(&self.reconstruction_nanos, reconstruction_started);
+            return Ok(Some(result));
         }
 
         let idx = if self.metadata.is_positional {
@@ -955,11 +1017,10 @@ impl Osa2Reader {
                 if i >= data_len {
                     return Ok(None);
                 }
-                Ok(Some(chunk.reconstruct_json(
-                    i,
-                    &self.fields,
-                    &self.string_tables,
-                )))
+                let reconstruction_started = self.profiling_started();
+                let result = chunk.reconstruct_json(i, &self.fields, &self.string_tables);
+                Self::add_elapsed(&self.reconstruction_nanos, reconstruction_started);
+                Ok(Some(result))
             }
             None => Ok(None),
         }
@@ -1003,6 +1064,14 @@ impl AnnotationProvider for Osa2Reader {
 
     fn cache_load_count(&self) -> Option<u64> {
         Some(self.chunk_load_count())
+    }
+
+    fn set_performance_profiling(&self, enabled: bool) {
+        self.profiling_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn performance_snapshot(&self) -> Option<ProviderPerformanceSnapshot> {
+        Some(self.performance_snapshot_value())
     }
 
     fn annotate_position(
