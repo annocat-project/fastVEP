@@ -742,14 +742,7 @@ impl AnnotationProvider for SaReader {
             return Ok(());
         }
 
-        // Honor the same chr*/bare/mitochondrial aliases as `find_blocks`
-        // so a preload on `chr1` against an index built with `1` (or vice
-        // versa) still primes the cache instead of silently no-op'ing.
-        let blocks = chrom_aliases(chrom)
-            .iter()
-            .find_map(|alias| self.index.chromosomes.get(alias))
-            .map(|v| v.as_slice());
-        let blocks = match blocks {
+        let blocks = match self.index.blocks_for_chrom(chrom).map(Vec::as_slice) {
             Some(b) => b,
             None => {
                 // A chromosome the caller asked about that is not in the

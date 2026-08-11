@@ -3,10 +3,9 @@
 //! The index maps (chromosome, position) -> file offset so the reader can
 //! seek directly to the relevant compressed block.
 
-use crate::common::{
-    chrom_aliases, MAX_INDEX_PAYLOAD, OSA_MAGIC, OSA_SCHEMA_VERSION, SCHEMA_VERSION,
-};
+use crate::common::{MAX_INDEX_PAYLOAD, OSA_MAGIC, OSA_SCHEMA_VERSION, SCHEMA_VERSION};
 use anyhow::Result;
+use fastvep_core::chrom_alias_map;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -45,6 +44,9 @@ pub struct SaIndex {
     pub header: IndexHeader,
     /// Chromosome name -> list of block references, sorted by start_pos.
     pub chromosomes: HashMap<String, Vec<BlockRef>>,
+    /// Derived alias map. It is not part of the OSA index format.
+    #[serde(skip)]
+    chrom_lookup: HashMap<String, String>,
 }
 
 impl SaIndex {
@@ -54,11 +56,17 @@ impl SaIndex {
         Self {
             header,
             chromosomes: HashMap::new(),
+            chrom_lookup: HashMap::new(),
         }
     }
 
     /// Add a block reference for a chromosome.
     pub fn add_block(&mut self, chrom: &str, block_ref: BlockRef) {
+        if !self.chromosomes.contains_key(chrom) {
+            for (alias, canonical) in chrom_alias_map([chrom]) {
+                self.chrom_lookup.entry(alias).or_insert(canonical);
+            }
+        }
         self.chromosomes
             .entry(chrom.to_string())
             .or_default()
@@ -68,13 +76,14 @@ impl SaIndex {
     /// Resolve a chromosome name to the on-disk key, tolerating `chr*` vs
     /// bare naming and mitochondrial aliases. Returns `None` if no alias is
     /// present in the index.
-    fn blocks_for_chrom(&self, chrom: &str) -> Option<&Vec<BlockRef>> {
-        for alias in chrom_aliases(chrom) {
-            if let Some(blocks) = self.chromosomes.get(&alias) {
-                return Some(blocks);
-            }
-        }
-        None
+    pub fn blocks_for_chrom(&self, chrom: &str) -> Option<&Vec<BlockRef>> {
+        self.chrom_lookup
+            .get(chrom)
+            .and_then(|key| self.chromosomes.get(key))
+    }
+
+    fn rebuild_chrom_lookup(&mut self) {
+        self.chrom_lookup = chrom_alias_map(self.chromosomes.keys());
     }
 
     /// Find the block(s) that may contain the given position on a chromosome.
@@ -172,7 +181,7 @@ impl SaIndex {
                 Ok(legacy.into())
             }
             OSA_SCHEMA_VERSION => {
-                let index: SaIndex = bincode::deserialize(&data)?;
+                let mut index: SaIndex = bincode::deserialize(&data)?;
                 if index.header.schema_version != OSA_SCHEMA_VERSION {
                     anyhow::bail!(
                         "OSA index schema mismatch: prefix is {}, header is {}",
@@ -180,6 +189,7 @@ impl SaIndex {
                         index.header.schema_version
                     );
                 }
+                index.rebuild_chrom_lookup();
                 Ok(index)
             }
             _ => anyhow::bail!(
@@ -213,7 +223,7 @@ struct LegacySaIndex {
 
 impl From<LegacySaIndex> for SaIndex {
     fn from(legacy: LegacySaIndex) -> Self {
-        Self {
+        let mut index = Self {
             header: IndexHeader {
                 schema_version: legacy.header.schema_version,
                 json_key: legacy.header.json_key,
@@ -227,7 +237,10 @@ impl From<LegacySaIndex> for SaIndex {
                 is_positional: legacy.header.is_positional,
             },
             chromosomes: legacy.chromosomes,
-        }
+            chrom_lookup: HashMap::new(),
+        };
+        index.rebuild_chrom_lookup();
+        index
     }
 }
 
@@ -279,6 +292,14 @@ mod tests {
             },
         );
 
+        let encoded = bincode::serialize(&index).unwrap();
+        let legacy_layout =
+            bincode::serialize(&(index.header.clone(), index.chromosomes.clone())).unwrap();
+        assert_eq!(
+            encoded, legacy_layout,
+            "derived alias map changed OSA bytes"
+        );
+
         // Serialize and deserialize
         let mut buf = Vec::new();
         index.write_to(&mut buf).unwrap();
@@ -290,6 +311,7 @@ mod tests {
         assert_eq!(loaded.chromosomes.len(), 2);
         assert_eq!(loaded.chromosomes["chr1"].len(), 2);
         assert_eq!(loaded.chromosomes["chr2"].len(), 1);
+        assert!(loaded.blocks_for_chrom("1").is_some());
     }
 
     #[test]

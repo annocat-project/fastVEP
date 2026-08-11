@@ -56,6 +56,29 @@ pub fn chrom_aliases(chrom: &str) -> Vec<String> {
     out
 }
 
+/// Map every accepted chromosome spelling to the canonical name in a cache.
+/// Build this once when a cache opens to avoid allocating aliases per variant.
+pub fn chrom_alias_map<I, S>(canonical: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let names: Vec<String> = canonical
+        .into_iter()
+        .map(|name| name.as_ref().to_string())
+        .collect();
+    let mut map = HashMap::with_capacity(names.len() * 3);
+    for name in &names {
+        map.insert(name.clone(), name.clone());
+    }
+    for name in &names {
+        for alias in chrom_aliases(name) {
+            map.entry(alias).or_insert_with(|| name.clone());
+        }
+    }
+    map
+}
+
 /// Heuristic: does this name look like an NCBI RefSeq molecule accession
 /// (`NC_000017.11`, `NW_…`, `NT_…`, `NG_…`)?
 ///
@@ -248,7 +271,7 @@ impl ChromSynonyms {
 
 #[cfg(test)]
 mod chrom_alias_tests {
-    use super::chrom_aliases;
+    use super::{chrom_alias_map, chrom_aliases};
 
     #[test]
     fn chr_prefix_round_trips() {
@@ -297,6 +320,20 @@ mod chrom_alias_tests {
         // chr-strip case and could match unrelated index keys.
         let aliases = chrom_aliases("");
         assert_eq!(aliases, vec![String::new()]);
+    }
+
+    #[test]
+    fn alias_map_preserves_canonical_names() {
+        let map = chrom_alias_map(["chr1", "chrM"]);
+        for (query, expected) in [
+            ("1", "chr1"),
+            ("chr1", "chr1"),
+            ("M", "chrM"),
+            ("MT", "chrM"),
+            ("chrMT", "chrM"),
+        ] {
+            assert_eq!(map.get(query).map(String::as_str), Some(expected));
+        }
     }
 }
 

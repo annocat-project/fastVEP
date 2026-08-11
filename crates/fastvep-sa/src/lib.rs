@@ -28,3 +28,4 @@ pub mod var32;
 pub mod writer;
 pub mod writer_v2;
 pub mod zigzag;
+mod zipdir;
