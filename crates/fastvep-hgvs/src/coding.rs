@@ -498,7 +498,12 @@ pub fn hgvsc_noncoding_with_seq(
             format!("{}{}del", prefix, shifted)
         }
         (Allele::Deletion, Allele::Sequence(alt_bases)) => {
-            let ins_pos = format!("{}_{}", pos_max, pos_max + 1);
+            let ins_after = if pos_min == pos_max {
+                pos_max + 1
+            } else {
+                pos_max
+            };
+            let ins_pos = format!("{}_{}", pos_min, ins_after);
             format!(
                 "{}{}ins{}",
                 prefix,
@@ -760,6 +765,18 @@ mod tests {
             &Allele::Sequence(b"G".to_vec()),
         );
         assert_eq!(result, Some("ENST00000472807.5:n.100A>G".to_string()));
+    }
+
+    #[test]
+    fn test_hgvsc_noncoding_insertion_uses_supplied_flanks() {
+        let result = hgvsc_noncoding(
+            "ENST00000472807.5",
+            54,
+            53,
+            &Allele::Deletion,
+            &Allele::Sequence(b"TT".to_vec()),
+        );
+        assert_eq!(result, Some("ENST00000472807.5:n.53_54insTT".to_string()));
     }
 
     #[test]

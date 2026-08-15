@@ -1026,13 +1026,16 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                     .allele_consequences
                     .iter()
                     .map(|ac| {
+                        let (cdna_position, cds_position, protein_position) = transcript
+                            .map(|value| record_transcript_positions(&vf.position, value))
+                            .unwrap_or_default();
                         let mut ann = AlleleAnnotation {
                             allele: ac.allele.clone(),
                             consequences: ac.consequences.clone(),
                             impact: ac.impact,
-                            cdna_position: zip_positions(ac.cdna_start, ac.cdna_end),
-                            cds_position: zip_positions(ac.cds_start, ac.cds_end),
-                            protein_position: zip_positions(ac.protein_start, ac.protein_end),
+                            cdna_position,
+                            cds_position,
+                            protein_position,
                             amino_acids: ac.amino_acids.clone(),
                             codons: ac.codons.clone(),
                             exon: ac.exon,
@@ -1389,58 +1392,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                         let is_fs = ac.consequences.contains(&Consequence::FrameshiftVariant);
 
                                         if is_fs {
-                                            // Frameshift: build alt sequence and scan for first changed AA + new stop
-                                            // Use spliced_seq from CDS start onwards (includes 3'UTR for stop codon search)
-                                            if let (Some(ref spliced), Some(coding_start), Some(cds_s)) =
-                                                (&tr.spliced_seq, tr.cdna_coding_start, ac.cds_start)
-                                            {
-                                                // Extract from CDS start to end of spliced seq (includes 3'UTR).
-                                                // Guard against malformed/truncated GFF3-derived transcript data
-                                                // where `coding_start` is inconsistent with the actual spliced
-                                                // sequence length — skip HGVSp generation for this case rather
-                                                // than panicking on an out-of-bounds slice.
-                                                let coding_start_idx = (coding_start - 1) as usize;
-                                                if coding_start >= 1 && coding_start_idx <= spliced.len() {
-                                                let ref_from_cds = &spliced.as_bytes()[coding_start_idx..];
-                                                let cds_idx = (cds_s - 1) as usize;
-                                                let mut alt_from_cds = ref_from_cds.to_vec();
-
-                                                // Apply the indel to build the frameshifted sequence
-                                                let del_len = ac.normalized_ref_allele.len();
-                                                if del_len > 0 {
-                                                    let end = (cds_idx + del_len).min(alt_from_cds.len());
-                                                    alt_from_cds.drain(cds_idx..end);
-                                                }
-                                                if let Allele::Sequence(bases) = if tr.strand
-                                                    == fastvep_core::Strand::Reverse
-                                                {
-                                                    complement_allele(&ac.normalized_alt_allele)
-                                                } else {
-                                                    ac.normalized_alt_allele.clone()
-                                                } {
-                                                    for (j, &b) in bases.iter().enumerate() {
-                                                        if cds_idx + j <= alt_from_cds.len() {
-                                                            alt_from_cds.insert(cds_idx + j, b);
-                                                        }
-                                                    }
-                                                }
-
-                                                let codon_start = cds_idx / 3;
-                                                let fs_codon_table =
-                                                    if fastvep_genome::is_mitochondrial(&tr.chromosome) {
-                                                        fastvep_genome::mitochondrial_codon_table()
-                                                    } else {
-                                                        fastvep_genome::CodonTable::standard()
-                                                    };
-                                                ann.hgvsp = fastvep_hgvs::hgvsp_frameshift(
-                                                    &versioned_pid,
-                                                    ref_from_cds,
-                                                    &alt_from_cds,
-                                                    codon_start,
-                                                    &fs_codon_table,
-                                                );
-                                                }
-                                            }
+                                            ann.hgvsp = frameshift_hgvsp(&versioned_pid, tr, ac);
                                         } else if aa.1 == "-"
                                             || ac.consequences.contains(&Consequence::InframeDeletion)
                                             || ac.consequences.contains(&Consequence::InframeInsertion)
@@ -1456,10 +1408,14 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                                 tr.peptide.as_deref(),
                                             );
                                         } else {
-                                            let ref_aa_byte = aa.0.as_bytes().first().copied().unwrap_or(b'X');
-                                            let alt_aa_byte = aa.1.as_bytes().first().copied().unwrap_or(b'X');
-                                            ann.hgvsp = fastvep_hgvs::hgvsp(
-                                                &versioned_pid, ps, ref_aa_byte, alt_aa_byte, false,
+                                            let hgvsp_start = protein_position
+                                                .map(|(start, _)| start)
+                                                .unwrap_or(ps);
+                                            ann.hgvsp = fastvep_hgvs::hgvsp_substitution(
+                                                &versioned_pid,
+                                                hgvsp_start,
+                                                &aa.0,
+                                                &aa.1,
                                             );
                                         }
                                     }
@@ -1920,9 +1876,10 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
 // Shared annotation utilities from fastvep-annotate (used by batch pipeline).
 use fastvep_annotate::{
     annotate_intergenic, annotate_sa_only_scaffold, complement_allele, convert_ins_to_dup_range,
-    convert_ins_to_dup_range_noncoding, hgvsc_noncoding_exonic, intronic_duplication_range,
-    load_gene_providers, load_sa_providers, shifted_exonic_deletion,
-    shifted_inframe_deletion_protein_change, three_prime_shift_intronic, zip_positions,
+    convert_ins_to_dup_range_noncoding, frameshift_hgvsp, hgvsc_noncoding_exonic,
+    intronic_duplication_range, load_gene_providers, load_sa_providers,
+    record_transcript_positions, shifted_exonic_deletion, shifted_inframe_deletion_protein_change,
+    three_prime_shift_intronic,
 };
 
 /// Index of the best transcript variation under VEP's default `--pick_order`

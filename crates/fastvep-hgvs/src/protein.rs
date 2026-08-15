@@ -20,6 +20,10 @@ pub fn hgvsp(
         return Some(format!("{}{}{}fs", prefix, ref_aa3, protein_pos));
     }
 
+    if protein_pos == 1 && ref_aa == b'M' && alt_aa != ref_aa {
+        return Some(format!("{}Met1?", prefix));
+    }
+
     if ref_aa == alt_aa {
         // Synonymous
         return Some(format!("{}{}{}=", prefix, ref_aa3, protein_pos));
@@ -39,6 +43,38 @@ pub fn hgvsp(
 
     // Missense
     Some(format!("{}{}{}{}", prefix, ref_aa3, protein_pos, alt_aa3))
+}
+
+/// Generate HGVSp for a translated substitution spanning one or more codons.
+pub fn hgvsp_substitution(
+    protein_id: &str,
+    protein_start: u64,
+    ref_aas: &str,
+    alt_aas: &str,
+) -> Option<String> {
+    let mut reference = ref_aas.as_bytes();
+    let mut alternate = alt_aas.as_bytes();
+    let mut start = protein_start;
+
+    while !reference.is_empty() && !alternate.is_empty() && reference[0] == alternate[0] {
+        reference = &reference[1..];
+        alternate = &alternate[1..];
+        start += 1;
+    }
+    while !reference.is_empty() && !alternate.is_empty() && reference.last() == alternate.last() {
+        reference = &reference[..reference.len() - 1];
+        alternate = &alternate[..alternate.len() - 1];
+    }
+
+    if reference.is_empty() && alternate.is_empty() {
+        let aa = ref_aas.as_bytes().first().copied()?;
+        return hgvsp(protein_id, protein_start, aa, aa, false);
+    }
+    if reference.len() == 1 && alternate.len() == 1 {
+        return hgvsp(protein_id, start, reference[0], alternate[0], false);
+    }
+
+    unshifted_inframe_change(&format!("{}:p.", protein_id), start, reference, alternate)
 }
 
 fn residue_span(first_pos: u64, residues: &[u8]) -> String {
@@ -401,6 +437,18 @@ mod tests {
     fn test_hgvsp_missense() {
         let result = hgvsp("ENSP00000001", 41, b'R', b'K', false);
         assert_eq!(result, Some("ENSP00000001:p.Arg41Lys".to_string()));
+    }
+
+    #[test]
+    fn test_hgvsp_start_lost_is_unknown() {
+        let result = hgvsp("ENSP00000001", 1, b'M', b'V', false);
+        assert_eq!(result, Some("ENSP00000001:p.Met1?".to_string()));
+    }
+
+    #[test]
+    fn test_hgvsp_substitution_uses_first_changed_residue() {
+        let result = hgvsp_substitution("ENSP00000001", 366, "ML", "IL");
+        assert_eq!(result, Some("ENSP00000001:p.Met366Ile".to_string()));
     }
 
     #[test]

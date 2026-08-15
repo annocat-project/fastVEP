@@ -23,8 +23,9 @@ use fastvep_cache::gff::parse_gff3;
 use fastvep_cache::providers::{
     FastaSequenceProvider, IndexedTranscriptProvider, SequenceProvider, TranscriptProvider,
 };
-use fastvep_consequence::ConsequencePredictor;
-use fastvep_core::{Allele, Consequence};
+use fastvep_consequence::{AlleleConsequenceResult, ConsequencePredictor};
+use fastvep_core::{Allele, Consequence, GenomicPosition, Strand};
+use fastvep_genome::Transcript;
 use fastvep_io::output;
 use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
 use fastvep_io::vcf::VcfParser;
@@ -337,16 +338,16 @@ impl AnnotationContext {
                         .allele_consequences
                         .iter()
                         .map(|ac| {
+                            let (cdna_position, cds_position, protein_position) = transcript
+                                .map(|value| record_transcript_positions(&vf.position, value))
+                                .unwrap_or_default();
                             let mut ann = AlleleAnnotation {
                                 allele: ac.allele.clone(),
                                 consequences: ac.consequences.clone(),
                                 impact: ac.impact,
-                                cdna_position: zip_positions(ac.cdna_start, ac.cdna_end),
-                                cds_position: zip_positions(ac.cds_start, ac.cds_end),
-                                protein_position: zip_positions(
-                                    ac.protein_start,
-                                    ac.protein_end,
-                                ),
+                                cdna_position,
+                                cds_position,
+                                protein_position,
                                 amino_acids: ac.amino_acids.clone(),
                                 codons: ac.codons.clone(),
                                 exon: ac.exon,
@@ -388,8 +389,8 @@ impl AnnotationContext {
                                                 ac.normalized_alt_allele.clone(),
                                             )
                                         };
-                                    let shifted_deletion = self.seq_provider.as_deref().and_then(
-                                        |provider| {
+                                    let shifted_deletion =
+                                        self.seq_provider.as_deref().and_then(|provider| {
                                             shifted_exonic_deletion(
                                                 provider as &dyn SequenceProvider,
                                                 chrom,
@@ -399,8 +400,7 @@ impl AnnotationContext {
                                                 &ac.normalized_alt_allele,
                                                 tr,
                                             )
-                                        },
-                                    );
+                                        });
                                     if let Some(coding_start) = tr.cdna_coding_start {
                                         if let Some(shifted) = shifted_deletion {
                                             ann.hgvsc = fastvep_hgvs::hgvsc_with_seq(
@@ -430,8 +430,8 @@ impl AnnotationContext {
                                                 tr.codon_table_start_phase,
                                             );
                                         } else if ac.intron.is_some() {
-                                            if let Some((cdna_pos, offset)) =
-                                                tr.genomic_to_intronic_cdna(
+                                            if let Some((cdna_pos, offset)) = tr
+                                                .genomic_to_intronic_cdna(
                                                     ac.normalized_position.start,
                                                 )
                                             {
@@ -475,10 +475,8 @@ impl AnnotationContext {
                                             &hgvs_alt,
                                         );
                                     } else if ac.intron.is_some() {
-                                        if let Some((cdna_pos, offset)) =
-                                            tr.genomic_to_intronic_cdna(
-                                                ac.normalized_position.start,
-                                            )
+                                        if let Some((cdna_pos, offset)) = tr
+                                            .genomic_to_intronic_cdna(ac.normalized_position.start)
                                         {
                                             let (end_cdna, end_offset) =
                                                 if ac.normalized_position.start
@@ -487,8 +485,8 @@ impl AnnotationContext {
                                                     tr.genomic_to_intronic_cdna(
                                                         ac.normalized_position.end,
                                                     )
-                                                        .map(|(c, o)| (Some(c), Some(o)))
-                                                        .unwrap_or((None, None))
+                                                    .map(|(c, o)| (Some(c), Some(o)))
+                                                    .unwrap_or((None, None))
                                                 } else {
                                                     (None, None)
                                                 };
@@ -525,77 +523,8 @@ impl AnnotationContext {
                                                 .consequences
                                                 .contains(&Consequence::FrameshiftVariant);
                                             if is_fs {
-                                                if let (
-                                                    Some(ref spliced),
-                                                    Some(coding_start),
-                                                    Some(cds_s),
-                                                ) = (
-                                                    &tr.spliced_seq,
-                                                    tr.cdna_coding_start,
-                                                    ac.cds_start,
-                                                ) {
-                                                    // Guard against malformed/truncated
-                                                    // GFF3-derived transcript data where
-                                                    // `coding_start` is inconsistent with the
-                                                    // actual spliced sequence length — skip
-                                                    // HGVSp generation for this case rather
-                                                    // than panicking on an out-of-bounds slice.
-                                                    let coding_start_idx =
-                                                        (coding_start - 1) as usize;
-                                                    let spliced_bytes: &[u8] =
-                                                        spliced.as_bytes();
-                                                    if coding_start >= 1
-                                                        && coding_start_idx <= spliced_bytes.len()
-                                                    {
-                                                    let ref_from_cds =
-                                                        &spliced_bytes[coding_start_idx..];
-                                                    let cds_idx = (cds_s - 1) as usize;
-                                                    let mut alt_from_cds =
-                                                        ref_from_cds.to_vec();
-                                                    let del_len =
-                                                        ac.normalized_ref_allele.len();
-                                                    if del_len > 0 {
-                                                        let end = (cds_idx + del_len)
-                                                            .min(alt_from_cds.len());
-                                                        alt_from_cds.drain(cds_idx..end);
-                                                    }
-                                                    if let Allele::Sequence(bases) = if tr.strand
-                                                        == fastvep_core::Strand::Reverse
-                                                    {
-                                                        complement_allele(
-                                                            &ac.normalized_alt_allele,
-                                                        )
-                                                    } else {
-                                                        ac.normalized_alt_allele.clone()
-                                                    } {
-                                                        for (j, &b) in
-                                                            bases.iter().enumerate()
-                                                        {
-                                                            if cds_idx + j
-                                                                <= alt_from_cds.len()
-                                                            {
-                                                                alt_from_cds
-                                                                    .insert(cds_idx + j, b);
-                                                            }
-                                                        }
-                                                    }
-                                                    let codon_start = cds_idx / 3;
-                                                    let fs_codon_table =
-                                                        if fastvep_genome::is_mitochondrial(&tr.chromosome) {
-                                                            fastvep_genome::mitochondrial_codon_table()
-                                                        } else {
-                                                            fastvep_genome::CodonTable::standard()
-                                                        };
-                                                    ann.hgvsp =
-                                                        fastvep_hgvs::hgvsp_frameshift(
-                                                            &versioned_pid,
-                                                            ref_from_cds,
-                                                            &alt_from_cds,
-                                                            codon_start,
-                                                            &fs_codon_table,
-                                                        );
-                                                    }
-                                                }
+                                                ann.hgvsp =
+                                                    frameshift_hgvsp(&versioned_pid, tr, ac);
                                             } else if aa.1 == "-"
                                                 || ac
                                                     .consequences
@@ -616,35 +545,21 @@ impl AnnotationContext {
                                                     tr.peptide.as_deref(),
                                                 );
                                             } else {
-                                                let ref_aa_byte = aa
-                                                    .0
-                                                    .as_bytes()
-                                                    .first()
-                                                    .copied()
-                                                    .unwrap_or(b'X');
-                                                let alt_aa_byte = aa
-                                                    .1
-                                                    .as_bytes()
-                                                    .first()
-                                                    .copied()
-                                                    .unwrap_or(b'X');
-                                                ann.hgvsp = fastvep_hgvs::hgvsp(
+                                                let hgvsp_start = protein_position
+                                                    .map(|(start, _)| start)
+                                                    .unwrap_or(ps);
+                                                ann.hgvsp = fastvep_hgvs::hgvsp_substitution(
                                                     &versioned_pid,
-                                                    ps,
-                                                    ref_aa_byte,
-                                                    alt_aa_byte,
-                                                    false,
+                                                    hgvsp_start,
+                                                    &aa.0,
+                                                    &aa.1,
                                                 );
                                             }
                                         }
                                     }
 
                                     if ann.hgvsp.is_none() {
-                                        if let (
-                                            Some(ref pid),
-                                            Some(cds_start),
-                                            Some(cds_end),
-                                        ) = (
+                                        if let (Some(ref pid), Some(cds_start), Some(cds_end)) = (
                                             &tr.protein_id,
                                             shifted_deletion.and_then(|value| value.cds_start),
                                             shifted_deletion.and_then(|value| value.cds_end),
@@ -665,14 +580,13 @@ impl AnnotationContext {
                                                     }
                                                     None => pid.clone(),
                                                 };
-                                                ann.hgvsp =
-                                                    fastvep_hgvs::hgvsp_inframe_indel(
-                                                        &versioned_pid,
-                                                        protein_start,
-                                                        &reference,
-                                                        &alternate,
-                                                        tr.peptide.as_deref(),
-                                                    );
+                                                ann.hgvsp = fastvep_hgvs::hgvsp_inframe_indel(
+                                                    &versioned_pid,
+                                                    protein_start,
+                                                    &reference,
+                                                    &alternate,
+                                                    tr.peptide.as_deref(),
+                                                );
                                             }
                                         }
                                     }
@@ -964,6 +878,73 @@ pub fn zip_positions(start: Option<u64>, end: Option<u64>) -> Option<(u64, u64)>
         (None, Some(e)) => Some((e, e)),
         _ => None,
     }
+}
+
+pub fn record_transcript_positions(
+    position: &GenomicPosition,
+    transcript: &Transcript,
+) -> (Option<(u64, u64)>, Option<(u64, u64)>, Option<(u64, u64)>) {
+    let cdna_start = transcript.genomic_to_cdna(position.start);
+    let cdna_end = transcript.genomic_to_cdna(position.end);
+    let cds_start = cdna_start.and_then(|value| transcript.cdna_to_cds(value));
+    let cds_end = cdna_end.and_then(|value| transcript.cdna_to_cds(value));
+    let protein_start = cds_start.map(Transcript::cds_to_protein);
+    let protein_end = cds_end.map(Transcript::cds_to_protein);
+    (
+        zip_positions(cdna_start, cdna_end),
+        zip_positions(cds_start, cds_end),
+        zip_positions(protein_start, protein_end),
+    )
+}
+
+pub fn frameshift_hgvsp(
+    protein_id: &str,
+    transcript: &Transcript,
+    consequence: &AlleleConsequenceResult,
+) -> Option<String> {
+    let spliced = transcript.spliced_seq.as_ref()?;
+    let coding_start = transcript.cdna_coding_start?;
+    let coding_start_index = coding_start.checked_sub(1)? as usize;
+    let reference = spliced.as_bytes().get(coding_start_index..)?;
+    let cds_start = consequence.cds_start?;
+    let cds_lo = consequence
+        .cds_end
+        .map_or(cds_start, |end| cds_start.min(end));
+    let edit_start = if consequence.normalized_ref_allele == Allele::Deletion {
+        cds_lo as usize
+    } else {
+        cds_lo.checked_sub(1)? as usize
+    };
+    let edit_end = edit_start.checked_add(consequence.normalized_ref_allele.len())?;
+    if edit_end > reference.len() {
+        return None;
+    }
+
+    let alternate_allele = if transcript.strand == Strand::Reverse {
+        complement_allele(&consequence.normalized_alt_allele)
+    } else {
+        consequence.normalized_alt_allele.clone()
+    };
+    let replacement = match alternate_allele {
+        Allele::Deletion => Vec::new(),
+        Allele::Sequence(bases) => bases,
+        _ => return None,
+    };
+    let mut alternate = reference.to_vec();
+    alternate.splice(edit_start..edit_end, replacement);
+
+    let codon_table = if fastvep_genome::is_mitochondrial(&transcript.chromosome) {
+        fastvep_genome::mitochondrial_codon_table()
+    } else {
+        fastvep_genome::CodonTable::standard()
+    };
+    fastvep_hgvs::hgvsp_frameshift(
+        protein_id,
+        reference,
+        &alternate,
+        edit_start / 3,
+        &codon_table,
+    )
 }
 
 pub fn complement_allele(allele: &Allele) -> Allele {

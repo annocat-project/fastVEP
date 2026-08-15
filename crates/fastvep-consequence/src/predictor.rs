@@ -1,5 +1,4 @@
 use fastvep_core::{Allele, Consequence, GenomicPosition, Impact, Strand};
-use fastvep_genome::codon::format_codon_window;
 use fastvep_genome::{is_mitochondrial, mitochondrial_codon_table, CodonTable, Transcript};
 use std::sync::Arc;
 
@@ -178,6 +177,8 @@ impl ConsequencePredictor {
             minimize_allele(position, ref_allele, alt_allele);
         let var_start = normalized_position.start;
         let var_end = normalized_position.end;
+        let record_start = position.start;
+        let record_end = position.end;
         let tr_start = transcript.start;
         let tr_end = transcript.end;
 
@@ -191,25 +192,25 @@ impl ConsequencePredictor {
         let mut distance = None;
 
         // 1. Check if variant overlaps the transcript at all
-        let overlaps = var_start <= tr_end && var_end >= tr_start;
+        let overlaps = record_start <= tr_end && record_end >= tr_start;
 
         if !overlaps {
             // Check upstream/downstream
-            let dist = self.distance_to_transcript(var_start, var_end, transcript);
+            let dist = self.distance_to_transcript(record_start, record_end, transcript);
             if let Some(d) = dist {
                 distance = Some(d);
                 let abs_dist = d.unsigned_abs();
                 if abs_dist <= self.upstream_distance {
                     match transcript.strand {
                         Strand::Forward => {
-                            if var_end < tr_start {
+                            if record_end < tr_start {
                                 consequences.push(Consequence::UpstreamGeneVariant);
                             } else {
                                 consequences.push(Consequence::DownstreamGeneVariant);
                             }
                         }
                         Strand::Reverse => {
-                            if var_start > tr_end {
+                            if record_start > tr_end {
                                 consequences.push(Consequence::UpstreamGeneVariant);
                             } else {
                                 consequences.push(Consequence::DownstreamGeneVariant);
@@ -248,25 +249,29 @@ impl ConsequencePredictor {
         // 2. Map to cDNA coordinates
         let cdna_start = transcript.genomic_to_cdna(var_start);
         let cdna_end = transcript.genomic_to_cdna(var_end);
+        let record_cdna_start = transcript.genomic_to_cdna(record_start);
+        let record_cdna_end = transcript.genomic_to_cdna(record_end);
+        let record_cds_start = record_cdna_start.and_then(|value| transcript.cdna_to_cds(value));
+        let record_cds_end = record_cdna_end.and_then(|value| transcript.cdna_to_cds(value));
 
         // 3. Determine exon/intron location
         // Use range-based overlap for exon detection to handle large indels
         let exon_info = transcript
-            .exon_at(var_start)
-            .or_else(|| transcript.exon_overlapping(var_start, var_end))
+            .exon_at(record_start)
+            .or_else(|| transcript.exon_overlapping(record_start, record_end))
             .map(|(i, t)| (i as u32 + 1, t as u32));
         let intron_info = transcript
-            .intron_at(var_start)
+            .intron_at(record_start)
             .map(|(i, t)| (i as u32 + 1, t as u32));
 
         let in_exon = exon_info.is_some();
         let in_intron = intron_info.is_some();
 
         // 4. Check splice sites (always check regardless of coding status)
-        if splice::is_splice_donor(transcript, var_start) {
+        if splice::is_splice_donor(transcript, record_start) {
             consequences.push(Consequence::SpliceDonorVariant);
         }
-        if splice::is_splice_acceptor(transcript, var_start) {
+        if splice::is_splice_acceptor(transcript, record_start) {
             consequences.push(Consequence::SpliceAcceptorVariant);
         }
 
@@ -279,20 +284,20 @@ impl ConsequencePredictor {
         });
 
         if !is_essential_splice {
-            let is_donor_5th = splice::is_splice_donor_5th_base(transcript, var_start);
-            let is_donor_region = splice::is_splice_donor_region(transcript, var_start);
+            let is_donor_5th = splice::is_splice_donor_5th_base(transcript, record_start);
+            let is_donor_region = splice::is_splice_donor_region(transcript, record_start);
             if is_donor_5th {
                 consequences.push(Consequence::SpliceDonorFifthBaseVariant);
             } else if is_donor_region {
                 consequences.push(Consequence::SpliceDonorRegionVariant);
             }
-            if splice::is_splice_polypyrimidine_tract(transcript, var_start) {
+            if splice::is_splice_polypyrimidine_tract(transcript, record_start) {
                 consequences.push(Consequence::SplicePolypyrimidineTractVariant);
             }
             // VEP excludes splice_region_variant when a more specific splice term is present:
             // splice_donor_region_variant or splice_donor_5th_base_variant
             if !is_donor_5th && !is_donor_region {
-                if splice::is_splice_region(transcript, var_start) {
+                if splice::is_splice_region(transcript, record_start) {
                     consequences.push(Consequence::SpliceRegionVariant);
                 }
             }
@@ -318,9 +323,9 @@ impl ConsequencePredictor {
             }
 
             let in_coding_region =
-                self.is_in_coding_region(var_start, var_end, coding_start, coding_end);
-            let in_5_utr = self.is_in_5_utr(var_start, var_end, transcript);
-            let in_3_utr = self.is_in_3_utr(var_start, var_end, transcript);
+                self.is_in_coding_region(record_start, record_end, coding_start, coding_end);
+            let in_5_utr = self.is_in_5_utr(record_start, record_end, transcript);
+            let in_3_utr = self.is_in_3_utr(record_start, record_end, transcript);
 
             if in_5_utr && in_exon {
                 consequences.push(Consequence::FivePrimeUtrVariant);
@@ -334,6 +339,10 @@ impl ConsequencePredictor {
                     transcript,
                     cds_start,
                     cds_end,
+                    ref_allele,
+                    alt_allele,
+                    record_cds_start,
+                    record_cds_end,
                 );
                 if let Some((conseq, aa, cdn)) = coding_conseq {
                     consequences.push(conseq);
@@ -407,6 +416,10 @@ impl ConsequencePredictor {
         transcript: &Transcript,
         cds_start: Option<u64>,
         cds_end: Option<u64>,
+        record_ref_allele: &Allele,
+        record_alt_allele: &Allele,
+        record_cds_start: Option<u64>,
+        record_cds_end: Option<u64>,
     ) -> Option<(
         Consequence,
         Option<(String, String)>,
@@ -458,9 +471,15 @@ impl ConsequencePredictor {
             let (aa_pair, codon_pair) = self.compute_indel_amino_acids(
                 transcript,
                 cds_pos,
+                cds_start,
+                cds_end,
                 ref_allele,
                 alt_allele,
                 is_frameshift,
+                record_ref_allele,
+                record_alt_allele,
+                record_cds_start,
+                record_cds_end,
             );
 
             return Some((consequence, aa_pair, codon_pair));
@@ -469,72 +488,56 @@ impl ConsequencePredictor {
         // Same-length substitutions must be translated as one block across
         // every codon they touch. Reverse-strand alleles also need reversal,
         // not only base complementation.
-        if let Some(ref translateable_seq) = transcript.translateable_seq {
-            let seq_bytes = translateable_seq.as_bytes();
+        if let Some((ref_window, alt_window, ref_codons, alt_codons)) = self.coding_windows(
+            transcript,
+            cds_start,
+            cds_end,
+            ref_allele,
+            alt_allele,
+            record_ref_allele,
+            record_alt_allele,
+            record_cds_start,
+            record_cds_end,
+        ) {
+            let table = self.codon_table_for(transcript);
+            let ref_aas = translate_window(&ref_window, &table, false);
+            let alt_aas = translate_window(&alt_window, &table, false);
+            let codon_pair = Some((ref_codons, alt_codons));
+            let aa_pair = Some((ref_aas.clone(), alt_aas.clone()));
+            let affects_start_codon = record_cds_start
+                .into_iter()
+                .chain(record_cds_end)
+                .any(|position| position <= 3);
 
-            let alt_bases: Vec<u8> = match alt_allele {
-                Allele::Sequence(bases) => match transcript.strand {
-                    Strand::Forward => bases.clone(),
-                    Strand::Reverse => bases.iter().rev().map(|&base| complement(base)).collect(),
-                },
-                _ => Vec::new(),
-            };
-            let cds_lo = cds_end.map_or(cds_pos_start, |end| cds_pos_start.min(end));
-
-            if !alt_bases.is_empty() && cds_lo >= 1 {
-                let first_changed = (cds_lo - 1) as usize;
-                let last_changed = first_changed + alt_bases.len() - 1;
-                let window_start = (first_changed / 3) * 3;
-                let window_end = (last_changed / 3 + 1) * 3;
-
-                if window_end <= seq_bytes.len() {
-                    let ref_window = seq_bytes[window_start..window_end].to_vec();
-                    let mut alt_window = ref_window.clone();
-                    let offset = first_changed - window_start;
-                    alt_window[offset..offset + alt_bases.len()].copy_from_slice(&alt_bases);
-
-                    let table = self.codon_table_for(transcript);
-                    let ref_aas: String = ref_window
-                        .chunks_exact(3)
-                        .map(|codon| table.translate(&[codon[0], codon[1], codon[2]]) as char)
-                        .collect();
-                    let alt_aas: String = alt_window
-                        .chunks_exact(3)
-                        .map(|codon| table.translate(&[codon[0], codon[1], codon[2]]) as char)
-                        .collect();
-                    let codon_pair = Some(format_codon_window(&ref_window, &alt_window));
-                    let aa_pair = Some((ref_aas.clone(), alt_aas.clone()));
-
-                    if window_start == 0
-                        && !CodonTable::is_start(&[alt_window[0], alt_window[1], alt_window[2]])
-                    {
-                        return Some((Consequence::StartLost, aa_pair, codon_pair));
-                    }
-                    if ref_aas == alt_aas {
-                        let consequence = if ref_aas.contains('*') {
-                            Consequence::StopRetainedVariant
-                        } else {
-                            Consequence::SynonymousVariant
-                        };
-                        return Some((consequence, aa_pair, codon_pair));
-                    }
-                    if ref_aas
-                        .chars()
-                        .zip(alt_aas.chars())
-                        .any(|(reference, alternate)| alternate == '*' && reference != '*')
-                    {
-                        return Some((Consequence::StopGained, aa_pair, codon_pair));
-                    }
-                    if ref_aas
-                        .chars()
-                        .zip(alt_aas.chars())
-                        .any(|(reference, alternate)| reference == '*' && alternate != '*')
-                    {
-                        return Some((Consequence::StopLost, aa_pair, codon_pair));
-                    }
-                    return Some((Consequence::MissenseVariant, aa_pair, codon_pair));
-                }
+            if affects_start_codon
+                && alt_window.len() >= 3
+                && !CodonTable::is_start(&[alt_window[0], alt_window[1], alt_window[2]])
+            {
+                return Some((Consequence::StartLost, aa_pair, codon_pair));
             }
+            if ref_aas == alt_aas {
+                let consequence = if ref_aas.contains('*') {
+                    Consequence::StopRetainedVariant
+                } else {
+                    Consequence::SynonymousVariant
+                };
+                return Some((consequence, aa_pair, codon_pair));
+            }
+            if ref_aas
+                .chars()
+                .zip(alt_aas.chars())
+                .any(|(reference, alternate)| alternate == '*' && reference != '*')
+            {
+                return Some((Consequence::StopGained, aa_pair, codon_pair));
+            }
+            if ref_aas
+                .chars()
+                .zip(alt_aas.chars())
+                .any(|(reference, alternate)| reference == '*' && alternate != '*')
+            {
+                return Some((Consequence::StopLost, aa_pair, codon_pair));
+            }
+            return Some((Consequence::MissenseVariant, aa_pair, codon_pair));
         }
 
         // Fallback: if we can't determine the exact consequence,
@@ -553,9 +556,15 @@ impl ConsequencePredictor {
         &self,
         transcript: &Transcript,
         cds_pos: u64,
+        cds_start: Option<u64>,
+        cds_end: Option<u64>,
         ref_allele: &Allele,
         alt_allele: &Allele,
         is_frameshift: bool,
+        record_ref_allele: &Allele,
+        record_alt_allele: &Allele,
+        record_cds_start: Option<u64>,
+        record_cds_end: Option<u64>,
     ) -> (Option<(String, String)>, Option<(String, String)>) {
         let translateable_seq = match transcript.translateable_seq.as_ref() {
             Some(s) => s,
@@ -586,98 +595,23 @@ impl ConsequencePredictor {
         let ref_aa_str = String::from(ref_aa as char);
 
         if is_frameshift {
-            // Build the alt sequence by applying the indel
-            let mut alt_seq: Vec<u8> = seq_bytes.to_vec();
-
-            match (ref_allele, alt_allele) {
-                (Allele::Sequence(_), Allele::Deletion) => {
-                    let del_len = ref_allele.len();
-                    let end = (cds_idx + del_len).min(alt_seq.len());
-                    alt_seq.drain(cds_idx..end);
-                }
-                (Allele::Deletion, Allele::Sequence(ins_bases)) => {
-                    let mut bases: Vec<u8> = ins_bases.clone();
-                    if transcript.strand == Strand::Reverse {
-                        bases = bases.iter().map(|&b| complement(b)).collect();
-                    }
-                    for (i, &b) in bases.iter().enumerate() {
-                        alt_seq.insert(cds_idx + i, b);
-                    }
-                }
-                (Allele::Sequence(ref_bases), Allele::Sequence(alt_bases)) => {
-                    let end = (cds_idx + ref_bases.len()).min(alt_seq.len());
-                    let mut replacement = alt_bases.clone();
-                    if transcript.strand == Strand::Reverse {
-                        replacement = replacement.iter().map(|&b| complement(b)).collect();
-                    }
-                    alt_seq.splice(cds_idx..end, replacement);
-                }
-                _ => return (None, None),
-            }
-
-            // Build codon display: VEP style with deleted base uppercase
-            // ref codon: lowercase bases, uppercase at the deleted position(s)
-            let mut ref_codon_display = String::with_capacity(3);
-            for i in 0..3 {
-                if i == codon_offset {
-                    ref_codon_display.push((ref_codon[i] as char).to_ascii_uppercase());
-                } else {
-                    ref_codon_display.push((ref_codon[i] as char).to_ascii_lowercase());
-                }
-            }
-
-            // alt codon: show only the remaining bases of the original codon after the indel
-            // For a deletion at offset 2 in a 3-base codon: show only the 2 remaining bases
-            let alt_codon_display: String = {
-                let mut original_codon: Vec<u8> = ref_codon.to_vec();
-                match (ref_allele, alt_allele) {
-                    (Allele::Sequence(_), Allele::Deletion) => {
-                        // Remove the deleted base(s) from the codon
-                        let del_len = ref_allele.len().min(3 - codon_offset);
-                        let end = (codon_offset + del_len).min(original_codon.len());
-                        original_codon.drain(codon_offset..end);
-                    }
-                    (Allele::Deletion, Allele::Sequence(ins_bases)) => {
-                        // Insert bases into the codon at the offset
-                        let mut bases = ins_bases.clone();
-                        if transcript.strand == Strand::Reverse {
-                            bases = bases.iter().map(|&b| complement(b)).collect();
-                        }
-                        for (j, &b) in bases.iter().enumerate() {
-                            original_codon.insert(codon_offset + j, b);
-                        }
-                    }
-                    _ => {}
-                }
-                original_codon
-                    .iter()
-                    .map(|&b| (b as char).to_ascii_lowercase())
-                    .collect()
+            let Some((ref_window, alt_window, ref_codons, alt_codons)) = self.coding_windows(
+                transcript,
+                cds_start,
+                cds_end,
+                ref_allele,
+                alt_allele,
+                record_ref_allele,
+                record_alt_allele,
+                record_cds_start,
+                record_cds_end,
+            ) else {
+                return (None, None);
             };
-
-            // For frameshifts, alt amino acid is always X (unknown/frameshift)
-            // For pure insertions, VEP uses "-" for ref amino acid/codon
-            // and only the inserted bases for alt codon
-            let (fs_ref_aa, fs_ref_codon, fs_alt_codon) = if *ref_allele == Allele::Deletion {
-                let ins_codon = if let Allele::Sequence(ins_bases) = alt_allele {
-                    let mut bases = ins_bases.clone();
-                    if transcript.strand == Strand::Reverse {
-                        bases = bases.iter().map(|&b| complement(b)).collect();
-                    }
-                    bases
-                        .iter()
-                        .map(|&b| (b as char).to_ascii_uppercase())
-                        .collect::<String>()
-                } else {
-                    alt_codon_display
-                };
-                ("-".to_string(), "-".to_string(), ins_codon)
-            } else {
-                (ref_aa_str, ref_codon_display, alt_codon_display)
-            };
-            let aa_pair = Some((fs_ref_aa, "X".to_string()));
-            let codon_pair = Some((fs_ref_codon, fs_alt_codon));
-            (aa_pair, codon_pair)
+            let table = self.codon_table_for(transcript);
+            let ref_aas = translate_window(&ref_window, &table, false);
+            let alt_aas = translate_window(&alt_window, &table, true);
+            (Some((ref_aas, alt_aas)), Some((ref_codons, alt_codons)))
         } else {
             // In-frame indel: build alt sequence and translate affected codons
             let mut alt_seq: Vec<u8> = seq_bytes.to_vec();
@@ -823,6 +757,80 @@ impl ConsequencePredictor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn coding_windows(
+        &self,
+        transcript: &Transcript,
+        cds_start: Option<u64>,
+        cds_end: Option<u64>,
+        ref_allele: &Allele,
+        alt_allele: &Allele,
+        record_ref_allele: &Allele,
+        record_alt_allele: &Allele,
+        record_cds_start: Option<u64>,
+        record_cds_end: Option<u64>,
+    ) -> Option<(Vec<u8>, Vec<u8>, String, String)> {
+        let sequence = transcript.translateable_seq.as_ref()?.as_bytes();
+        let cds_start = cds_start?;
+        let cds_lo = cds_end.map_or(cds_start, |end| cds_start.min(end));
+        let edit_start = if *ref_allele == Allele::Deletion {
+            cds_lo as usize
+        } else {
+            cds_lo.checked_sub(1)? as usize
+        };
+        let edit_end = edit_start.checked_add(ref_allele.len())?;
+        if edit_end > sequence.len() {
+            return None;
+        }
+
+        let replacement = transcript_allele(alt_allele, transcript.strand)?;
+        let mut alternate_sequence = sequence.to_vec();
+        alternate_sequence.splice(edit_start..edit_end, replacement);
+
+        let record_start = record_cds_start?;
+        let record_end = record_cds_end.unwrap_or(record_start);
+        let record_lo = record_start.min(record_end) as usize;
+        let record_hi = record_start.max(record_end) as usize;
+        let window_start = record_lo.checked_sub(1)? / 3 * 3;
+        let window_end = record_hi.checked_add(2)? / 3 * 3;
+        if window_end > sequence.len() {
+            return None;
+        }
+
+        let reference_window = sequence[window_start..window_end].to_vec();
+        let alternate_len = reference_window
+            .len()
+            .checked_add(record_alt_allele.len())?
+            .checked_sub(record_ref_allele.len())?;
+        let alternate_end = window_start.checked_add(alternate_len)?;
+        if alternate_end > alternate_sequence.len() {
+            return None;
+        }
+        let alternate_window = alternate_sequence[window_start..alternate_end].to_vec();
+
+        let reference_mark =
+            (record_ref_allele.len() > 0).then_some((record_lo - 1, record_ref_allele.len()));
+        let alternate_mark = (record_alt_allele.len() > 0).then_some((
+            if *record_ref_allele == Allele::Deletion {
+                edit_start
+            } else {
+                record_lo - 1
+            },
+            record_alt_allele.len(),
+        ));
+        let reference_codons =
+            display_codon_window(&reference_window, window_start, reference_mark);
+        let alternate_codons =
+            display_codon_window(&alternate_window, window_start, alternate_mark);
+
+        Some((
+            reference_window,
+            alternate_window,
+            reference_codons,
+            alternate_codons,
+        ))
+    }
+
     fn distance_to_transcript(
         &self,
         var_start: u64,
@@ -955,6 +963,49 @@ impl Default for ConsequencePredictor {
     fn default() -> Self {
         Self::new(5000, 5000)
     }
+}
+
+fn transcript_allele(allele: &Allele, strand: Strand) -> Option<Vec<u8>> {
+    match allele {
+        Allele::Deletion => Some(Vec::new()),
+        Allele::Sequence(bases) => Some(match strand {
+            Strand::Forward => bases.clone(),
+            Strand::Reverse => bases.iter().rev().map(|&base| complement(base)).collect(),
+        }),
+        _ => None,
+    }
+}
+
+fn display_codon_window(
+    bases: &[u8],
+    window_start: usize,
+    marked: Option<(usize, usize)>,
+) -> String {
+    bases
+        .iter()
+        .enumerate()
+        .map(|(offset, &base)| {
+            let index = window_start + offset;
+            let is_marked =
+                marked.is_some_and(|(start, len)| index >= start && index < start + len);
+            if is_marked {
+                (base as char).to_ascii_uppercase()
+            } else {
+                (base as char).to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+fn translate_window(bases: &[u8], table: &CodonTable, mark_partial: bool) -> String {
+    let mut amino_acids: String = bases
+        .chunks_exact(3)
+        .map(|codon| table.translate(&[codon[0], codon[1], codon[2]]) as char)
+        .collect();
+    if mark_partial && bases.len() % 3 != 0 {
+        amino_acids.push('X');
+    }
+    amino_acids
 }
 
 #[cfg(test)]
@@ -1425,6 +1476,10 @@ mod tests {
                 &tr,
                 Some(6),
                 Some(7),
+                &Allele::from_str("CA"),
+                &Allele::from_str("TG"),
+                Some(6),
+                Some(7),
             )
             .unwrap();
 
@@ -1445,6 +1500,10 @@ mod tests {
                 &Allele::from_str("TG"),
                 &Allele::from_str("CA"),
                 &tr,
+                Some(7),
+                Some(6),
+                &Allele::from_str("TG"),
+                &Allele::from_str("CA"),
                 Some(7),
                 Some(6),
             )

@@ -7,7 +7,7 @@ pub use coding::{
     hgvsc_noncoding_intronic_range, hgvsc_noncoding_with_seq, hgvsc_with_seq,
 };
 pub use genomic::hgvsg;
-pub use protein::{hgvsp, hgvsp_frameshift, hgvsp_inframe_indel};
+pub use protein::{hgvsp, hgvsp_frameshift, hgvsp_inframe_indel, hgvsp_substitution};
 
 /// Full HGVS annotation result.
 #[derive(Debug, Clone, Default)]
