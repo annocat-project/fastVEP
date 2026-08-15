@@ -196,15 +196,21 @@ pub fn aa_one_to_three(aa: u8) -> &'static str {
 /// Format a ref/alt codon pair with changed bases UPPERCASE, unchanged lowercase.
 /// Matches VEP convention: e.g., GCA/GAA → "gCa/gAa"
 pub fn format_codon_change(ref_codon: &[u8; 3], alt_codon: &[u8; 3]) -> (String, String) {
-    let mut ref_display = String::with_capacity(3);
-    let mut alt_display = String::with_capacity(3);
-    for i in 0..3 {
-        if ref_codon[i].to_ascii_uppercase() != alt_codon[i].to_ascii_uppercase() {
-            ref_display.push((ref_codon[i] as char).to_ascii_uppercase());
-            alt_display.push((alt_codon[i] as char).to_ascii_uppercase());
+    format_codon_window(ref_codon, alt_codon)
+}
+
+/// Format an arbitrary-length ref/alt codon window using VEP's casing.
+pub fn format_codon_window(ref_window: &[u8], alt_window: &[u8]) -> (String, String) {
+    let len = ref_window.len().min(alt_window.len());
+    let mut ref_display = String::with_capacity(len);
+    let mut alt_display = String::with_capacity(len);
+    for i in 0..len {
+        if !ref_window[i].eq_ignore_ascii_case(&alt_window[i]) {
+            ref_display.push((ref_window[i] as char).to_ascii_uppercase());
+            alt_display.push((alt_window[i] as char).to_ascii_uppercase());
         } else {
-            ref_display.push((ref_codon[i] as char).to_ascii_lowercase());
-            alt_display.push((alt_codon[i] as char).to_ascii_lowercase());
+            ref_display.push((ref_window[i] as char).to_ascii_lowercase());
+            alt_display.push((alt_window[i] as char).to_ascii_lowercase());
         }
     }
     (ref_display, alt_display)
@@ -288,6 +294,13 @@ mod tests {
         let (r, a) = format_codon_change(b"AAA", b"TTT");
         assert_eq!(r, "AAA");
         assert_eq!(a, "TTT");
+    }
+
+    #[test]
+    fn test_format_codon_window_across_boundary() {
+        let (r, a) = format_codon_window(b"TCCAGG", b"TCCTGG");
+        assert_eq!(r, "tccAgg");
+        assert_eq!(a, "tccTgg");
     }
 
     #[test]

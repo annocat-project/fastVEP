@@ -220,7 +220,7 @@ fn parse_gff3_lines(lines: impl Iterator<Item = Result<String>>) -> Result<Vec<T
         let attrs = parse_attributes(fields[8]);
 
         match feature_type {
-            "gene" | "pseudogene" => {
+            "gene" | "pseudogene" | "ncRNA_gene" => {
                 let gene_id = attrs
                     .get("ID")
                     .or_else(|| attrs.get("gene_id"))
@@ -273,7 +273,8 @@ fn parse_gff3_lines(lines: impl Iterator<Item = Result<String>>) -> Result<Vec<T
             | "J_gene_segment"
             | "C_gene_segment"
             | "NMD_transcript_variant"
-            | "pseudogenic_transcript" => {
+            | "pseudogenic_transcript"
+            | "unconfirmed_transcript" => {
                 let transcript_id = attrs
                     .get("ID")
                     .or_else(|| attrs.get("transcript_id"))
@@ -736,7 +737,7 @@ fn parse_gff3_lines(lines: impl Iterator<Item = Result<String>>) -> Result<Vec<T
             appris: None,
             ccds: gff_tr.ccds.clone(),
             protein_id: tr_cds.first().map(|c| c.protein_id.clone()),
-            protein_version: if !tr_cds.is_empty() { Some(1) } else { None },
+            protein_version: tr_cds.first().and_then(|c| c.protein_version),
             swissprot: vec![],
             trembl: vec![],
             uniparc: vec![],
@@ -957,6 +958,34 @@ chr1\tensembl\texon\t6000\t9000\t.\t-\t.\tID=exon:ENSE00000002;Parent=transcript
         assert!(!mpc.gencode_primary);
         assert_eq!(mpc.tsl, Some(2));
         assert!(mpc.ccds.is_none());
+    }
+
+    #[test]
+    fn test_parse_gff3_ensembl_ncrna_gene_and_unconfirmed_transcript() {
+        let gff = "##gff-version 3
+chr1\thavana\tncRNA_gene\t1000\t1500\t.\t+\t.\tID=gene:ENSG00000003;Name=TESTRNA;biotype=lncRNA
+chr1\thavana\tunconfirmed_transcript\t1000\t1500\t.\t+\t.\tID=transcript:ENST00000003;Parent=gene:ENSG00000003;biotype=TEC;version=2
+chr1\thavana\texon\t1000\t1500\t.\t+\t.\tID=exon:ENSE00000003;Parent=transcript:ENST00000003;rank=1";
+
+        let transcripts = parse_gff3(gff.as_bytes()).unwrap();
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(&*transcripts[0].stable_id, "ENST00000003");
+        assert_eq!(transcripts[0].gene.symbol.as_deref(), Some("TESTRNA"));
+        assert_eq!(&*transcripts[0].biotype, "TEC");
+    }
+
+    #[test]
+    fn test_parse_gff3_preserves_protein_version() {
+        let gff = "##gff-version 3
+chr1\tensembl\tgene\t1000\t1500\t.\t+\t.\tID=gene:ENSG00000004;Name=TESTPROTEIN;biotype=protein_coding
+chr1\tensembl\tmRNA\t1000\t1500\t.\t+\t.\tID=transcript:ENST00000004;Parent=gene:ENSG00000004;biotype=protein_coding;version=3
+chr1\tensembl\texon\t1000\t1500\t.\t+\t.\tID=exon:ENSE00000004;Parent=transcript:ENST00000004;rank=1
+chr1\tensembl\tCDS\t1050\t1400\t.\t+\t0\tID=CDS:ENSP00000004;Parent=transcript:ENST00000004;protein_id=ENSP00000004;version=7";
+
+        let transcripts = parse_gff3(gff.as_bytes()).unwrap();
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].protein_id.as_deref(), Some("ENSP00000004"));
+        assert_eq!(transcripts[0].protein_version, Some(7));
     }
 
     #[test]

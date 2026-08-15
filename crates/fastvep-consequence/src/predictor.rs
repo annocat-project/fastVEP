@@ -1,5 +1,5 @@
 use fastvep_core::{Allele, Consequence, GenomicPosition, Impact, Strand};
-use fastvep_genome::codon::format_codon_change;
+use fastvep_genome::codon::format_codon_window;
 use fastvep_genome::{is_mitochondrial, mitochondrial_codon_table, CodonTable, Transcript};
 use std::sync::Arc;
 
@@ -20,7 +20,13 @@ pub struct TranscriptConsequence {
 /// Consequence result for a single allele against a transcript.
 #[derive(Debug, Clone)]
 pub struct AlleleConsequenceResult {
+    /// ALT as represented by the parsed VCF record. Keep this for output and
+    /// supplementary-source matching.
     pub allele: Allele,
+    /// Allele-local minimal representation used for consequence and HGVS work.
+    pub normalized_position: GenomicPosition,
+    pub normalized_ref_allele: Allele,
+    pub normalized_alt_allele: Allele,
     pub consequences: Vec<Consequence>,
     pub impact: Impact,
     pub cdna_start: Option<u64>,
@@ -144,8 +150,34 @@ impl ConsequencePredictor {
         transcript: &Transcript,
         _ref_seq: Option<&[u8]>,
     ) -> AlleleConsequenceResult {
-        let var_start = position.start;
-        let var_end = position.end;
+        // VCF `*`, `.`, `<NON_REF>`, and `<*>` do not provide an alternate
+        // sequence. They cannot have a predicted molecular consequence.
+        if *alt_allele == Allele::Missing {
+            return AlleleConsequenceResult {
+                allele: alt_allele.clone(),
+                normalized_position: position.clone(),
+                normalized_ref_allele: ref_allele.clone(),
+                normalized_alt_allele: alt_allele.clone(),
+                consequences: Vec::new(),
+                impact: Impact::Modifier,
+                cdna_start: None,
+                cdna_end: None,
+                cds_start: None,
+                cds_end: None,
+                protein_start: None,
+                protein_end: None,
+                amino_acids: None,
+                codons: None,
+                exon: None,
+                intron: None,
+                distance: None,
+            };
+        }
+
+        let (normalized_position, normalized_ref_allele, normalized_alt_allele) =
+            minimize_allele(position, ref_allele, alt_allele);
+        let var_start = normalized_position.start;
+        let var_end = normalized_position.end;
         let tr_start = transcript.start;
         let tr_end = transcript.end;
 
@@ -194,6 +226,9 @@ impl ConsequencePredictor {
             let impact = Consequence::worst_impact(&consequences).unwrap_or(Impact::Modifier);
             return AlleleConsequenceResult {
                 allele: alt_allele.clone(),
+                normalized_position,
+                normalized_ref_allele,
+                normalized_alt_allele,
                 consequences,
                 impact,
                 cdna_start: None,
@@ -294,7 +329,11 @@ impl ConsequencePredictor {
             } else if in_coding_region && in_exon {
                 // Coding exonic variant - determine coding consequence
                 let coding_conseq = self.predict_coding_consequence(
-                    ref_allele, alt_allele, transcript, cds_start, cds_end,
+                    &normalized_ref_allele,
+                    &normalized_alt_allele,
+                    transcript,
+                    cds_start,
+                    cds_end,
                 );
                 if let Some((conseq, aa, cdn)) = coding_conseq {
                     consequences.push(conseq);
@@ -341,6 +380,9 @@ impl ConsequencePredictor {
 
         AlleleConsequenceResult {
             allele: alt_allele.clone(),
+            normalized_position,
+            normalized_ref_allele,
+            normalized_alt_allele,
             consequences,
             impact,
             cdna_start,
@@ -424,68 +466,74 @@ impl ConsequencePredictor {
             return Some((consequence, aa_pair, codon_pair));
         }
 
-        // Same length substitution (SNV or MNV)
+        // Same-length substitutions must be translated as one block across
+        // every codon they touch. Reverse-strand alleles also need reversal,
+        // not only base complementation.
         if let Some(ref translateable_seq) = transcript.translateable_seq {
             let seq_bytes = translateable_seq.as_bytes();
 
-            // Get the codon containing this CDS position
-            let codon_number = ((cds_pos_start - 1) / 3) as usize;
-            let codon_offset = ((cds_pos_start - 1) % 3) as usize;
-            let codon_start = codon_number * 3;
+            let alt_bases: Vec<u8> = match alt_allele {
+                Allele::Sequence(bases) => match transcript.strand {
+                    Strand::Forward => bases.clone(),
+                    Strand::Reverse => bases.iter().rev().map(|&base| complement(base)).collect(),
+                },
+                _ => Vec::new(),
+            };
+            let cds_lo = cds_end.map_or(cds_pos_start, |end| cds_pos_start.min(end));
 
-            if codon_start + 3 <= seq_bytes.len() {
-                let ref_codon = [
-                    seq_bytes[codon_start],
-                    seq_bytes[codon_start + 1],
-                    seq_bytes[codon_start + 2],
-                ];
-                let mut alt_codon = ref_codon;
+            if !alt_bases.is_empty() && cds_lo >= 1 {
+                let first_changed = (cds_lo - 1) as usize;
+                let last_changed = first_changed + alt_bases.len() - 1;
+                let window_start = (first_changed / 3) * 3;
+                let window_end = (last_changed / 3 + 1) * 3;
 
-                // Apply the substitution
-                if let Allele::Sequence(alt_bases) = alt_allele {
-                    for (i, &base) in alt_bases.iter().enumerate() {
-                        let pos = codon_offset + i;
-                        if pos < 3 {
-                            alt_codon[pos] = match transcript.strand {
-                                Strand::Forward => base,
-                                Strand::Reverse => complement(base),
-                            };
-                        }
+                if window_end <= seq_bytes.len() {
+                    let ref_window = seq_bytes[window_start..window_end].to_vec();
+                    let mut alt_window = ref_window.clone();
+                    let offset = first_changed - window_start;
+                    alt_window[offset..offset + alt_bases.len()].copy_from_slice(&alt_bases);
+
+                    let table = self.codon_table_for(transcript);
+                    let ref_aas: String = ref_window
+                        .chunks_exact(3)
+                        .map(|codon| table.translate(&[codon[0], codon[1], codon[2]]) as char)
+                        .collect();
+                    let alt_aas: String = alt_window
+                        .chunks_exact(3)
+                        .map(|codon| table.translate(&[codon[0], codon[1], codon[2]]) as char)
+                        .collect();
+                    let codon_pair = Some(format_codon_window(&ref_window, &alt_window));
+                    let aa_pair = Some((ref_aas.clone(), alt_aas.clone()));
+
+                    if window_start == 0
+                        && !CodonTable::is_start(&[alt_window[0], alt_window[1], alt_window[2]])
+                    {
+                        return Some((Consequence::StartLost, aa_pair, codon_pair));
                     }
-                }
-
-                let ref_aa = self.codon_table_for(transcript).translate(&ref_codon);
-                let alt_aa = self.codon_table_for(transcript).translate(&alt_codon);
-
-                let (ref_codon_str, alt_codon_str) = format_codon_change(&ref_codon, &alt_codon);
-
-                let ref_aa_str = String::from(ref_aa as char);
-                let alt_aa_str = String::from(alt_aa as char);
-
-                let codon_pair = Some((ref_codon_str, alt_codon_str));
-                let aa_pair = Some((ref_aa_str.clone(), alt_aa_str.clone()));
-
-                // Check if this affects the start codon
-                if codon_number == 0 && !CodonTable::is_start(&alt_codon) {
-                    return Some((Consequence::StartLost, aa_pair, codon_pair));
-                }
-
-                // Determine consequence type
-                if ref_aa == alt_aa {
-                    if ref_aa == b'*' {
-                        return Some((Consequence::StopRetainedVariant, aa_pair, codon_pair));
+                    if ref_aas == alt_aas {
+                        let consequence = if ref_aas.contains('*') {
+                            Consequence::StopRetainedVariant
+                        } else {
+                            Consequence::SynonymousVariant
+                        };
+                        return Some((consequence, aa_pair, codon_pair));
                     }
-                    return Some((Consequence::SynonymousVariant, aa_pair, codon_pair));
+                    if ref_aas
+                        .chars()
+                        .zip(alt_aas.chars())
+                        .any(|(reference, alternate)| alternate == '*' && reference != '*')
+                    {
+                        return Some((Consequence::StopGained, aa_pair, codon_pair));
+                    }
+                    if ref_aas
+                        .chars()
+                        .zip(alt_aas.chars())
+                        .any(|(reference, alternate)| reference == '*' && alternate != '*')
+                    {
+                        return Some((Consequence::StopLost, aa_pair, codon_pair));
+                    }
+                    return Some((Consequence::MissenseVariant, aa_pair, codon_pair));
                 }
-
-                if alt_aa == b'*' {
-                    return Some((Consequence::StopGained, aa_pair, codon_pair));
-                }
-                if ref_aa == b'*' {
-                    return Some((Consequence::StopLost, aa_pair, codon_pair));
-                }
-
-                return Some((Consequence::MissenseVariant, aa_pair, codon_pair));
             }
         }
 
@@ -835,6 +883,62 @@ impl ConsequencePredictor {
             Strand::Reverse => var_start < coding_start && var_start >= transcript.start,
         }
     }
+}
+
+fn minimize_allele(
+    position: &GenomicPosition,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+) -> (GenomicPosition, Allele, Allele) {
+    let (Allele::Sequence(ref_bases), Allele::Sequence(alt_bases)) = (ref_allele, alt_allele)
+    else {
+        return (position.clone(), ref_allele.clone(), alt_allele.clone());
+    };
+
+    let mut ref_end = ref_bases.len();
+    let mut alt_end = alt_bases.len();
+    while ref_end > 0
+        && alt_end > 0
+        && ref_bases[ref_end - 1].eq_ignore_ascii_case(&alt_bases[alt_end - 1])
+    {
+        ref_end -= 1;
+        alt_end -= 1;
+    }
+
+    let mut prefix = 0;
+    while prefix < ref_end
+        && prefix < alt_end
+        && ref_bases[prefix].eq_ignore_ascii_case(&alt_bases[prefix])
+    {
+        prefix += 1;
+    }
+
+    if prefix == 0 && ref_end == ref_bases.len() && alt_end == alt_bases.len() {
+        return (position.clone(), ref_allele.clone(), alt_allele.clone());
+    }
+
+    let start = position.start + prefix as u64;
+    let normalized_ref = if ref_end == prefix {
+        Allele::Deletion
+    } else {
+        Allele::Sequence(ref_bases[prefix..ref_end].to_vec())
+    };
+    let normalized_alt = if alt_end == prefix {
+        Allele::Deletion
+    } else {
+        Allele::Sequence(alt_bases[prefix..alt_end].to_vec())
+    };
+    let end = if normalized_ref == Allele::Deletion {
+        start.saturating_sub(1)
+    } else {
+        start + normalized_ref.len() as u64 - 1
+    };
+
+    (
+        GenomicPosition::new(position.chromosome.clone(), start, end, position.strand),
+        normalized_ref,
+        normalized_alt,
+    )
 }
 
 fn complement(base: u8) -> u8 {
@@ -1309,6 +1413,67 @@ mod tests {
     }
 
     #[test]
+    fn test_mnv_across_codon_boundary() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_coding_transcript();
+        tr.translateable_seq = Some("ATGTCCAGG".into());
+
+        let (consequence, amino_acids, codons) = predictor
+            .predict_coding_consequence(
+                &Allele::from_str("CA"),
+                &Allele::from_str("TG"),
+                &tr,
+                Some(6),
+                Some(7),
+            )
+            .unwrap();
+
+        assert_eq!(consequence, Consequence::MissenseVariant);
+        assert_eq!(amino_acids, Some(("SR".into(), "SG".into())));
+        assert_eq!(codons, Some(("tcCAgg".into(), "tcTGgg".into())));
+    }
+
+    #[test]
+    fn test_reverse_strand_mnv_is_reverse_complemented() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_coding_transcript();
+        tr.strand = Strand::Reverse;
+        tr.translateable_seq = Some("ATGTCCAGG".into());
+
+        let (consequence, amino_acids, codons) = predictor
+            .predict_coding_consequence(
+                &Allele::from_str("TG"),
+                &Allele::from_str("CA"),
+                &tr,
+                Some(7),
+                Some(6),
+            )
+            .unwrap();
+
+        assert_eq!(consequence, Consequence::MissenseVariant);
+        assert_eq!(amino_acids, Some(("SR".into(), "SG".into())));
+        assert_eq!(codons, Some(("tcCAgg".into(), "tcTGgg".into())));
+    }
+
+    #[test]
+    fn test_missing_allele_has_no_consequence() {
+        let predictor = ConsequencePredictor::default();
+        let tr = make_coding_transcript();
+        let position = GenomicPosition::new("chr1", 1050, 1050, Strand::Forward);
+        let result = predictor.predict(
+            &position,
+            &Allele::from_str("A"),
+            &[Allele::Missing],
+            &[&tr],
+            None,
+        );
+
+        let allele = &result.transcript_consequences[0].allele_consequences[0];
+        assert!(allele.consequences.is_empty());
+        assert_eq!(result.most_severe, None);
+    }
+
+    #[test]
     fn test_noncoding_exon_variant() {
         let predictor = ConsequencePredictor::default();
         let tr = make_noncoding_transcript();
@@ -1412,5 +1577,17 @@ mod tests {
 
         let tc = &result.transcript_consequences[0];
         assert_eq!(tc.allele_consequences.len(), 2);
+    }
+
+    #[test]
+    fn minimizes_each_multiallelic_alt_independently() {
+        let position = GenomicPosition::new("chr1", 100, 101, Strand::Forward);
+        let (position, reference, alternate) =
+            minimize_allele(&position, &Allele::from_str("CC"), &Allele::from_str("C"));
+
+        assert_eq!(position.start, 100);
+        assert_eq!(position.end, 100);
+        assert_eq!(reference, Allele::from_str("C"));
+        assert_eq!(alternate, Allele::Deletion);
     }
 }

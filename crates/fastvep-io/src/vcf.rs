@@ -207,12 +207,17 @@ pub fn parse_vcf_line(line: &str) -> Result<VariationFeature> {
         format!("{}/{}", ref_allele_str, alt_allele_strs.join("/"))
     };
 
-    // Convert to Allele enums
+    // Non-variant ALT placeholders assert that no alternate sequence exists.
+    // Mapping them to a literal sequence would produce false consequences.
     let ref_allele = Allele::from_str(&ref_allele_str);
-    let alt_alleles: Vec<Allele> = alt_allele_strs
-        .iter()
-        .map(|s| Allele::from_str(s))
-        .collect();
+    let alt_alleles: Vec<Allele> = if is_non_variant {
+        alt_allele_strs.iter().map(|_| Allele::Missing).collect()
+    } else {
+        alt_allele_strs
+            .iter()
+            .map(|s| Allele::from_str(s))
+            .collect()
+    };
 
     let variation_name = if id == "." {
         None
@@ -445,7 +450,16 @@ mod tests {
         let line = "1\t100\t.\tA\t.\t.\tPASS\t.";
         let vf = parse_vcf_line(line).unwrap();
         assert_eq!(vf.allele_string, "A");
-        assert!(vf.alt_alleles.is_empty() || vf.alt_alleles[0] == Allele::from_str("."));
+        assert!(vf.alt_alleles.iter().all(|a| *a == Allele::Missing));
+    }
+
+    #[test]
+    fn test_parse_symbolic_non_variant_alleles() {
+        for alt in ["<NON_REF>", "<*>"] {
+            let line = format!("1\t100\t.\tA\t{}\t.\tPASS\t.", alt);
+            let vf = parse_vcf_line(&line).unwrap();
+            assert!(vf.alt_alleles.iter().all(|a| *a == Allele::Missing));
+        }
     }
 
     #[test]

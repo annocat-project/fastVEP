@@ -109,6 +109,26 @@ impl Transcript {
         None
     }
 
+    /// Map a 1-based cDNA position to its genomic coordinate.
+    pub fn cdna_to_genomic(&self, cdna_pos: u64) -> Option<u64> {
+        if cdna_pos == 0 {
+            return None;
+        }
+
+        let mut remaining = cdna_pos;
+        for exon in self.sorted_exons() {
+            let exon_len = exon.end - exon.start + 1;
+            if remaining <= exon_len {
+                return match self.strand {
+                    Strand::Forward => Some(exon.start + remaining - 1),
+                    Strand::Reverse => Some(exon.end - remaining + 1),
+                };
+            }
+            remaining -= exon_len;
+        }
+        None
+    }
+
     /// Map a cDNA position to a CDS position.
     /// Returns None if the position is not in the coding region.
     pub fn cdna_to_cds(&self, cdna_pos: u64) -> Option<u64> {
@@ -466,6 +486,22 @@ mod tests {
         assert_eq!(tr.genomic_to_cdna(2000), Some(202));
         // Position in intron
         assert_eq!(tr.genomic_to_cdna(1500), None);
+    }
+
+    #[test]
+    fn test_cdna_to_genomic_forward_and_reverse() {
+        let tr = make_test_transcript();
+        assert_eq!(tr.cdna_to_genomic(1), Some(1000));
+        assert_eq!(tr.cdna_to_genomic(201), Some(1200));
+        assert_eq!(tr.cdna_to_genomic(202), Some(2000));
+        assert_eq!(tr.cdna_to_genomic(tr.cdna_length()), Some(5000));
+        assert_eq!(tr.cdna_to_genomic(tr.cdna_length() + 1), None);
+
+        let mut reverse = tr.clone();
+        reverse.strand = Strand::Reverse;
+        assert_eq!(reverse.cdna_to_genomic(1), Some(5000));
+        assert_eq!(reverse.cdna_to_genomic(1001), Some(4000));
+        assert_eq!(reverse.cdna_to_genomic(1002), Some(2300));
     }
 
     #[test]

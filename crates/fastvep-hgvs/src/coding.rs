@@ -436,6 +436,25 @@ pub fn hgvsc_noncoding(
     ref_allele: &Allele,
     alt_allele: &Allele,
 ) -> Option<String> {
+    hgvsc_noncoding_with_seq(
+        transcript_id,
+        cdna_start,
+        cdna_end,
+        ref_allele,
+        alt_allele,
+        None,
+    )
+}
+
+/// Generate non-coding HGVSc with HGVS 3' shifting for exonic deletions.
+pub fn hgvsc_noncoding_with_seq(
+    transcript_id: &str,
+    cdna_start: u64,
+    cdna_end: u64,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    spliced_seq: Option<&str>,
+) -> Option<String> {
     let prefix = format!("{}:n.", transcript_id);
     let (pos_min, pos_max) = if cdna_start <= cdna_end {
         (cdna_start, cdna_end)
@@ -457,8 +476,26 @@ pub fn hgvsc_noncoding(
                 prefix, pos_str, ref_bases[0] as char, alt_bases[0] as char
             )
         }
-        (Allele::Sequence(_), Allele::Deletion) => {
-            format!("{}{}del", prefix, pos_str)
+        (Allele::Sequence(ref_bases), Allele::Deletion) => {
+            let (mut start, mut end) = (pos_min, pos_max);
+            if let Some(seq) = spliced_seq {
+                let seq = seq.as_bytes();
+                let (mut start_index, mut end_index) = ((start - 1) as usize, (end - 1) as usize);
+                while end_index + 1 < seq.len()
+                    && seq[end_index + 1].eq_ignore_ascii_case(&seq[start_index])
+                {
+                    start_index += 1;
+                    end_index += 1;
+                }
+                start = start_index as u64 + 1;
+                end = end_index as u64 + 1;
+            }
+            let shifted = if ref_bases.len() == 1 {
+                start.to_string()
+            } else {
+                format!("{}_{}", start, end)
+            };
+            format!("{}{}del", prefix, shifted)
         }
         (Allele::Deletion, Allele::Sequence(alt_bases)) => {
             let ins_pos = format!("{}_{}", pos_max, pos_max + 1);
@@ -723,5 +760,18 @@ mod tests {
             &Allele::Sequence(b"G".to_vec()),
         );
         assert_eq!(result, Some("ENST00000472807.5:n.100A>G".to_string()));
+    }
+
+    #[test]
+    fn test_hgvsc_noncoding_deletion_3prime_shift() {
+        let result = hgvsc_noncoding_with_seq(
+            "ENST00000472807.5",
+            4,
+            4,
+            &Allele::Sequence(b"T".to_vec()),
+            &Allele::Deletion,
+            Some("AACTTTTGA"),
+        );
+        assert_eq!(result, Some("ENST00000472807.5:n.7del".to_string()));
     }
 }

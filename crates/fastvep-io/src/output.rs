@@ -42,7 +42,10 @@ fn format_csq_entry_into(
         // Write each field value directly into buf via escape_csq_str, avoiding
         // temporary String allocations for most fields.
         match *field {
-            "Allele" => escape_csq_str(&aa.allele.to_string(), buf),
+            "Allele" => escape_csq_str(
+                &normalized_csq_allele(&vf.ref_allele, &aa.allele, vf.alt_alleles.len()),
+                buf,
+            ),
             "Consequence" => {
                 for (j, c) in aa.consequences.iter().enumerate() {
                     if j > 0 {
@@ -1490,6 +1493,45 @@ pub fn format_tab_line_with(
     lines
 }
 
+fn normalized_csq_allele(
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    alternate_count: usize,
+) -> String {
+    if alternate_count > 1 {
+        return alt_allele.to_string();
+    }
+
+    let (Allele::Sequence(reference), Allele::Sequence(alternate)) = (ref_allele, alt_allele)
+    else {
+        return alt_allele.to_string();
+    };
+
+    let mut ref_end = reference.len();
+    let mut alt_end = alternate.len();
+    while ref_end > 0
+        && alt_end > 0
+        && reference[ref_end - 1].eq_ignore_ascii_case(&alternate[alt_end - 1])
+    {
+        ref_end -= 1;
+        alt_end -= 1;
+    }
+
+    let mut prefix = 0;
+    while prefix < ref_end
+        && prefix < alt_end
+        && reference[prefix].eq_ignore_ascii_case(&alternate[prefix])
+    {
+        prefix += 1;
+    }
+
+    if prefix == alt_end {
+        "-".to_string()
+    } else {
+        String::from_utf8_lossy(&alternate[prefix..alt_end]).into_owned()
+    }
+}
+
 fn supplementary_alleles(vf: &VariationFeature) -> Vec<serde_json::Value> {
     let mut by_allele = BTreeMap::<String, serde_json::Map<String, Value>>::new();
     for tv in &vf.transcript_variations {
@@ -1951,6 +1993,16 @@ mod tests {
         assert_eq!(escape_csq_value("a|b"), "a&b");
         assert_eq!(escape_csq_value("a b"), "a_b");
         assert_eq!(escape_csq_value("p.Leu153="), "p.Leu153%3D");
+    }
+
+    #[test]
+    fn csq_allele_is_minimized_without_changing_source_allele() {
+        let reference = Allele::from_str("CC");
+        let alternate = Allele::from_str("C");
+
+        assert_eq!(normalized_csq_allele(&reference, &alternate, 1), "-");
+        assert_eq!(normalized_csq_allele(&reference, &alternate, 2), "C");
+        assert_eq!(alternate.to_string(), "C");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Predicts consequences for SVs (deletions, duplications, inversions,
 //! CNVs, breakends) based on their overlap with transcripts.
 
-use fastvep_core::{Allele, Consequence, Impact, Strand, VariantType};
+use fastvep_core::{Allele, Consequence, GenomicPosition, Impact, Strand, VariantType};
 use fastvep_genome::Transcript;
 use std::sync::Arc;
 
@@ -135,6 +135,14 @@ fn predict_sv_for_transcript(
 
         return AlleleConsequenceResult {
             allele: allele.clone(),
+            normalized_position: GenomicPosition::new(
+                transcript.chromosome.to_string(),
+                sv_start,
+                sv_end,
+                Strand::Forward,
+            ),
+            normalized_ref_allele: Allele::Deletion,
+            normalized_alt_allele: allele.clone(),
             consequences: vec![consequence],
             impact: consequence.impact(),
             cdna_start: None,
@@ -169,6 +177,14 @@ fn predict_sv_for_transcript(
 
     AlleleConsequenceResult {
         allele: allele.clone(),
+        normalized_position: GenomicPosition::new(
+            transcript.chromosome.to_string(),
+            sv_start,
+            sv_end,
+            Strand::Forward,
+        ),
+        normalized_ref_allele: Allele::Deletion,
+        normalized_alt_allele: allele.clone(),
         consequences,
         impact,
         cdna_start: None,
