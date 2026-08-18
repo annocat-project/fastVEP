@@ -279,7 +279,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -378,7 +378,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -476,7 +476,7 @@ chr1\t26011\t2.71
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -559,7 +559,7 @@ fn annotate_vcf_replaces_existing_fastvep_info() {
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -631,7 +631,7 @@ fn annotate_vcf_emits_fastsa_projection_for_gnomad() {
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -661,20 +661,24 @@ fn annotate_vcf_emits_fastsa_projection_for_gnomad() {
 }
 
 #[test]
-fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
+fn annotate_tab_emits_fastsa_columns_from_separate_directories() {
     // Regression test for issue #30: tab output silently dropped every
     // supplementary annotation source. After fix, each loaded source must
     // produce one extra tab column with the same pipe-delimited value used
     // for the VCF `FV_*` INFO field.
     let tmp = tempfile::tempdir().unwrap();
-    let gnomad_source = tmp.path().join("gnomad-mini.vcf");
+    let clinvar_dir = tmp.path().join("clinvar");
+    let gnomad_dir = tmp.path().join("gnomad");
+    fs::create_dir_all(&clinvar_dir).unwrap();
+    fs::create_dir_all(&gnomad_dir).unwrap();
+    let gnomad_source = gnomad_dir.join("gnomad-mini.vcf");
     let input_vcf = tmp.path().join("input.vcf");
     let gff3 = tmp.path().join("mini.gff3");
-    let gnomad_base = tmp.path().join("gnomad-mini");
+    let gnomad_base = gnomad_dir.join("gnomad-mini");
     let output_tab = tmp.path().join("annotated.tab");
     let transcript_cache = tmp.path().join("mini.fastvep.cache");
 
-    write_clinvar_fixture(tmp.path());
+    write_clinvar_fixture(&clinvar_dir);
     fs::write(&gnomad_source, GNOMAD_SOURCE_VCF).unwrap();
     fs::write(&input_vcf, INPUT_NO_SPLICEAI_INFO_VCF).unwrap();
     fs::write(&gff3, MINI_GFF3).unwrap();
@@ -702,7 +706,10 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![
+            clinvar_dir.to_string_lossy().into_owned(),
+            gnomad_dir.to_string_lossy().into_owned(),
+        ],
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -830,7 +837,7 @@ fn sa_only_vcf_omits_csq_and_default_pipeline() {
         distance: 0,
         cache_dir: None,
         transcript_cache: None,
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: true,
         acmg: false,
         acmg_config: None,
@@ -895,7 +902,7 @@ fn sa_only_tab_emits_minimal_columns() {
         distance: 0,
         cache_dir: None,
         transcript_cache: None,
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: true,
         acmg: false,
         acmg_config: None,
@@ -968,7 +975,7 @@ fn sa_only_json_omits_transcript_consequences() {
         distance: 0,
         cache_dir: None,
         transcript_cache: None,
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: true,
         acmg: false,
         acmg_config: None,
@@ -1066,7 +1073,7 @@ fn sa_only_requires_sa_dir() {
         distance: 0,
         cache_dir: None,
         transcript_cache: None,
-        sa_dir: None,
+        sa_dir: Vec::new(),
         sa_only: true,
         acmg: false,
         acmg_config: None,
@@ -1138,7 +1145,7 @@ fn sa_only_multi_allelic_emits_per_alt_rows_with_independent_sa_columns() {
         distance: 0,
         cache_dir: None,
         transcript_cache: None,
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: true,
         acmg: false,
         acmg_config: None,
@@ -1218,7 +1225,7 @@ fn sa_only_strips_preexisting_csq_from_input_info() {
         distance: 0,
         cache_dir: None,
         transcript_cache: None,
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: true,
         acmg: false,
         acmg_config: None,
@@ -1292,7 +1299,7 @@ fn sa_only_strips_csq_when_in_middle_of_info_field() {
         distance: 0,
         cache_dir: None,
         transcript_cache: None,
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: true,
         acmg: false,
         acmg_config: None,
@@ -1390,7 +1397,7 @@ fn intergenic_variant_with_sa_dir_in_default_mode_emits_fv_clinvar() {
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_dir: vec![tmp.path().to_string_lossy().into_owned()],
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -1454,7 +1461,7 @@ fn annotate_tab_gene_list_filters_to_panel_genes() {
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: None,
+        sa_dir: Vec::new(),
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -1510,7 +1517,7 @@ fn annotate_tab_explicit_alleles_inserts_ref_column() {
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: None,
+        sa_dir: Vec::new(),
         sa_only: false,
         acmg: false,
         acmg_config: None,
@@ -1598,7 +1605,7 @@ min_dp = 8
         distance: 0,
         cache_dir: None,
         transcript_cache: Some(transcript_cache.to_string_lossy().into_owned()),
-        sa_dir: None,
+        sa_dir: Vec::new(),
         sa_only: false,
         acmg: false,
         acmg_config: None,

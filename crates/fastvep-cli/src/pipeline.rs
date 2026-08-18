@@ -282,8 +282,8 @@ pub struct AnnotateConfig {
     pub distance: u64,
     pub cache_dir: Option<String>,
     pub transcript_cache: Option<String>,
-    /// Directory containing supplementary annotation files (.osa, .osi, .oga).
-    pub sa_dir: Option<String>,
+    /// Directories containing supplementary annotation files (.osa, .osi, .oga).
+    pub sa_dir: Vec<String>,
     /// Skip the default 49-field CSQ annotation pipeline and emit only
     /// supplementary annotations from `--sa-dir`. Requires `sa_dir`.
     pub sa_only: bool,
@@ -325,7 +325,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
         .map(|_| PerformanceProfile::new(&config.output_format, config.buffer_size.max(1)));
     let sa_only = config.sa_only;
     if sa_only {
-        if config.sa_dir.is_none() {
+        if config.sa_dir.is_empty() {
             return Err(anyhow::anyhow!(
                 "--sa-only requires --sa-dir to be set (otherwise there is nothing to emit)."
             ));
@@ -611,16 +611,21 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     // shows up here rather than as a silent stall before the progress meter
     // (issue #78). `tracing` has no subscriber installed in the CLI.
     let source_loading_started = phase_start(&performance);
-    let sa_providers: Vec<Box<dyn AnnotationProvider>> = if let Some(ref dir) = config.sa_dir {
+    let sa_providers: Vec<Box<dyn AnnotationProvider>> = if !config.sa_dir.is_empty() {
         let t0 = std::time::Instant::now();
-        let loaded: Vec<Box<dyn AnnotationProvider>> = load_sa_providers(Path::new(dir))?
+        let loaded = config
+            .sa_dir
+            .par_iter()
+            .map(|dir| load_sa_providers(Path::new(dir)))
+            .collect::<Result<Vec<_>>>()?
             .into_iter()
+            .flatten()
             .map(|m| m.into_inner().unwrap())
-            .collect();
+            .collect::<Vec<Box<dyn AnnotationProvider>>>();
         eprintln!(
-            "Loaded {} supplementary annotation source(s) from {} in {:.1}s",
+            "Loaded {} supplementary annotation source(s) from {} directories in {:.1}s",
             loaded.len(),
-            dir,
+            config.sa_dir.len(),
             t0.elapsed().as_secs_f64()
         );
         loaded
@@ -635,7 +640,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     if sa_only && sa_providers.is_empty() {
         eprintln!(
             "warning: --sa-only is set but --sa-dir {:?} loaded zero allele-level supplementary providers; output will contain no annotations.",
-            config.sa_dir.as_deref().unwrap_or("")
+            config.sa_dir.join(", ")
         );
     }
 
@@ -644,34 +649,48 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     // transcript overlap, which sa_only does not produce. Loading them anyway
     // would emit always-empty headers/columns.
     let gene_providers: Vec<fastvep_sa::gene::GeneIndex> = if sa_only {
-        if let Some(ref dir) = config.sa_dir {
+        if !config.sa_dir.is_empty() {
             // Cheap probe: just count `.oga` files instead of fully loading
             // each one. Earlier this path called `load_gene_providers` and
             // discarded the result, paying the full disk-read cost for a
             // warning message that only needs a yes/no on presence.
-            let oga_count = std::fs::read_dir(Path::new(dir))
-                .map(|it| {
-                    it.flatten()
-                        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("oga"))
-                        .count()
+            let oga_count = config
+                .sa_dir
+                .iter()
+                .map(|dir| {
+                    std::fs::read_dir(Path::new(dir))
+                        .map(|it| {
+                            it.flatten()
+                                .filter(|e| {
+                                    e.path().extension().and_then(|s| s.to_str()) == Some("oga")
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0)
                 })
-                .unwrap_or(0);
+                .sum::<usize>();
             if oga_count > 0 {
                 eprintln!(
-                    "warning: --sa-only ignores {} gene-level annotation source(s) (.oga) in {}; gene-level SA requires transcript overlap.",
+                    "warning: --sa-only ignores {} gene-level annotation source(s) (.oga) in the supplementary annotation directories; gene-level SA requires transcript overlap.",
                     oga_count,
-                    dir
                 );
             }
         }
         Vec::new()
-    } else if let Some(ref dir) = config.sa_dir {
-        let loaded = load_gene_providers(Path::new(dir))?;
+    } else if !config.sa_dir.is_empty() {
+        let loaded = config
+            .sa_dir
+            .par_iter()
+            .map(|dir| load_gene_providers(Path::new(dir)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         if !loaded.is_empty() {
             eprintln!(
-                "Loaded {} gene-level annotation source(s) from {}",
+                "Loaded {} gene-level annotation source(s) from {} directories",
                 loaded.len(),
-                dir
+                config.sa_dir.len()
             );
         }
         loaded
@@ -6319,7 +6338,7 @@ mod hgvsp_inframe_tests {
             distance: 5000,
             cache_dir: None,
             transcript_cache: None,
-            sa_dir: None,
+            sa_dir: Vec::new(),
             sa_only: false,
             acmg: false,
             acmg_config: None,

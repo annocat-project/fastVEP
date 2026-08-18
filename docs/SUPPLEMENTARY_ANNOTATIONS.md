@@ -66,7 +66,8 @@ All readers refuse malformed/oversized index payloads (the `.osa.idx`,
 size is bounded — see `crates/fastvep-sa/src/common.rs::MAX_INDEX_PAYLOAD`).
 A directory passed to `--sa-dir` is scanned for any of the four
 extensions; mismatched files (e.g. a `.tsv` left in place) are silently
-skipped.
+skipped. Repeat `--sa-dir` to load providers from separate directories. The
+directories are read in the supplied order and do not need to share a volume.
 
 ## Choosing v1 vs v2 (`--format`)
 

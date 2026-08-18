@@ -80,9 +80,10 @@ enum Commands {
         #[arg(long)]
         transcript_cache: Option<String>,
 
-        /// Directory containing supplementary annotation files (.osa, .osi, .oga)
+        /// Directory containing supplementary annotation files (.osa, .osi, .oga).
+        /// Repeat the option to load more than one directory.
         #[arg(long)]
-        sa_dir: Option<String>,
+        sa_dir: Vec<String>,
 
         /// Skip the default 49-field CSQ annotation pipeline (transcript
         /// consequence, HGVS, ACMG, VEP variation cache) and emit only
@@ -463,4 +464,28 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn annotate_accepts_repeated_supplementary_directories() {
+        let cli = Cli::try_parse_from([
+            "fastvep",
+            "annotate",
+            "--input",
+            "variants.vcf",
+            "--sa-dir",
+            "clinvar",
+            "--sa-dir",
+            "gnomad",
+        ])
+        .unwrap();
+        let Commands::Annotate { sa_dir, .. } = cli.command else {
+            panic!("expected annotate command");
+        };
+        assert_eq!(sa_dir, ["clinvar", "gnomad"]);
+    }
 }

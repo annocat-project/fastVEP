@@ -165,6 +165,8 @@ fastvep sa-verify --input clinvar.osa2 --assembly GRCh38
 For chromosome-sharded sources, build one cache per chromosome and place the
 verified shards and manifest in the same source directory. `--sa-dir` loads
 compatible OSA1, OSA2, interval, and gene-level providers from that directory.
+Repeat `--sa-dir` to load verified providers from separate directories without
+copying or linking them into a shared staging directory.
 
 The `sa-convert` command converts verified CADD or SpliceAI OSA1 shards to OSA2.
 It never overwrites its input:
