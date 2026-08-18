@@ -64,6 +64,10 @@ This fork adds the interfaces and correctness rules needed for that workflow.
 - Correct consequence and HGVS handling for multiallelic records, noncoding
   genes, splice-boundary deletions, protein versions, and mitochondrial start
   uncertainty.
+- Resolve in-frame HGVSp changes against either end of the affected residue
+  span and report start-codon deletions as uncertain.
+- Preserve annotated selenocysteine residues when translating complete nuclear
+  coding sequences.
 
 ### Performance and safety
 
@@ -84,6 +88,9 @@ This fork adds the interfaces and correctness rules needed for that workflow.
   until the corresponding chunk is queried.
 - Keep installed transcript caches read-only during annotation and fully verify
   newly built transcript caches before installation.
+- Publish rebuilt transcript caches atomically with frame checksums, reject an
+  unusable explicit cache, and never reuse a region-limited GFF3 load as a
+  whole-file cache.
 - Summarize repeated missing-contig warnings instead of emitting one warning per
   transcript.
 - Report aggregate phase timings, source lookups, cache hits and misses, decoded

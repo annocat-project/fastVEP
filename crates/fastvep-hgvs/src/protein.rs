@@ -93,6 +93,14 @@ fn residue_span(first_pos: u64, residues: &[u8]) -> String {
     }
 }
 
+fn uncertain_from_initiator(residues: &[u8]) -> String {
+    if residues.len() == 1 {
+        format!("{}1?", aa_one_to_three(residues[0]))
+    } else {
+        format!("{}1_?{}", three_letter(residues), residues.len())
+    }
+}
+
 fn three_letter(residues: &[u8]) -> String {
     residues.iter().map(|&aa| aa_one_to_three(aa)).collect()
 }
@@ -132,6 +140,15 @@ fn peptide_carries(peptide: &[u8], protein_start: u64, reference: &[u8]) -> bool
     peptide.get(start..end) == Some(reference)
 }
 
+fn anchor_candidates(protein_start: u64, reference_len: usize) -> [Option<u64>; 2] {
+    let from_end = reference_len
+        .checked_sub(1)
+        .filter(|&back| back > 0)
+        .and_then(|back| protein_start.checked_sub(back as u64))
+        .filter(|&anchor| anchor > 0);
+    [Some(protein_start), from_end]
+}
+
 /// Generate HGVSp notation for an in-frame insertion, deletion, or delins.
 ///
 /// Insertions and deletions use the HGVS 3' rule when the transcript peptide
@@ -160,13 +177,22 @@ pub fn hgvsp_inframe_indel(
 
     // Transcript peptides include the terminator. It is not a protein residue
     // and must not participate in shifting or flank an insertion.
-    let peptide = peptide
-        .map(str::as_bytes)
-        .map(|value| match value.iter().position(|&aa| aa == b'*') {
-            Some(stop) => &value[..stop],
-            None => value,
-        })
-        .filter(|value| peptide_carries(value, protein_start, &original_ref));
+    let peptide =
+        peptide
+            .map(str::as_bytes)
+            .map(|value| match value.iter().position(|&aa| aa == b'*') {
+                Some(stop) => &value[..stop],
+                None => value,
+            });
+    let Some((peptide, protein_start)) = peptide.and_then(|value| {
+        anchor_candidates(protein_start, original_ref.len())
+            .into_iter()
+            .flatten()
+            .find(|&anchor| peptide_carries(value, anchor, &original_ref))
+            .map(|anchor| (value, anchor))
+    }) else {
+        return fallback();
+    };
 
     // Reduce the caller's replacement to the minimal changed region.
     let mut reference = original_ref.clone();
@@ -187,8 +213,7 @@ pub fn hgvsp_inframe_indel(
     }
 
     if reference.is_empty() {
-        let (Some(peptide), Some(mut at)) = (peptide, start.checked_sub(1).map(|v| v as usize))
-        else {
+        let Some(mut at) = start.checked_sub(1).map(|v| v as usize) else {
             return fallback();
         };
         let mut inserted = alternate;
@@ -227,25 +252,26 @@ pub fn hgvsp_inframe_indel(
     } else if alternate.is_empty() {
         let mut at = start;
         let mut residues = reference;
-        if let Some(peptide) = peptide {
-            let len = residues.len();
-            loop {
-                let first = at
-                    .checked_sub(1)
-                    .and_then(|index| peptide.get(index as usize));
-                let following = peptide.get(at as usize + len - 1);
-                match (first, following) {
-                    (Some(left), Some(right)) if left == right => at += 1,
-                    _ => break,
-                }
-            }
-            match at
+        let len = residues.len();
+        loop {
+            let first = at
                 .checked_sub(1)
-                .and_then(|begin| peptide.get(begin as usize..begin as usize + len))
-            {
-                Some(block) => residues = block.to_vec(),
-                None => return fallback(),
+                .and_then(|index| peptide.get(index as usize));
+            let following = peptide.get(at as usize + len - 1);
+            match (first, following) {
+                (Some(left), Some(right)) if left == right => at += 1,
+                _ => break,
             }
+        }
+        match at
+            .checked_sub(1)
+            .and_then(|begin| peptide.get(begin as usize..begin as usize + len))
+        {
+            Some(block) => residues = block.to_vec(),
+            None => return fallback(),
+        }
+        if at == 1 {
+            return Some(format!("{}{}", prefix, uncertain_from_initiator(&residues)));
         }
         Some(format!("{}{}del", prefix, residue_span(at, &residues)))
     } else {
@@ -571,6 +597,28 @@ mod tests {
     fn test_hgvsp_inframe_ignores_inconsistent_peptide() {
         let r = hgvsp_inframe_indel("ENSP1", 2, "F", "-", Some("MQQQQQK"));
         assert_eq!(r, Some("ENSP1:p.Phe2del".to_string()));
+    }
+
+    #[test]
+    fn inframe_indel_accepts_either_end_of_the_affected_span() {
+        for anchor in [4, 5] {
+            assert_eq!(
+                hgvsp_inframe_indel("ENSP1", anchor, "FF", "F", Some("MRIFFASM")),
+                Some("ENSP1:p.Phe5del".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_of_the_initiation_codon_is_uncertain() {
+        assert_eq!(
+            hgvsp_inframe_indel("ENSP1", 1, "MNII", "I", Some("MNIIDIVAIIPY")),
+            Some("ENSP1:p.MetAsnIle1_?3".to_string())
+        );
+        assert_eq!(
+            hgvsp_inframe_indel("ENSP1", 1, "EA", "A", Some("EAKRQ")),
+            Some("ENSP1:p.Glu1?".to_string())
+        );
     }
 
     #[test]

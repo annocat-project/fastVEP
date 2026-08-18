@@ -20,6 +20,4 @@ noodles-csi = { workspace = true }
 bincode = { workspace = true }
 memmap2 = { workspace = true }
 zstd = { workspace = true }
-
-[dev-dependencies]
 tempfile = { workspace = true }

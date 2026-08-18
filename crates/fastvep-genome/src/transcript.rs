@@ -70,6 +70,19 @@ pub struct Transcript {
     pub codon_table_start_phase: u64,
 }
 
+fn resolve_readthrough_selenocysteine(peptide: &mut [u8], cds: &[u8], table: &CodonTable) {
+    if !table.is_stop(b"TGA") || !cds.len().is_multiple_of(3) || peptide.last() != Some(&b'*') {
+        return;
+    }
+
+    let last = peptide.len() - 1;
+    for (index, residue) in peptide[..last].iter_mut().enumerate() {
+        if *residue == b'*' && cds[index * 3..index * 3 + 3].eq_ignore_ascii_case(b"TGA") {
+            *residue = b'U';
+        }
+    }
+}
+
 impl Transcript {
     /// Whether this transcript is protein-coding.
     pub fn is_coding(&self) -> bool {
@@ -195,7 +208,12 @@ impl Transcript {
                 } else {
                     CodonTable::standard()
                 };
-                let peptide_bytes = codon_table.translate_seq(translateable.as_bytes());
+                let mut peptide_bytes = codon_table.translate_seq(translateable.as_bytes());
+                resolve_readthrough_selenocysteine(
+                    &mut peptide_bytes,
+                    translateable.as_bytes(),
+                    &codon_table,
+                );
                 self.peptide = Some(String::from_utf8_lossy(&peptide_bytes).to_string());
             }
         }
@@ -377,6 +395,31 @@ pub struct Translation {
 
 #[cfg(test)]
 mod tests {
+    fn translated(cds: &str) -> String {
+        let table = CodonTable::standard();
+        let mut peptide = table.translate_seq(cds.as_bytes());
+        super::resolve_readthrough_selenocysteine(&mut peptide, cds.as_bytes(), &table);
+        String::from_utf8(peptide).unwrap()
+    }
+
+    #[test]
+    fn resolves_only_corroborated_internal_tga_as_selenocysteine() {
+        assert_eq!(translated("ATGAAATGACGGTAA"), "MKUR*");
+        assert_eq!(translated("ATGAAATAACGGTAA"), "MK*R*");
+        assert_eq!(translated("ATGAAATGACGGCGG"), "MK*RR");
+        assert_eq!(translated("ATGAAATGACGGTA"), "MK*R");
+    }
+
+    #[test]
+    fn leaves_mitochondrial_tga_translation_unchanged() {
+        let table = crate::mitochondrial::mitochondrial_codon_table();
+        let cds = b"ATGAAATGACGGAGA";
+        let mut peptide = table.translate_seq(cds);
+        let expected = peptide.clone();
+        super::resolve_readthrough_selenocysteine(&mut peptide, cds, &table);
+        assert_eq!(peptide, expected);
+    }
+
     use super::*;
 
     fn make_test_transcript() -> Transcript {

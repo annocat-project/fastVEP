@@ -19,11 +19,22 @@ const CACHE_MAGIC_V1: &[u8; 8] = b"FSTVEP01";
 
 /// Save transcripts to a binary cache file (bincode + zstd).
 pub fn save_cache(transcripts: &[Transcript], path: &Path) -> Result<()> {
-    let file =
-        File::create(path).with_context(|| format!("Creating cache file: {}", path.display()))?;
-    let writer = BufWriter::new(file);
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::Builder::new()
+        .prefix(".fastvep-cache-")
+        .suffix(".partial")
+        .tempfile_in(dir)
+        .with_context(|| format!("Creating temporary cache file in {}", dir.display()))?;
+    let writer = BufWriter::new(
+        tmp.reopen()
+            .with_context(|| format!("Reopening temporary cache file {}", tmp.path().display()))?,
+    );
     // zstd level 1: fast compression, still much better decompression than gzip
     let mut zst = zstd::Encoder::new(writer, 1)?;
+    zst.include_checksum(true)?;
 
     // Write magic header
     use std::io::Write;
@@ -33,7 +44,27 @@ pub fn save_cache(transcripts: &[Transcript], path: &Path) -> Result<()> {
     bincode::serialize_into(&mut zst, transcripts)
         .with_context(|| "Serializing transcripts to cache")?;
 
-    zst.finish()?;
+    let mut writer = zst.finish()?;
+    writer.flush().with_context(|| "Flushing cache writer")?;
+    writer
+        .get_ref()
+        .sync_all()
+        .with_context(|| "Syncing cache file to disk")?;
+    drop(writer);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o7777)
+            .unwrap_or(0o644);
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("Setting cache permissions for {}", path.display()))?;
+    }
+
+    tmp.persist(path).map_err(|error| {
+        anyhow::anyhow!("Publishing cache file {}: {}", path.display(), error.error)
+    })?;
     Ok(())
 }
 
@@ -328,11 +359,11 @@ mod tests {
     #[test]
     fn test_cache_roundtrip() {
         let transcripts = vec![make_test_transcript()];
-        let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcripts.cache");
 
-        save_cache(&transcripts, path).unwrap();
-        let loaded = load_cache(path).unwrap();
+        save_cache(&transcripts, &path).unwrap();
+        let loaded = load_cache(&path).unwrap();
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(&*loaded[0].stable_id, "ENST00000001");
@@ -395,10 +426,11 @@ mod tests {
 
     #[test]
     fn verifies_a_sequence_complete_primary_cache() {
-        let tmp = NamedTempFile::new().unwrap();
-        save_cache(&[make_coding_transcript("1", true)], tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcripts.cache");
+        save_cache(&[make_coding_transcript("1", true)], &path).unwrap();
 
-        let report = verify_cache(tmp.path(), true).unwrap();
+        let report = verify_cache(&path, true).unwrap();
         assert_eq!(report.cache_format, "FSTVEP02");
         assert_eq!(report.transcript_count, 1);
         assert_eq!(report.coding_with_sequence_count, 1);
@@ -407,20 +439,43 @@ mod tests {
 
     #[test]
     fn rejects_missing_primary_coding_sequences_when_required() {
-        let tmp = NamedTempFile::new().unwrap();
-        save_cache(&[make_coding_transcript("chr1", false)], tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcripts.cache");
+        save_cache(&[make_coding_transcript("chr1", false)], &path).unwrap();
 
-        assert!(verify_cache(tmp.path(), true).is_err());
-        let report = verify_cache(tmp.path(), false).unwrap();
+        assert!(verify_cache(&path, true).is_err());
+        let report = verify_cache(&path, false).unwrap();
         assert_eq!(report.primary_coding_missing_sequence_count, 1);
     }
 
     #[test]
     fn permits_missing_non_primary_sequences() {
-        let tmp = NamedTempFile::new().unwrap();
-        save_cache(&[make_coding_transcript("KI270713.1", false)], tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcripts.cache");
+        save_cache(&[make_coding_transcript("KI270713.1", false)], &path).unwrap();
 
-        let report = verify_cache(tmp.path(), true).unwrap();
+        let report = verify_cache(&path, true).unwrap();
         assert_eq!(report.non_primary_coding_missing_sequence_count, 1);
+    }
+
+    #[test]
+    fn replaces_an_existing_cache_without_leaving_a_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcripts.cache");
+        save_cache(&[make_test_transcript()], &path).unwrap();
+
+        let mut replacement = make_test_transcript();
+        replacement.stable_id = "ENST00000002".into();
+        save_cache(&[replacement], &path).unwrap();
+
+        let loaded = load_cache(&path).unwrap();
+        assert_eq!(&*loaded[0].stable_id, "ENST00000002");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".partial")
+        }));
     }
 }

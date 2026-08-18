@@ -41,6 +41,18 @@ pub struct AlleleConsequenceResult {
     pub distance: Option<i64>,
 }
 
+fn resolve_readthrough_residue(transcript: &Transcript, codon_index: usize, translated: u8) -> u8 {
+    if translated != b'*' {
+        return translated;
+    }
+    transcript
+        .peptide
+        .as_deref()
+        .and_then(|peptide| peptide.as_bytes().get(codon_index).copied())
+        .filter(|&residue| residue != b'*')
+        .unwrap_or(translated)
+}
+
 /// Full prediction result for a variant.
 #[derive(Debug, Clone)]
 pub struct PredictionResult {
@@ -488,20 +500,30 @@ impl ConsequencePredictor {
         // Same-length substitutions must be translated as one block across
         // every codon they touch. Reverse-strand alleles also need reversal,
         // not only base complementation.
-        if let Some((ref_window, alt_window, ref_codons, alt_codons)) = self.coding_windows(
-            transcript,
-            cds_start,
-            cds_end,
-            ref_allele,
-            alt_allele,
-            record_ref_allele,
-            record_alt_allele,
-            record_cds_start,
-            record_cds_end,
-        ) {
+        if let Some((ref_window, alt_window, ref_codons, alt_codons, window_start)) = self
+            .coding_windows(
+                transcript,
+                cds_start,
+                cds_end,
+                ref_allele,
+                alt_allele,
+                record_ref_allele,
+                record_alt_allele,
+                record_cds_start,
+                record_cds_end,
+            )
+        {
             let table = self.codon_table_for(transcript);
-            let ref_aas = translate_window(&ref_window, &table, false);
-            let alt_aas = translate_window(&alt_window, &table, false);
+            let ref_aas =
+                translate_reference_window(&ref_window, table, transcript, window_start, false);
+            let alt_aas = translate_alternate_window(
+                &alt_window,
+                &ref_window,
+                table,
+                transcript,
+                window_start,
+                false,
+            );
             let codon_pair = Some((ref_codons, alt_codons));
             let aa_pair = Some((ref_aas.clone(), alt_aas.clone()));
             let affects_start_codon = record_cds_start
@@ -591,26 +613,40 @@ impl ConsequencePredictor {
             seq_bytes[codon_start + 1],
             seq_bytes[codon_start + 2],
         ];
-        let ref_aa = self.codon_table_for(transcript).translate(&ref_codon);
+        let ref_aa = resolve_readthrough_residue(
+            transcript,
+            codon_number,
+            self.codon_table_for(transcript).translate(&ref_codon),
+        );
         let ref_aa_str = String::from(ref_aa as char);
 
         if is_frameshift {
-            let Some((ref_window, alt_window, ref_codons, alt_codons)) = self.coding_windows(
-                transcript,
-                cds_start,
-                cds_end,
-                ref_allele,
-                alt_allele,
-                record_ref_allele,
-                record_alt_allele,
-                record_cds_start,
-                record_cds_end,
-            ) else {
+            let Some((ref_window, alt_window, ref_codons, alt_codons, window_start)) = self
+                .coding_windows(
+                    transcript,
+                    cds_start,
+                    cds_end,
+                    ref_allele,
+                    alt_allele,
+                    record_ref_allele,
+                    record_alt_allele,
+                    record_cds_start,
+                    record_cds_end,
+                )
+            else {
                 return (None, None);
             };
             let table = self.codon_table_for(transcript);
-            let ref_aas = translate_window(&ref_window, &table, false);
-            let alt_aas = translate_window(&alt_window, &table, true);
+            let ref_aas =
+                translate_reference_window(&ref_window, table, transcript, window_start, false);
+            let alt_aas = translate_alternate_window(
+                &alt_window,
+                &ref_window,
+                table,
+                transcript,
+                window_start,
+                true,
+            );
             (Some((ref_aas, alt_aas)), Some((ref_codons, alt_codons)))
         } else {
             // In-frame indel: build alt sequence and translate affected codons
@@ -769,7 +805,7 @@ impl ConsequencePredictor {
         record_alt_allele: &Allele,
         record_cds_start: Option<u64>,
         record_cds_end: Option<u64>,
-    ) -> Option<(Vec<u8>, Vec<u8>, String, String)> {
+    ) -> Option<(Vec<u8>, Vec<u8>, String, String, usize)> {
         let sequence = transcript.translateable_seq.as_ref()?.as_bytes();
         let cds_start = cds_start?;
         let cds_lo = cds_end.map_or(cds_start, |end| cds_start.min(end));
@@ -828,6 +864,7 @@ impl ConsequencePredictor {
             alternate_window,
             reference_codons,
             alternate_codons,
+            window_start,
         ))
     }
 
@@ -997,10 +1034,53 @@ fn display_codon_window(
         .collect()
 }
 
-fn translate_window(bases: &[u8], table: &CodonTable, mark_partial: bool) -> String {
+fn translate_reference_window(
+    bases: &[u8],
+    table: &CodonTable,
+    transcript: &Transcript,
+    window_start: usize,
+    mark_partial: bool,
+) -> String {
     let mut amino_acids: String = bases
         .chunks_exact(3)
-        .map(|codon| table.translate(&[codon[0], codon[1], codon[2]]) as char)
+        .enumerate()
+        .map(|(offset, codon)| {
+            resolve_readthrough_residue(
+                transcript,
+                window_start / 3 + offset,
+                table.translate(&[codon[0], codon[1], codon[2]]),
+            ) as char
+        })
+        .collect();
+    if mark_partial && bases.len() % 3 != 0 {
+        amino_acids.push('X');
+    }
+    amino_acids
+}
+
+fn translate_alternate_window(
+    bases: &[u8],
+    reference: &[u8],
+    table: &CodonTable,
+    transcript: &Transcript,
+    window_start: usize,
+    mark_partial: bool,
+) -> String {
+    let mut amino_acids: String = bases
+        .chunks_exact(3)
+        .enumerate()
+        .map(|(offset, codon)| {
+            let translated = table.translate(&[codon[0], codon[1], codon[2]]);
+            let unchanged = reference
+                .get(offset * 3..offset * 3 + 3)
+                .is_some_and(|reference_codon| reference_codon.eq_ignore_ascii_case(codon));
+            if unchanged {
+                resolve_readthrough_residue(transcript, window_start / 3 + offset, translated)
+                    as char
+            } else {
+                translated as char
+            }
+        })
         .collect();
     if mark_partial && bases.len() % 3 != 0 {
         amino_acids.push('X');
@@ -1012,6 +1092,26 @@ fn translate_window(bases: &[u8], table: &CodonTable, mark_partial: bool) -> Str
 mod tests {
     use super::*;
     use fastvep_genome::{Exon, Gene, Translation};
+
+    #[test]
+    fn reference_readthrough_is_preserved_only_for_unchanged_codons() {
+        let mut transcript = make_coding_transcript();
+        transcript.peptide = Some("MU*".to_string());
+        let table = CodonTable::standard();
+
+        assert_eq!(
+            translate_reference_window(b"ATGTGA", &table, &transcript, 0, false),
+            "MU"
+        );
+        assert_eq!(
+            translate_alternate_window(b"ATGTGA", b"ATGTGA", &table, &transcript, 0, false),
+            "MU"
+        );
+        assert_eq!(
+            translate_alternate_window(b"ATGTGC", b"ATGTGA", &table, &transcript, 0, false),
+            "MC"
+        );
+    }
 
     fn make_coding_transcript() -> Transcript {
         // A simple protein-coding transcript on forward strand:

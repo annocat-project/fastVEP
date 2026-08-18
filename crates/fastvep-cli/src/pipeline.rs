@@ -376,6 +376,10 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             })
     };
 
+    // Indexed GFF3 loading returns only transcripts near this input VCF. That
+    // set is valid for this run but must never become a reusable sidecar cache.
+    let mut region_restricted = false;
+
     let mut transcripts = if sa_only {
         Vec::new()
     } else {
@@ -445,9 +449,15 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                 break 'load trs;
                             }
                             Err(e) => {
+                                if explicit_cache {
+                                    return Err(anyhow::anyhow!(
+                                        "Transcript cache {} could not be loaded: {e}. Refusing to annotate without the requested transcript source.",
+                                        cp.display()
+                                    ));
+                                }
                                 eprintln!(
-                                    "Warning: cache load failed ({}), falling back to GFF3",
-                                    e
+                                    "Warning: sidecar cache {} could not be loaded ({e}); rebuilding from GFF3",
+                                    cp.display()
                                 );
                             }
                         }
@@ -462,20 +472,29 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             // and the consequence predictor doesn't require globally-unique
             // stable_ids, so Ensembl + RefSeq can simply coexist.
             if gff3_specs.is_empty() {
-                eprintln!(
-                    "Warning: No GFF3 file provided. Only intergenic variants will be annotated."
-                );
-                Vec::new()
+                return Err(anyhow::anyhow!(
+                    "No transcript source is usable. Pass --gff3, a valid --transcript-cache, or --sa-only for transcript-free annotation."
+                ));
             } else {
                 let mut all: Vec<fastvep_genome::Transcript> = Vec::new();
                 for spec in &gff3_specs {
-                    let trs = load_one_gff3(spec, &config.input, config.distance)?;
-                    eprintln!(
-                        "Loaded {} transcripts from {} (source label: {})",
-                        trs.len(),
-                        spec.path,
-                        spec.source
-                    );
+                    let (trs, restricted) = load_one_gff3(spec, &config.input, config.distance)?;
+                    region_restricted |= restricted;
+                    if restricted {
+                        eprintln!(
+                            "Loaded {} transcripts overlapping this input from {} (source label: {})",
+                            trs.len(),
+                            spec.path,
+                            spec.source
+                        );
+                    } else {
+                        eprintln!(
+                            "Loaded {} transcripts from {} (source label: {})",
+                            trs.len(),
+                            spec.path,
+                            spec.source
+                        );
+                    }
                     all.extend(trs);
                 }
                 if all.is_empty() {
@@ -570,7 +589,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
     // single-GFF3 case — multi-source caches need to round-trip through
     // an explicit `--transcript-cache` path so the on-disk filename
     // isn't tied to one of N inputs.
-    if needs_seq_build {
+    if should_publish_transcript_cache(needs_seq_build, region_restricted) {
         if let Some(ref cp) = cache_path {
             if single_gff3.is_some() {
                 if let Err(e) = fastvep_cache::transcript_cache::save_cache(&transcripts, cp) {
@@ -2668,9 +2687,15 @@ fn should_build_missing_sequences(explicit_cache: bool, has_missing_sequences: b
     !explicit_cache && has_missing_sequences
 }
 
+fn should_publish_transcript_cache(needs_seq_build: bool, region_restricted: bool) -> bool {
+    needs_seq_build && !region_restricted
+}
+
 #[cfg(test)]
 mod cache_build_lock_tests {
-    use super::{acquire_cache_build_lock, should_build_missing_sequences};
+    use super::{
+        acquire_cache_build_lock, should_build_missing_sequences, should_publish_transcript_cache,
+    };
 
     #[test]
     fn rejects_a_second_builder_for_the_same_output() {
@@ -2688,6 +2713,13 @@ mod cache_build_lock_tests {
         assert!(!should_build_missing_sequences(true, true));
         assert!(should_build_missing_sequences(false, true));
         assert!(!should_build_missing_sequences(false, false));
+    }
+
+    #[test]
+    fn region_restricted_transcripts_are_not_published_as_a_reusable_cache() {
+        assert!(!should_publish_transcript_cache(true, true));
+        assert!(should_publish_transcript_cache(true, false));
+        assert!(!should_publish_transcript_cache(false, false));
     }
 }
 
@@ -2744,7 +2776,7 @@ fn load_one_gff3(
     spec: &Gff3Spec,
     vcf_input: &str,
     distance: u64,
-) -> Result<Vec<fastvep_genome::Transcript>> {
+) -> Result<(Vec<fastvep_genome::Transcript>, bool)> {
     let gff_path = Path::new(&spec.path);
     let tbi_path = format!("{}.tbi", spec.path);
 
@@ -2755,15 +2787,18 @@ fn load_one_gff3(
             regions.len(),
             spec.path
         );
-        fastvep_cache::gff::parse_gff3_indexed_with_source(gff_path, &regions, &spec.source)
+        let transcripts =
+            fastvep_cache::gff::parse_gff3_indexed_with_source(gff_path, &regions, &spec.source)?;
+        Ok((transcripts, true))
     } else {
         let gff_file =
             File::open(&spec.path).with_context(|| format!("Opening GFF3 file: {}", spec.path))?;
-        if spec.path.ends_with(".gz") || spec.path.ends_with(".bgz") {
-            parse_gff3_with_source(flate2::read::MultiGzDecoder::new(gff_file), &spec.source)
+        let transcripts = if spec.path.ends_with(".gz") || spec.path.ends_with(".bgz") {
+            parse_gff3_with_source(flate2::read::MultiGzDecoder::new(gff_file), &spec.source)?
         } else {
-            parse_gff3_with_source(gff_file, &spec.source)
-        }
+            parse_gff3_with_source(gff_file, &spec.source)?
+        };
+        Ok((transcripts, false))
     }
 }
 

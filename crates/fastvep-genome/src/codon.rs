@@ -188,6 +188,8 @@ pub fn aa_one_to_three(aa: u8) -> &'static str {
         b'Y' => "Tyr",
         b'V' => "Val",
         b'*' => "Ter",
+        b'U' => "Sec",
+        b'O' => "Pyl",
         b'X' => "Xaa",
         _ => "???",
     }
@@ -270,6 +272,8 @@ mod tests {
     fn test_aa_one_to_three() {
         assert_eq!(aa_one_to_three(b'M'), "Met");
         assert_eq!(aa_one_to_three(b'*'), "Ter");
+        assert_eq!(aa_one_to_three(b'U'), "Sec");
+        assert_eq!(aa_one_to_three(b'O'), "Pyl");
         assert_eq!(aa_one_to_three(b'X'), "Xaa");
     }
 
