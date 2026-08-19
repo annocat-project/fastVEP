@@ -3104,7 +3104,7 @@ fn parallel_batch_parser(
 ) -> Result<Option<BatchParser>> {
     if !matches!(
         source,
-        "spliceai" | "cadd" | "revel" | "dbsnp" | "topmed" | "gerp" | "dann"
+        "spliceai" | "cadd" | "dbsnp" | "topmed" | "gerp" | "dann"
     ) {
         return Ok(None);
     }
@@ -3124,15 +3124,6 @@ fn parallel_batch_parser(
             fastvep_sa::sources::cadd::iter_cadd_selected(
                 io::Cursor::new(bytes),
                 &map,
-                selected_fields.as_ref(),
-            )
-            .collect()
-        }),
-        "revel" => std::sync::Arc::new(move |bytes| {
-            fastvep_sa::sources::revel::iter_revel_selected(
-                io::Cursor::new(bytes),
-                &map,
-                2,
                 selected_fields.as_ref(),
             )
             .collect()
@@ -3431,12 +3422,10 @@ mod supplementary_field_tests {
     #[test]
     fn parallel_parser_is_limited_to_row_stateless_sources() {
         let chrom_map = std::collections::HashMap::new();
-        for source in [
-            "spliceai", "cadd", "revel", "dbsnp", "topmed", "gerp", "dann",
-        ] {
+        for source in ["spliceai", "cadd", "dbsnp", "topmed", "gerp", "dann"] {
             assert!(parallel_batch_parser(source, &chrom_map).unwrap().is_some());
         }
-        for source in ["gnomad", "dbnsfp", "phylop"] {
+        for source in ["gnomad", "dbnsfp", "phylop", "revel"] {
             assert!(parallel_batch_parser(source, &chrom_map).unwrap().is_none());
         }
     }
@@ -3848,28 +3837,6 @@ pub fn run_sa_build_inputs(
                 },
             );
         }
-        "revel" => {
-            return run_streaming_sa_build(
-                source,
-                inputs,
-                &normalized_skips,
-                chromosome_idx,
-                output,
-                header,
-                &chrom_map,
-                &chrom_list,
-                show_progress,
-                None,
-                |r, m| {
-                    fastvep_sa::sources::revel::iter_revel_selected(
-                        r,
-                        m,
-                        2,
-                        selected_fields.as_ref(),
-                    )
-                },
-            );
-        }
         "dbsnp" => {
             return run_streaming_sa_build(
                 source,
@@ -3977,9 +3944,15 @@ pub fn run_sa_build_inputs(
         "onekg" | "1000g" => fastvep_sa::sources::onekg::parse_onekg_vcf(buf_reader, &chrom_map)?,
         "mitomap" => fastvep_sa::sources::mitomap::parse_mitomap(buf_reader, &chrom_map)?,
         "primateai" => fastvep_sa::sources::primateai::parse_primateai(buf_reader, &chrom_map)?,
+        "revel" => fastvep_sa::sources::revel::parse_revel_selected(
+            buf_reader,
+            &chrom_map,
+            2,
+            selected_fields.as_ref(),
+        )?,
         _ => unreachable!(),
     };
-    let remaining_filter = (source != "clinvar")
+    let remaining_filter = (!matches!(source, "clinvar" | "revel"))
         .then_some(selected_fields.as_ref())
         .flatten();
     let records = records
@@ -4322,23 +4295,29 @@ pub fn run_sa_build_v2(
                 assembly,
             )
         }
-        // REVEL: transcript-specific records per allele, stored as whole-record
-        // blobs. The v1 parser buffers+sorts the CSV; column 2 is the GRCh38
-        // position, matching the v1 build path.
-        "revel" => run_streaming_osa2_v1_build(
-            source,
-            inputs,
-            &normalized_skips,
-            chromosome_idx,
-            &out_path,
-            &revel::revel_osa2_metadata(assembly),
-            fastvep_sa::writer_v2::raw_json_blob_fields(),
-            &chrom_map,
-            &chrom_list,
-            show_progress,
-            selected_fields.as_ref(),
-            |reader, map| revel::iter_revel_selected(reader, map, 2, selected_fields.as_ref()),
-        ),
+        // REVEL files are ordered by source coordinates, not necessarily by
+        // their lifted GRCh38 positions. Sort the parsed chromosome before the
+        // streaming writer so a lifted segment cannot reopen an OSA2 chunk.
+        "revel" => {
+            if framed_input {
+                anyhow::bail!("source '{source}' requires one complete input for .osa2");
+            }
+            eprintln!("Building revel .osa2: {} -> {}", input, out_path.display());
+            let (buf_reader, meter) = open_sa_reader_with_meter(input, show_progress)?;
+            let records =
+                revel::parse_revel_selected(buf_reader, &chrom_map, 2, selected_fields.as_ref())?;
+            let records = bridge_v1_raw_blobs(records.into_iter().map(Ok), &chrom_list);
+            finish_osa2_build(
+                &out_path,
+                &revel::revel_osa2_metadata(assembly),
+                fastvep_sa::writer_v2::raw_json_blob_fields(),
+                &[],
+                records,
+                meter,
+                input,
+                assembly,
+            )
+        }
         // Positional per-base scores (PhyloP/GERP/DANN): allele-less, keyed by
         // coordinate. Stream the score TSV/wig and store each bare-number score
         // as a whole-record blob. Genome-wide (~3B positions for PhyloP), so
@@ -5279,6 +5258,7 @@ chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
             &input,
             "chr,hg19_pos,grch38_pos,ref,alt,aaref,aaalt,REVEL,transcript\n\
              1,100,101,G,A,R,H,0.1,ENST1\n\
+             1,102,99,C,T,A,V,0.4,ENST3\n\
              1,100,101,G,A,Arg,His,0.8,ENST2\n",
         )
         .unwrap();
@@ -5304,6 +5284,15 @@ chr1\t100\t.\tA\tG\t.\tPASS\tAF=0.000000657073;AN=1522000;AC=1
                 {"aaAlt": "H", "aaRef": "R", "score": 0.1, "transcriptId": "ENST1"},
                 {"aaAlt": "His", "aaRef": "Arg", "score": 0.8, "transcriptId": "ENST2"}
             ])
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&annotation_json(
+                &reader, "chr1", 99, "C", "T"
+            ))
+            .unwrap(),
+            serde_json::json!([{
+                "aaAlt": "V", "aaRef": "A", "score": 0.4, "transcriptId": "ENST3"
+            }])
         );
     }
 

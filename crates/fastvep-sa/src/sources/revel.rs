@@ -39,17 +39,36 @@ pub fn parse_revel<R: BufRead>(
     chrom_to_idx: &HashMap<String, u16>,
     pos_column: usize,
 ) -> Result<Vec<AnnotationRecord>> {
-    let mut records = iter_revel(reader, chrom_to_idx, pos_column).collect::<Result<Vec<_>>>()?;
+    parse_revel_selected(reader, chrom_to_idx, pos_column, None)
+}
+
+/// Parse and sort REVEL rows while retaining only selected cache fields.
+///
+/// REVEL's files are partitioned by source coordinates. Lifted GRCh38
+/// positions can move backwards, so cache writers must not consume these rows
+/// directly from [`iter_revel_selected`].
+pub fn parse_revel_selected<R: BufRead>(
+    reader: R,
+    chrom_to_idx: &HashMap<String, u16>,
+    pos_column: usize,
+    selected_fields: Option<&HashSet<String>>,
+) -> Result<Vec<AnnotationRecord>> {
+    let mut records = iter_revel_selected(reader, chrom_to_idx, pos_column, selected_fields)
+        .collect::<Result<Vec<_>>>()?;
 
     records.sort_by(|a, b| {
         a.chrom_idx
             .cmp(&b.chrom_idx)
             .then(a.position.cmp(&b.position))
+            .then(a.ref_allele.cmp(&b.ref_allele))
+            .then(a.alt_allele.cmp(&b.alt_allele))
     });
     Ok(records)
 }
 
-/// Stream coordinate-sorted REVEL CSV rows without retaining a chromosome in memory.
+/// Stream REVEL CSV rows in source order without retaining them in memory.
+/// Use [`parse_revel`] before writing a cache because GRCh38 positions can move
+/// backwards relative to the source coordinates.
 pub fn iter_revel<'a, R: BufRead>(
     reader: R,
     chrom_to_idx: &'a HashMap<String, u16>,
@@ -196,6 +215,7 @@ mod tests {
     fn test_parse_revel() {
         let data = "\
 chr,hg19_pos,grch38_pos,ref,alt,aaref,aaalt,REVEL
+1,35144,35140,T,C,I,T,0.121
 1,35142,35142,G,A,T,M,0.027
 1,35142,35142,G,C,T,S,0.035
 1,35143,35143,C,A,T,N,0.842
@@ -204,13 +224,15 @@ chr,hg19_pos,grch38_pos,ref,alt,aaref,aaalt,REVEL
         chrom_map.insert("chr1".into(), 0u16);
 
         let records = parse_revel(data.as_bytes(), &chrom_map, 2).unwrap();
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[0].position, 35142);
-        assert_eq!(records[0].ref_allele, "G");
-        assert_eq!(records[0].alt_allele, "A");
-        assert!(records[0].json.contains("0.027"));
-        assert_eq!(records[2].position, 35143);
-        assert!(records[2].json.contains("0.842"));
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].position, 35140);
+        assert!(records[0].json.contains("0.121"));
+        assert_eq!(records[1].position, 35142);
+        assert_eq!(records[1].ref_allele, "G");
+        assert_eq!(records[1].alt_allele, "A");
+        assert!(records[1].json.contains("0.027"));
+        assert_eq!(records[3].position, 35143);
+        assert!(records[3].json.contains("0.842"));
     }
 
     #[test]
