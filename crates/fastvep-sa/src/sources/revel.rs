@@ -117,10 +117,11 @@ impl<R: BufRead> Iterator for RevelRecordIter<'_, R> {
             let Some(&chrom_idx) = self.chrom_to_idx.get(&chrom) else {
                 continue;
             };
-            let position = match fields
-                .get(self.pos_column)
-                .and_then(|value| value.parse::<u32>().ok())
-            {
+            let position_field = fields.get(self.pos_column).copied().unwrap_or_default();
+            if position_field == "." {
+                continue;
+            }
+            let position = match position_field.parse::<u32>().ok() {
                 Some(position) if position > 0 => position,
                 _ => {
                     return Some(Err(anyhow!(
@@ -219,6 +220,20 @@ chr,hg19_pos,grch38_pos,ref,alt,aaref,aaalt,REVEL
             .next()
             .unwrap()
             .is_err());
+    }
+
+    #[test]
+    fn missing_grch38_positions_are_skipped() {
+        let map = HashMap::from([("chr1".to_string(), 0)]);
+        let records = iter_revel(
+            &b"1,1,.,G,A,T,M,0.2,ENST1\n1,2,3,G,C,T,S,0.3,ENST1\n"[..],
+            &map,
+            2,
+        )
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].position, 3);
     }
 
     #[test]
