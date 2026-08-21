@@ -1,3 +1,4 @@
+use fastvep_core::Strand;
 use fastvep_genome::codon::{aa_one_to_three, CodonTable};
 
 /// Generate HGVSp (protein) notation.
@@ -140,13 +141,28 @@ fn peptide_carries(peptide: &[u8], protein_start: u64, reference: &[u8]) -> bool
     peptide.get(start..end) == Some(reference)
 }
 
-fn anchor_candidates(protein_start: u64, reference_len: usize) -> [Option<u64>; 2] {
+/// Whether `protein_start` names the end of a shrinking affected span.
+///
+/// Protein coordinates are derived from the genomic left edge. That edge is
+/// the end of the affected protein span only on a reverse-strand transcript.
+fn anchored_at_span_end(strand: Strand, reference_len: usize, alternate_len: usize) -> bool {
+    strand == Strand::Reverse && alternate_len < reference_len
+}
+
+fn anchor_candidates(
+    protein_start: u64,
+    reference_len: usize,
+    end_first: bool,
+) -> [Option<u64>; 2] {
     let from_end = reference_len
         .checked_sub(1)
         .filter(|&back| back > 0)
         .and_then(|back| protein_start.checked_sub(back as u64))
         .filter(|&anchor| anchor > 0);
-    [Some(protein_start), from_end]
+    match from_end {
+        Some(other) if end_first => [Some(other), Some(protein_start)],
+        _ => [Some(protein_start), from_end],
+    }
 }
 
 /// Generate HGVSp notation for an in-frame insertion, deletion, or delins.
@@ -161,6 +177,7 @@ pub fn hgvsp_inframe_indel(
     ref_aas: &str,
     alt_aas: &str,
     peptide: Option<&str>,
+    strand: Strand,
 ) -> Option<String> {
     let strip = |value: &str| {
         if value == "-" {
@@ -185,11 +202,15 @@ pub fn hgvsp_inframe_indel(
                 None => value,
             });
     let Some((peptide, protein_start)) = peptide.and_then(|value| {
-        anchor_candidates(protein_start, original_ref.len())
-            .into_iter()
-            .flatten()
-            .find(|&anchor| peptide_carries(value, anchor, &original_ref))
-            .map(|anchor| (value, anchor))
+        anchor_candidates(
+            protein_start,
+            original_ref.len(),
+            anchored_at_span_end(strand, original_ref.len(), original_alt.len()),
+        )
+        .into_iter()
+        .flatten()
+        .find(|&anchor| peptide_carries(value, anchor, &original_ref))
+        .map(|anchor| (value, anchor))
     }) else {
         return fallback();
     };
@@ -411,6 +432,23 @@ mod tests {
     use super::*;
     use fastvep_genome::mitochondrial_codon_table;
 
+    fn hgvsp_inframe_indel(
+        protein_id: &str,
+        protein_start: u64,
+        ref_aas: &str,
+        alt_aas: &str,
+        peptide: Option<&str>,
+    ) -> Option<String> {
+        super::hgvsp_inframe_indel(
+            protein_id,
+            protein_start,
+            ref_aas,
+            alt_aas,
+            peptide,
+            Strand::Forward,
+        )
+    }
+
     #[test]
     fn test_hgvsp_frameshift_mitochondrial_table_differs() {
         // Same ref/alt translateable sequences, only the codon table differs.
@@ -607,6 +645,34 @@ mod tests {
                 Some("ENSP1:p.Phe5del".to_string())
             );
         }
+    }
+
+    #[test]
+    fn anchor_candidates_puts_the_determined_end_first() {
+        assert_eq!(anchor_candidates(10, 5, true), [Some(6), Some(10)]);
+        assert_eq!(anchor_candidates(10, 5, false), [Some(10), Some(6)]);
+        assert_eq!(anchor_candidates(10, 1, true), [Some(10), None]);
+    }
+
+    #[test]
+    fn only_reverse_strand_shrinking_changes_are_anchored_at_the_end() {
+        assert!(anchored_at_span_end(Strand::Reverse, 3, 0));
+        assert!(anchored_at_span_end(Strand::Reverse, 3, 1));
+        assert!(!anchored_at_span_end(Strand::Forward, 3, 0));
+        assert!(!anchored_at_span_end(Strand::Reverse, 1, 3));
+        assert!(!anchored_at_span_end(Strand::Reverse, 3, 3));
+    }
+
+    #[test]
+    fn periodic_reverse_strand_reference_uses_the_span_the_variant_touches() {
+        assert_eq!(
+            super::hgvsp_inframe_indel("ENSP1", 4, "EGE", "-", Some("MEGEGEA"), Strand::Reverse,),
+            Some("ENSP1:p.Glu2_Glu4del".to_string())
+        );
+        assert_eq!(
+            super::hgvsp_inframe_indel("ENSP1", 4, "EGE", "-", Some("MEGEGEA"), Strand::Forward,),
+            Some("ENSP1:p.Glu4_Glu6del".to_string())
+        );
     }
 
     #[test]

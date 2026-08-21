@@ -543,6 +543,7 @@ impl AnnotationContext {
                                                     &aa.0,
                                                     &aa.1,
                                                     tr.peptide.as_deref(),
+                                                    tr.strand,
                                                 );
                                             } else {
                                                 let hgvsp_start = protein_position
@@ -586,6 +587,7 @@ impl AnnotationContext {
                                                     &reference,
                                                     &alternate,
                                                     tr.peptide.as_deref(),
+                                                    tr.strand,
                                                 );
                                             }
                                         }

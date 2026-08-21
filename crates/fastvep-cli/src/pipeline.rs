@@ -1444,6 +1444,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                                 &aa.0,
                                                 &aa.1,
                                                 tr.peptide.as_deref(),
+                                                tr.strand,
                                             );
                                         } else {
                                             let hgvsp_start = protein_position
@@ -1494,6 +1495,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                             &reference,
                                             &alternate,
                                             tr.peptide.as_deref(),
+                                            tr.strand,
                                         );
                                     }
                                 }
