@@ -13,10 +13,11 @@ conda/recipe/build/
 conda-bld/
 
 # Large data (downloaded via benchmarks/download_data.sh)
-test_data/
+/test_data/
 
-# Test directory (small test files are force-added via git add -f)
-tests/
+# Root test-fixture directory. Keep this anchored so crate integration tests
+# under crates/*/tests remain trackable.
+/tests/
 
 # Benchmark data and output (scripts are tracked)
 benchmarks/output/

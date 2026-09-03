@@ -10,7 +10,7 @@ use fastvep_cache::providers::{
     TabixVariationProvider, TranscriptProvider, VariationProvider,
 };
 use fastvep_consequence::ConsequencePredictor;
-use fastvep_core::{Allele, Consequence};
+use fastvep_core::Consequence;
 use fastvep_hgvs;
 use fastvep_io::output;
 use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
@@ -1057,23 +1057,35 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             };
 
             // Convert prediction results to VariationFeature annotations
-            for tc in &transcript_consequences {
-                let transcript = overlapping.iter().find(|t| t.stable_id == tc.transcript_id);
+            for (i, tc) in transcript_consequences.iter().enumerate() {
+                let transcript = overlapping
+                    .get(i)
+                    .copied()
+                    .filter(|tr| tr.stable_id == tc.transcript_id)
+                    .or_else(|| {
+                        overlapping
+                            .iter()
+                            .copied()
+                            .find(|tr| tr.stable_id == tc.transcript_id)
+                    });
 
                 let allele_annotations: Vec<AlleleAnnotation> = tc
                     .allele_consequences
                     .iter()
                     .map(|ac| {
-                        let (cdna_position, cds_position, protein_position) = transcript
-                            .map(|value| record_transcript_positions(&vf.position, value))
-                            .unwrap_or_default();
                         let mut ann = AlleleAnnotation {
                             allele: ac.allele.clone(),
                             consequences: ac.consequences.clone(),
                             impact: ac.impact,
-                            cdna_position,
-                            cds_position,
-                            protein_position,
+                            cdna_position: fastvep_annotate::zip_positions(
+                                ac.cdna_start,
+                                ac.cdna_end,
+                            ),
+                            cds_position: fastvep_annotate::zip_positions(
+                                ac.cds_start,
+                                ac.cds_end,
+                            ),
+                            protein_position: ac.protein_range(),
                             amino_acids: ac.amino_acids.clone(),
                             codons: ac.codons.clone(),
                             exon: ac.exon,
@@ -1097,13 +1109,11 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                         if config.hgvs {
                             ann.hgvsg = Some(fastvep_hgvs::hgvsg(
                                 chrom,
-                                ac.normalized_position.start,
-                                ac.normalized_position.end,
-                                &ac.normalized_ref_allele,
-                                &ac.normalized_alt_allele,
+                                vf.position.start,
+                                vf.position.end,
+                                &vf.ref_allele,
+                                &ac.allele,
                             ));
-                            let mut shifted_deletion = None;
-
                             if let Some(tr) = transcript {
                                 // Build versioned IDs for HGVS notation
                                 let versioned_tid = match tr.version {
@@ -1114,43 +1124,17 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                 // Determine alleles for HGVS - complement for minus strand
                                 let (hgvs_ref, hgvs_alt) = if tr.strand == fastvep_core::Strand::Reverse {
                                     (
-                                        complement_allele(&ac.normalized_ref_allele),
-                                        complement_allele(&ac.normalized_alt_allele),
+                                        complement_allele(&vf.ref_allele),
+                                        complement_allele(&ac.allele),
                                     )
                                 } else {
                                     (
-                                        ac.normalized_ref_allele.clone(),
-                                        ac.normalized_alt_allele.clone(),
+                                        vf.ref_allele.clone(),
+                                        ac.allele.clone(),
                                     )
                                 };
-                                shifted_deletion = seq_provider.as_deref().and_then(|provider| {
-                                    shifted_exonic_deletion(
-                                        provider as &dyn SequenceProvider,
-                                        chrom,
-                                        ac.normalized_position.start,
-                                        ac.normalized_position.end,
-                                        &ac.normalized_ref_allele,
-                                        &ac.normalized_alt_allele,
-                                        tr,
-                                    )
-                                });
-
                                 if let Some(coding_start) = tr.cdna_coding_start {
-                                    if let Some(shifted) = shifted_deletion {
-                                        ann.hgvsc = fastvep_hgvs::hgvsc_with_seq(
-                                            &versioned_tid,
-                                            shifted.cdna_start,
-                                            shifted.cdna_end,
-                                            &hgvs_ref,
-                                            &hgvs_alt,
-                                            coding_start,
-                                            tr.cdna_coding_end,
-                                            tr.spliced_seq.as_deref(),
-                                            tr.codon_table_start_phase,
-                                        );
-                                    } else if let (Some(cs), Some(ce)) =
-                                        (ac.cdna_start, ac.cdna_end)
-                                    {
+                                    if let (Some(cs), Some(ce)) = (ac.cdna_start, ac.cdna_end) {
                                         // Normalize cDNA positions (minus-strand can reverse order)
                                         let (cs, ce) = (cs.min(ce), cs.max(ce));
                                         // Exonic variant: standard HGVSc with 3' shifting
@@ -1164,256 +1148,57 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                             tr.spliced_seq.as_deref(),
                                             tr.codon_table_start_phase,
                                         );
-                                    } else if ac.intron.is_some() {
-                                        // Intronic variant: offset notation
-                                        // Note: intronic HGVS uses original coding_start (no phase adjustment)
-                                        // Apply HGVS 3' normalization for intronic indels
-                                        let (shifted_start, shifted_end) = if let Some(ref sp) = seq_provider {
-                                            let is_indel = matches!((&hgvs_ref, &hgvs_alt),
-                                                (Allele::Sequence(_), Allele::Deletion) |
-                                                (Allele::Deletion, Allele::Sequence(_)));
-                                            if is_indel {
-                                                if let Some((istart, iend)) = tr.intron_bounds_at(ac.normalized_position.start) {
-                                                    // Use genomic-strand alleles for ref comparison
-                                                    three_prime_shift_intronic(
-                                                        &**sp as &dyn SequenceProvider, chrom,
-                                                        ac.normalized_position.start, ac.normalized_position.end,
-                                                        &ac.normalized_ref_allele, &ac.normalized_alt_allele,
-                                                        tr.strand, istart, iend,
-                                                    )
-                                                } else {
-                                                    (ac.normalized_position.start, ac.normalized_position.end)
-                                                }
-                                            } else {
-                                                (ac.normalized_position.start, ac.normalized_position.end)
-                                            }
-                                        } else {
-                                            (ac.normalized_position.start, ac.normalized_position.end)
-                                        };
-                                        // For insertions, build the rotated insertion bases
-                                        // after 3' shifting (bases rotate as position shifts)
-                                        let shifted_hgvs_alt = if let (Allele::Deletion, Allele::Sequence(ins_bases)) = (&hgvs_ref, &hgvs_alt) {
-                                            if shifted_start != ac.normalized_position.start && !ins_bases.is_empty() {
-                                                // Calculate how many positions we shifted
-                                                let shift_amount = if tr.strand == fastvep_core::Strand::Forward {
-                                                    (shifted_start as i64 - ac.normalized_position.start as i64) as usize
-                                                } else {
-                                                    (ac.normalized_position.start as i64 - shifted_start as i64) as usize
-                                                };
-                                                // Rotate: for forward strand, each shift moves first base to end
-                                                // For reverse strand, each shift moves last base to front
-                                                let mut rotated = ins_bases.clone();
-                                                let len = rotated.len();
-                                                if len > 0 {
-                                                    let effective_shift = shift_amount % len;
-                                                    match tr.strand {
-                                                        fastvep_core::Strand::Forward => {
-                                                            rotated.rotate_left(effective_shift);
-                                                        }
-                                                        fastvep_core::Strand::Reverse => {
-                                                            rotated.rotate_right(effective_shift);
-                                                        }
-                                                    }
-                                                }
-                                                Allele::Sequence(rotated)
-                                            } else {
-                                                hgvs_alt.clone()
-                                            }
-                                        } else {
-                                            hgvs_alt.clone()
-                                        };
-
-                                        // For insertions, use position before insertion
-                                        // for the primary HGVS coordinate (ins is BETWEEN two bases).
-                                        // On reverse strand, the insertion is between P and P+1 in
-                                        // genomic coords, but P+1 is 5' in transcript order, so we
-                                        // use P+1 as the HGVS start coordinate.
-                                        let is_insertion = matches!((&hgvs_ref, &shifted_hgvs_alt), (Allele::Deletion, Allele::Sequence(_)));
-                                        let hgvs_pos = if is_insertion {
-                                            if tr.strand == fastvep_core::Strand::Reverse {
-                                                shifted_end + 1
-                                            } else {
-                                                shifted_end // base before insertion
-                                            }
-                                        } else {
-                                            shifted_start
-                                        };
-                                        if let Some((cdna_pos, offset)) = tr.genomic_to_intronic_cdna(hgvs_pos) {
-                                            // For multi-base variants, compute end position too
-                                            let (end_cdna, end_offset) = if shifted_start != shifted_end && hgvs_pos == shifted_start {
-                                                tr.genomic_to_intronic_cdna(shifted_end)
-                                                    .map(|(c, o)| (Some(c), Some(o)))
-                                                    .unwrap_or((None, None))
-                                            } else {
-                                                (None, None)
-                                            };
-                                            let mut hgvsc = fastvep_hgvs::hgvsc_intronic_range(
-                                                &versioned_tid,
-                                                cdna_pos,
-                                                offset,
-                                                end_cdna,
-                                                end_offset,
-                                                &hgvs_ref,
-                                                &shifted_hgvs_alt,
-                                                coding_start,
-                                                tr.cdna_coding_end,
-                                            );
-                                            // For intronic insertions, check whether the inserted
-                                            // sequence duplicates adjacent reference in transcript order.
-                                            if let (Some(ref h), Allele::Deletion) = (&hgvsc, &hgvs_ref) {
-                                                let genomic_alt = if tr.strand
-                                                    == fastvep_core::Strand::Reverse
-                                                {
-                                                    complement_allele(&shifted_hgvs_alt)
-                                                } else {
-                                                    shifted_hgvs_alt.clone()
-                                                };
-                                                if let (true, Some(ref sp), Allele::Sequence(ins)) =
-                                                    (h.contains("ins"), &seq_provider, genomic_alt)
-                                                {
-                                                    if let Some(((start_cdna, start_offset), (end_cdna, end_offset))) =
-                                                        intronic_duplication_range(
-                                                            &**sp as &dyn SequenceProvider,
-                                                            chrom,
-                                                            shifted_start,
-                                                            shifted_end,
-                                                            &ins,
-                                                            tr,
-                                                        )
-                                                    {
-                                                        hgvsc = convert_ins_to_dup_range(
-                                                            h,
-                                                            start_cdna,
-                                                            start_offset,
-                                                            end_cdna,
-                                                            end_offset,
-                                                            coding_start,
-                                                            tr.cdna_coding_end,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            ann.hgvsc = hgvsc;
-                                        }
+                                    } else {
+                                        ann.hgvsc = hgvsc_intronic_shifted(
+                                            seq_provider
+                                                .as_deref()
+                                                .map(|sp| sp as &dyn SequenceProvider),
+                                            chrom,
+                                            tr,
+                                            &versioned_tid,
+                                            vf.position.start,
+                                            vf.position.end,
+                                            &vf.ref_allele,
+                                            &ac.allele,
+                                            &hgvs_ref,
+                                            &hgvs_alt,
+                                            Some(coding_start),
+                                            tr.cdna_coding_end,
+                                        );
                                     }
                                 } else {
                                     // Non-coding transcript: use n. notation
                                     if let (Some(cs), Some(ce)) = (ac.cdna_start, ac.cdna_end) {
-                                        ann.hgvsc = hgvsc_noncoding_exonic(
-                                            seq_provider
-                                                .as_deref()
-                                                .map(|provider| provider as &dyn SequenceProvider),
-                                            tr,
+                                        ann.hgvsc = fastvep_hgvs::hgvsc_noncoding(
                                             &versioned_tid,
                                             cs, ce,
                                             &hgvs_ref,
                                             &hgvs_alt,
+                                            tr.spliced_seq.as_deref(),
                                         );
-                                    } else if ac.intron.is_some() {
-                                        // Apply 3' normalization for non-coding intronic indels
-                                        let (nc_shifted_start, nc_shifted_end) = if let Some(ref sp) = seq_provider {
-                                            let is_indel = matches!((&hgvs_ref, &hgvs_alt),
-                                                (Allele::Sequence(_), Allele::Deletion) |
-                                                (Allele::Deletion, Allele::Sequence(_)));
-                                            if is_indel {
-                                                if let Some((istart, iend)) = tr.intron_bounds_at(ac.normalized_position.start) {
-                                                    three_prime_shift_intronic(
-                                                        &**sp as &dyn SequenceProvider, chrom,
-                                                        ac.normalized_position.start, ac.normalized_position.end,
-                                                        &ac.normalized_ref_allele, &ac.normalized_alt_allele,
-                                                        tr.strand, istart, iend,
-                                                    )
-                                                } else {
-                                                    (ac.normalized_position.start, ac.normalized_position.end)
-                                                }
-                                            } else {
-                                                (ac.normalized_position.start, ac.normalized_position.end)
-                                            }
-                                        } else {
-                                            (ac.normalized_position.start, ac.normalized_position.end)
-                                        };
-
-                                        // Rotate insertion bases for non-coding
-                                        let nc_shifted_hgvs_alt = if let (Allele::Deletion, Allele::Sequence(ins_bases)) = (&hgvs_ref, &hgvs_alt) {
-                                            if nc_shifted_start != ac.normalized_position.start && !ins_bases.is_empty() {
-                                                let shift_amount = if tr.strand == fastvep_core::Strand::Forward {
-                                                    (nc_shifted_start as i64 - ac.normalized_position.start as i64) as usize
-                                                } else {
-                                                    (ac.normalized_position.start as i64 - nc_shifted_start as i64) as usize
-                                                };
-                                                let mut rotated = ins_bases.clone();
-                                                let len = rotated.len();
-                                                if len > 0 {
-                                                    let effective_shift = shift_amount % len;
-                                                    match tr.strand {
-                                                        fastvep_core::Strand::Forward => rotated.rotate_left(effective_shift),
-                                                        fastvep_core::Strand::Reverse => rotated.rotate_right(effective_shift),
-                                                    }
-                                                }
-                                                Allele::Sequence(rotated)
-                                            } else {
-                                                hgvs_alt.clone()
-                                            }
-                                        } else {
-                                            hgvs_alt.clone()
-                                        };
-
-                                        if let Some((cdna_pos, offset)) = tr.genomic_to_intronic_cdna(nc_shifted_start) {
-                                            let (end_cdna, end_offset) = if nc_shifted_start != nc_shifted_end {
-                                                tr.genomic_to_intronic_cdna(nc_shifted_end)
-                                                    .map(|(c, o)| (Some(c), Some(o)))
-                                                    .unwrap_or((None, None))
-                                            } else {
-                                                (None, None)
-                                            };
-                                            let mut hgvsc = fastvep_hgvs::hgvsc_noncoding_intronic_range(
-                                                &versioned_tid,
-                                                cdna_pos,
-                                                offset,
-                                                end_cdna,
-                                                end_offset,
-                                                &hgvs_ref,
-                                                &nc_shifted_hgvs_alt,
-                                            );
-                                            // Dup detection for non-coding intronic insertions.
-                                            if let (Some(ref h), Allele::Deletion) = (&hgvsc, &hgvs_ref) {
-                                                let genomic_alt = if tr.strand
-                                                    == fastvep_core::Strand::Reverse
-                                                {
-                                                    complement_allele(&nc_shifted_hgvs_alt)
-                                                } else {
-                                                    nc_shifted_hgvs_alt.clone()
-                                                };
-                                                if let (true, Some(ref sp), Allele::Sequence(ins)) =
-                                                    (h.contains("ins"), &seq_provider, genomic_alt)
-                                                {
-                                                    if let Some(((start_cdna, start_offset), (end_cdna, end_offset))) =
-                                                        intronic_duplication_range(
-                                                            &**sp as &dyn SequenceProvider,
-                                                            chrom,
-                                                            nc_shifted_start,
-                                                            nc_shifted_end,
-                                                            &ins,
-                                                            tr,
-                                                        )
-                                                    {
-                                                        hgvsc = convert_ins_to_dup_range_noncoding(
-                                                            h,
-                                                            start_cdna,
-                                                            start_offset,
-                                                            end_cdna,
-                                                            end_offset,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            ann.hgvsc = hgvsc;
-                                        }
+                                    } else {
+                                        ann.hgvsc = hgvsc_intronic_shifted(
+                                            seq_provider
+                                                .as_deref()
+                                                .map(|sp| sp as &dyn SequenceProvider),
+                                            chrom,
+                                            tr,
+                                            &versioned_tid,
+                                            vf.position.start,
+                                            vf.position.end,
+                                            &vf.ref_allele,
+                                            &ac.allele,
+                                            &hgvs_ref,
+                                            &hgvs_alt,
+                                            None,
+                                            None,
+                                        );
                                     }
                                 }
                             }
 
                             if let (Some(ref aa), Some(ps)) = (&ac.amino_acids, ac.protein_start) {
+                                let pe = ac.protein_end.unwrap_or(ps);
                                 if let Some(tr) = transcript {
                                     if let Some(ref pid) = tr.protein_id {
                                         let versioned_pid = match tr.protein_version {
@@ -1430,10 +1215,33 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                         let is_fs = ac.consequences.contains(&Consequence::FrameshiftVariant);
 
                                         if is_fs {
-                                            ann.hgvsp = frameshift_hgvsp(&versioned_pid, tr, ac);
+                                            if let (Some(spliced), Some(coding_start)) =
+                                                (tr.spliced_seq.as_deref(), tr.cdna_coding_start)
+                                            {
+                                                ann.hgvsp = fastvep_annotate::cds_and_downstream(
+                                                    tr,
+                                                    spliced,
+                                                    coding_start,
+                                                )
+                                                .and_then(|cds| {
+                                                    fastvep_hgvs::hgvsp_frameshift_from_cds(
+                                                        &versioned_pid,
+                                                        &cds,
+                                                        ac.cds_start,
+                                                        ac.cds_end,
+                                                        &vf.ref_allele,
+                                                        &ac.allele,
+                                                        tr.strand,
+                                                        &fastvep_annotate::frameshift_codon_table(tr),
+                                                    )
+                                                });
+                                            }
                                         } else if aa.1 == "-"
+                                            || aa.0.len() != aa.1.len()
+                                            || ac.consequences.contains(&Consequence::StartLost)
                                             || ac.consequences.contains(&Consequence::InframeDeletion)
                                             || ac.consequences.contains(&Consequence::InframeInsertion)
+                                            || aa.0.len() > 1
                                         {
                                             // In-frame indel / delins (frameshift handled
                                             // above). aa.0 holds the replaced residues, aa.1 the
@@ -1441,65 +1249,37 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                             ann.hgvsp = fastvep_hgvs::hgvsp_inframe_indel(
                                                 &versioned_pid,
                                                 ps,
+                                                pe,
                                                 &aa.0,
                                                 &aa.1,
-                                                tr.peptide.as_deref(),
+                                                tr.peptide.as_deref().map(str::as_bytes),
                                                 tr.strand,
                                             );
                                         } else {
-                                            let hgvsp_start = protein_position
-                                                .map(|(start, _)| start)
-                                                .unwrap_or(ps);
-                                            ann.hgvsp = fastvep_hgvs::hgvsp_substitution(
+                                            let ref_aa = aa
+                                                .0
+                                                .as_bytes()
+                                                .first()
+                                                .copied()
+                                                .unwrap_or(b'X');
+                                            let alt_aa = aa
+                                                .1
+                                                .as_bytes()
+                                                .first()
+                                                .copied()
+                                                .unwrap_or(b'X');
+                                            ann.hgvsp = fastvep_hgvs::hgvsp(
                                                 &versioned_pid,
-                                                hgvsp_start,
-                                                &aa.0,
-                                                &aa.1,
+                                                ps,
+                                                ref_aa,
+                                                alt_aa,
+                                                false,
                                             );
                                         }
                                     }
                                 }
                             }
 
-                            if ann.hgvsp.is_none() {
-                                if let (
-                                    Some(tr),
-                                    Some(pid),
-                                    Some(cds_start),
-                                    Some(cds_end),
-                                ) = (
-                                    transcript,
-                                    transcript.and_then(|value| value.protein_id.as_ref()),
-                                    shifted_deletion.and_then(|value| value.cds_start),
-                                    shifted_deletion.and_then(|value| value.cds_end),
-                                ) {
-                                    if let Some((protein_start, reference, alternate)) =
-                                        shifted_inframe_deletion_protein_change(
-                                            tr, cds_start, cds_end,
-                                        )
-                                    {
-                                        let versioned_pid = match tr.protein_version {
-                                            Some(version) => {
-                                                let suffix = format!(".{version}");
-                                                if pid.ends_with(&suffix) {
-                                                    pid.clone()
-                                                } else {
-                                                    format!("{pid}.{version}")
-                                                }
-                                            }
-                                            None => pid.clone(),
-                                        };
-                                        ann.hgvsp = fastvep_hgvs::hgvsp_inframe_indel(
-                                            &versioned_pid,
-                                            protein_start,
-                                            &reference,
-                                            &alternate,
-                                            tr.peptide.as_deref(),
-                                            tr.strand,
-                                        );
-                                    }
-                                }
-                            }
                         }
 
                         ann
@@ -1650,10 +1430,11 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                 ));
                             }
                             Ok(None) => {}
-                            Err(_) => {
+                            Err(error) => {
                                 if profiling_enabled {
                                     errors += 1;
                                 }
+                                fastvep_annotate::sa_lookup_errors().record(&source_key, &error);
                             }
                         }
                     }
@@ -1885,6 +1666,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
 
     writer.flush()?;
     meter.finish();
+    fastvep_annotate::report_sa_lookup_errors();
 
     if let (Some(profile), Some(path)) = (performance.as_ref(), config.profile_output.as_deref()) {
         let primary_serialization = profile
@@ -1915,11 +1697,8 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
 
 // Shared annotation utilities from fastvep-annotate (used by batch pipeline).
 use fastvep_annotate::{
-    annotate_intergenic, annotate_sa_only_scaffold, complement_allele, convert_ins_to_dup_range,
-    convert_ins_to_dup_range_noncoding, frameshift_hgvsp, hgvsc_noncoding_exonic,
-    intronic_duplication_range, load_gene_providers, load_sa_providers,
-    record_transcript_positions, shifted_exonic_deletion, shifted_inframe_deletion_protein_change,
-    three_prime_shift_intronic,
+    annotate_intergenic, annotate_sa_only_scaffold, complement_allele, hgvsc_intronic_shifted,
+    load_gene_providers, load_sa_providers,
 };
 
 /// Index of the best transcript variation under VEP's default `--pick_order`

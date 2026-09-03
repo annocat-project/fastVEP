@@ -47,6 +47,10 @@ use std::time::Instant;
 /// Soft cap on cached chunk *entries*; the byte budget is the real gate.
 const CHUNK_CACHE_MAX_ENTRIES: usize = 4096;
 
+/// Bound retained failed-chunk diagnostics without allowing corrupt input to
+/// grow process memory without limit.
+const MAX_REMEMBERED_CHUNK_FAILURES: usize = 1 << 16;
+
 /// Monotonic id per reader so chunks are namespaced in the shared cache
 /// (two shards can share a `chunk_id` without colliding). Never reused.
 static NEXT_READER_ID: AtomicU64 = AtomicU64::new(0);
@@ -182,6 +186,9 @@ pub struct Osa2Reader {
     /// Count of chunks built (cache misses) — a thrash diagnostic, exposed via
     /// `chunk_load_count()`.
     chunk_load_count: AtomicU64,
+    /// Chunks whose build failed, retained so later variants do not repeat the
+    /// same decompression or decode failure.
+    failed_chunks: Mutex<HashMap<ChunkKey, Arc<str>>>,
     profiling_enabled: AtomicBool,
     cache_hit_count: AtomicU64,
     compressed_bytes: AtomicU64,
@@ -408,6 +415,7 @@ impl Osa2Reader {
             reader_id: NEXT_READER_ID.fetch_add(1, Ordering::Relaxed),
             local_cache: local_budget.map(|b| Mutex::new(ChunkCache::new(b))),
             chunk_load_count: AtomicU64::new(0),
+            failed_chunks: Mutex::new(HashMap::new()),
             profiling_enabled: AtomicBool::new(false),
             cache_hit_count: AtomicU64::new(0),
             compressed_bytes: AtomicU64::new(0),
@@ -432,6 +440,14 @@ impl Osa2Reader {
     /// by benchmarks/tests to detect chunk-cache thrashing.
     pub fn chunk_load_count(&self) -> u64 {
         self.chunk_load_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of distinct chunks this reader has found unreadable.
+    pub fn chunk_failure_count(&self) -> u64 {
+        self.failed_chunks
+            .lock()
+            .map(|failed| failed.len() as u64)
+            .unwrap_or(0)
     }
 
     fn profiling_started(&self) -> Option<Instant> {
@@ -919,9 +935,15 @@ impl Osa2Reader {
                     .take(MAX_JSON_BLOB_DECOMPRESSED as u64 + 1)
                     .read_to_end(&mut decompressed)?;
                 if decompressed.len() > MAX_JSON_BLOB_DECOMPRESSED {
+                    let width = 1u64 << self.metadata.chunk_bits;
                     anyhow::bail!(
-                        "JSON blob decompressed size exceeds limit ({} bytes)",
-                        MAX_JSON_BLOB_DECOMPRESSED
+                        "{}: JSON records for chunk {}/{} exceed the {} MiB decompression limit; \
+                         the chunk spans {} bases. Rebuild this dense source with narrower chunks",
+                        self.sa_metadata.name,
+                        chrom,
+                        chunk_id,
+                        MAX_JSON_BLOB_DECOMPRESSED / (1024 * 1024),
+                        width,
                     );
                 }
                 if decode_started.is_some() {
@@ -970,9 +992,26 @@ impl Osa2Reader {
             }
         }
 
+        if let Ok(failed) = self.failed_chunks.lock() {
+            if let Some(reason) = failed.get(&key) {
+                return Err(anyhow::anyhow!("{}", reason));
+            }
+        }
+
         // Build without holding the lock (lock-free mmap reads + inflate).
         let chunk_started = self.profiling_started();
-        let chunk = Arc::new(self.build_chunk(chrom, chunk_id)?);
+        let chunk = match self.build_chunk(chrom, chunk_id) {
+            Ok(chunk) => Arc::new(chunk),
+            Err(error) => {
+                Self::add_elapsed(&self.chunk_build_nanos, chunk_started);
+                if let Ok(mut failed) = self.failed_chunks.lock() {
+                    if failed.len() < MAX_REMEMBERED_CHUNK_FAILURES {
+                        failed.insert(key, Arc::from(error.to_string()));
+                    }
+                }
+                return Err(error);
+            }
+        };
         Self::add_elapsed(&self.chunk_build_nanos, chunk_started);
         self.chunk_load_count.fetch_add(1, Ordering::Relaxed);
         let bytes = chunk_bytes(&chunk);
