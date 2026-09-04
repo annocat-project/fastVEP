@@ -21,7 +21,7 @@ use fastvep_cache::gff::parse_gff3;
 use fastvep_cache::providers::{
     FastaSequenceProvider, IndexedTranscriptProvider, SequenceProvider, TranscriptProvider,
 };
-use fastvep_consequence::ConsequencePredictor;
+use fastvep_consequence::{AlleleConsequenceResult, ConsequencePredictor};
 use fastvep_core::{Allele, Consequence};
 use fastvep_genome::Transcript;
 use fastvep_io::output;
@@ -381,76 +381,15 @@ impl AnnotationContext {
                                         Some(v) => format!("{}.{}", tc.transcript_id, v),
                                         None => tc.transcript_id.to_string(),
                                     };
-                                    let (hgvs_ref, hgvs_alt) =
-                                        if tr.strand == fastvep_core::Strand::Reverse {
-                                            (
-                                                complement_allele(&vf.ref_allele),
-                                                complement_allele(&ac.allele),
-                                            )
-                                        } else {
-                                            (vf.ref_allele.clone(), ac.allele.clone())
-                                        };
-                                    if let Some(coding_start) = tr.cdna_coding_start {
-                                        if let (Some(cs), Some(ce)) = (ac.cdna_start, ac.cdna_end) {
-                                            let (cs, ce) = (cs.min(ce), cs.max(ce));
-                                            ann.hgvsc = fastvep_hgvs::hgvsc_with_seq(
-                                                &versioned_tid,
-                                                cs,
-                                                ce,
-                                                &hgvs_ref,
-                                                &hgvs_alt,
-                                                coding_start,
-                                                tr.cdna_coding_end,
-                                                tr.spliced_seq.as_deref(),
-                                                tr.codon_table_start_phase,
-                                            );
-                                        } else {
-                                            ann.hgvsc = hgvsc_intronic_shifted(
-                                                self.seq_provider
-                                                    .as_deref()
-                                                    .map(|sp| sp as &dyn SequenceProvider),
-                                                chrom,
-                                                tr,
-                                                &versioned_tid,
-                                                vf.position.start,
-                                                vf.position.end,
-                                                &vf.ref_allele,
-                                                &ac.allele,
-                                                &hgvs_ref,
-                                                &hgvs_alt,
-                                                Some(coding_start),
-                                                tr.cdna_coding_end,
-                                            );
-                                        }
-                                    } else if let (Some(cs), Some(ce)) =
-                                        (ac.cdna_start, ac.cdna_end)
-                                    {
-                                        ann.hgvsc = fastvep_hgvs::hgvsc_noncoding(
-                                            &versioned_tid,
-                                            cs,
-                                            ce,
-                                            &hgvs_ref,
-                                            &hgvs_alt,
-                                            tr.spliced_seq.as_deref(),
-                                        );
-                                    } else {
-                                        ann.hgvsc = hgvsc_intronic_shifted(
-                                            self.seq_provider
-                                                .as_deref()
-                                                .map(|sp| sp as &dyn SequenceProvider),
-                                            chrom,
-                                            tr,
-                                            &versioned_tid,
-                                            vf.position.start,
-                                            vf.position.end,
-                                            &vf.ref_allele,
-                                            &ac.allele,
-                                            &hgvs_ref,
-                                            &hgvs_alt,
-                                            None,
-                                            None,
-                                        );
-                                    }
+                                    ann.hgvsc = hgvsc_for_allele(
+                                        self.seq_provider
+                                            .as_deref()
+                                            .map(|sp| sp as &dyn SequenceProvider),
+                                        chrom,
+                                        tr,
+                                        &versioned_tid,
+                                        ac,
+                                    );
 
                                     // HGVSp
                                     if let (Some(ref aa), Some(ps)) =
@@ -927,6 +866,101 @@ pub fn complement_allele(allele: &Allele) -> Allele {
             Allele::Sequence(comp)
         }
         other => other.clone(),
+    }
+}
+
+/// Generate transcript HGVS from the allele-local minimal representation.
+///
+/// Consequence prediction intentionally uses the uploaded VCF allele, but HGVS
+/// must use the minimal representation of each ALT independently. This matters
+/// for multiallelic records where the parser cannot trim a shared anchor.
+pub fn hgvsc_for_allele(
+    seq_provider: Option<&dyn SequenceProvider>,
+    chrom: &str,
+    transcript: &Transcript,
+    versioned_tid: &str,
+    allele: &AlleleConsequenceResult,
+) -> Option<String> {
+    let start = allele.normalized_position.start;
+    let end = allele.normalized_position.end;
+    let (hgvs_ref, hgvs_alt) = if transcript.strand == fastvep_core::Strand::Reverse {
+        (
+            complement_allele(&allele.normalized_ref_allele),
+            complement_allele(&allele.normalized_alt_allele),
+        )
+    } else {
+        (
+            allele.normalized_ref_allele.clone(),
+            allele.normalized_alt_allele.clone(),
+        )
+    };
+
+    let cdna_span = match (&allele.normalized_ref_allele, &allele.normalized_alt_allele) {
+        (Allele::Sequence(reference), Allele::Sequence(alternate))
+            if reference.len() == 1 && alternate.len() == 1 =>
+        {
+            (allele.cdna_start, allele.cdna_end)
+        }
+        _ => (
+            transcript.genomic_to_cdna(start),
+            transcript.genomic_to_cdna(end),
+        ),
+    };
+
+    match cdna_span {
+        (Some(cdna_start), Some(cdna_end)) => {
+            let (cdna_start, cdna_end) =
+                if transcript.cdna_coding_start.is_none() && transcript.spliced_seq.is_none() {
+                    hgvs_normalize::exonic_deletion_cdna_span(
+                        seq_provider,
+                        chrom,
+                        transcript,
+                        start,
+                        end,
+                        &allele.normalized_ref_allele,
+                        &allele.normalized_alt_allele,
+                    )
+                    .unwrap_or((cdna_start, cdna_end))
+                } else {
+                    (cdna_start, cdna_end)
+                };
+            let (cdna_start, cdna_end) = (cdna_start.min(cdna_end), cdna_start.max(cdna_end));
+            match transcript.cdna_coding_start {
+                Some(coding_start) => fastvep_hgvs::hgvsc_with_seq(
+                    versioned_tid,
+                    cdna_start,
+                    cdna_end,
+                    &hgvs_ref,
+                    &hgvs_alt,
+                    coding_start,
+                    transcript.cdna_coding_end,
+                    transcript.spliced_seq.as_deref(),
+                    transcript.codon_table_start_phase,
+                ),
+                None => fastvep_hgvs::hgvsc_noncoding(
+                    versioned_tid,
+                    cdna_start,
+                    cdna_end,
+                    &hgvs_ref,
+                    &hgvs_alt,
+                    transcript.spliced_seq.as_deref(),
+                ),
+            }
+        }
+        _ => hgvsc_intronic_shifted(
+            seq_provider,
+            chrom,
+            transcript,
+            versioned_tid,
+            start,
+            end,
+            &allele.normalized_ref_allele,
+            &allele.normalized_alt_allele,
+            &hgvs_ref,
+            &hgvs_alt,
+            transcript.cdna_coding_start,
+            transcript.cdna_coding_end,
+        ),
     }
 }
 

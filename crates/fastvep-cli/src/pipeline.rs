@@ -1121,80 +1121,15 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                     None => tc.transcript_id.to_string(),
                                 };
 
-                                // Determine alleles for HGVS - complement for minus strand
-                                let (hgvs_ref, hgvs_alt) = if tr.strand == fastvep_core::Strand::Reverse {
-                                    (
-                                        complement_allele(&vf.ref_allele),
-                                        complement_allele(&ac.allele),
-                                    )
-                                } else {
-                                    (
-                                        vf.ref_allele.clone(),
-                                        ac.allele.clone(),
-                                    )
-                                };
-                                if let Some(coding_start) = tr.cdna_coding_start {
-                                    if let (Some(cs), Some(ce)) = (ac.cdna_start, ac.cdna_end) {
-                                        // Normalize cDNA positions (minus-strand can reverse order)
-                                        let (cs, ce) = (cs.min(ce), cs.max(ce));
-                                        // Exonic variant: standard HGVSc with 3' shifting
-                                        ann.hgvsc = fastvep_hgvs::hgvsc_with_seq(
-                                            &versioned_tid,
-                                            cs, ce,
-                                            &hgvs_ref,
-                                            &hgvs_alt,
-                                            coding_start,
-                                            tr.cdna_coding_end,
-                                            tr.spliced_seq.as_deref(),
-                                            tr.codon_table_start_phase,
-                                        );
-                                    } else {
-                                        ann.hgvsc = hgvsc_intronic_shifted(
-                                            seq_provider
-                                                .as_deref()
-                                                .map(|sp| sp as &dyn SequenceProvider),
-                                            chrom,
-                                            tr,
-                                            &versioned_tid,
-                                            vf.position.start,
-                                            vf.position.end,
-                                            &vf.ref_allele,
-                                            &ac.allele,
-                                            &hgvs_ref,
-                                            &hgvs_alt,
-                                            Some(coding_start),
-                                            tr.cdna_coding_end,
-                                        );
-                                    }
-                                } else {
-                                    // Non-coding transcript: use n. notation
-                                    if let (Some(cs), Some(ce)) = (ac.cdna_start, ac.cdna_end) {
-                                        ann.hgvsc = fastvep_hgvs::hgvsc_noncoding(
-                                            &versioned_tid,
-                                            cs, ce,
-                                            &hgvs_ref,
-                                            &hgvs_alt,
-                                            tr.spliced_seq.as_deref(),
-                                        );
-                                    } else {
-                                        ann.hgvsc = hgvsc_intronic_shifted(
-                                            seq_provider
-                                                .as_deref()
-                                                .map(|sp| sp as &dyn SequenceProvider),
-                                            chrom,
-                                            tr,
-                                            &versioned_tid,
-                                            vf.position.start,
-                                            vf.position.end,
-                                            &vf.ref_allele,
-                                            &ac.allele,
-                                            &hgvs_ref,
-                                            &hgvs_alt,
-                                            None,
-                                            None,
-                                        );
-                                    }
-                                }
+                                ann.hgvsc = hgvsc_for_allele(
+                                    seq_provider
+                                        .as_deref()
+                                        .map(|sp| sp as &dyn SequenceProvider),
+                                    chrom,
+                                    tr,
+                                    &versioned_tid,
+                                    ac,
+                                );
                             }
 
                             if let (Some(ref aa), Some(ps)) = (&ac.amino_acids, ac.protein_start) {
@@ -1697,8 +1632,8 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
 
 // Shared annotation utilities from fastvep-annotate (used by batch pipeline).
 use fastvep_annotate::{
-    annotate_intergenic, annotate_sa_only_scaffold, complement_allele, hgvsc_intronic_shifted,
-    load_gene_providers, load_sa_providers,
+    annotate_intergenic, annotate_sa_only_scaffold, hgvsc_for_allele, load_gene_providers,
+    load_sa_providers,
 };
 
 /// Index of the best transcript variation under VEP's default `--pick_order`

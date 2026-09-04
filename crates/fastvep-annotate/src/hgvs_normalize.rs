@@ -260,6 +260,57 @@ pub fn three_prime_shift_intronic(
     }
 }
 
+/// Apply the HGVS 3'-rule to an exonic deletion when a non-coding transcript
+/// has no cached spliced sequence.
+pub(crate) fn exonic_deletion_cdna_span(
+    seq_provider: Option<&dyn SequenceProvider>,
+    chrom: &str,
+    transcript: &fastvep_genome::Transcript,
+    start: u64,
+    end: u64,
+    ref_allele: &fastvep_core::Allele,
+    alt_allele: &fastvep_core::Allele,
+) -> Option<(u64, u64)> {
+    use fastvep_core::Allele;
+
+    let original = || {
+        Some((
+            transcript.genomic_to_cdna(start)?,
+            transcript.genomic_to_cdna(end)?,
+        ))
+    };
+    let Some(provider) = seq_provider else {
+        return original();
+    };
+    if !matches!(
+        (ref_allele, alt_allele),
+        (Allele::Sequence(bases), Allele::Deletion) if !bases.is_empty()
+    ) {
+        return original();
+    }
+
+    let (lo, hi) = (start.min(end), start.max(end));
+    let exon = transcript
+        .exons
+        .iter()
+        .find(|exon| lo >= exon.start && hi <= exon.end)?;
+    let (shifted_start, shifted_end) = three_prime_shift_intronic(
+        provider,
+        chrom,
+        start,
+        end,
+        ref_allele,
+        alt_allele,
+        transcript.strand,
+        exon.start,
+        exon.end,
+    );
+    Some((
+        transcript.genomic_to_cdna(shifted_start)?,
+        transcript.genomic_to_cdna(shifted_end)?,
+    ))
+}
+
 /// The block a 3'-shifted intronic insertion duplicates, in genomic coordinates.
 ///
 /// After a maximal 3'-shift the duplicated copy can only sit immediately 5' of
@@ -572,6 +623,16 @@ mod tests {
         }
     }
 
+    struct HomopolymerRef;
+    impl SequenceProvider for HomopolymerRef {
+        fn fetch_sequence(&self, _chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+            if start < 1 || end < start || end > 100 {
+                return Err(anyhow!("bad range"));
+            }
+            Ok(vec![b'C'; (end - start + 1) as usize])
+        }
+    }
+
     /// Two exons on `strand` with one intron between them, so an intronic
     /// position has an anchor on either side. Exon 1 is 1..=20, exon 2 is
     /// 81..=100, and the intron is 21..=80.
@@ -630,6 +691,21 @@ mod tests {
             flags: vec![],
             codon_table_start_phase: 0,
         }
+    }
+
+    #[test]
+    fn reverse_exonic_deletion_shifts_without_a_cached_transcript_sequence() {
+        let tr = transcript(Strand::Reverse);
+        let span = exonic_deletion_cdna_span(
+            Some(&HomopolymerRef),
+            "1",
+            &tr,
+            91,
+            91,
+            &fastvep_core::Allele::from_str("C"),
+            &fastvep_core::Allele::Deletion,
+        );
+        assert_eq!(span, Some((20, 20)));
     }
 
     /// 20 exonic bases, then a `TG` repeat filling the intron, then exon 2. An
