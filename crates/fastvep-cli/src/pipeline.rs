@@ -1142,6 +1142,17 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                             &versioned_tid,
                                             ac,
                                         );
+                                        if ann.hgvsc.is_some() {
+                                            ann.hgvs_offset =
+                                                fastvep_annotate::hgvs_offset_for_allele(
+                                                    seq_provider
+                                                        .as_deref()
+                                                        .map(|sp| sp as &dyn SequenceProvider),
+                                                    chrom,
+                                                    tr,
+                                                    ac,
+                                                );
+                                        }
                                     }
 
                                     if let Some(tr) = transcript {

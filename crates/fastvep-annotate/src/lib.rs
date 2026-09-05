@@ -399,6 +399,16 @@ impl AnnotationContext {
                                         &versioned_tid,
                                         ac,
                                     );
+                                    if ann.hgvsc.is_some() {
+                                        ann.hgvs_offset = hgvs_offset_for_allele(
+                                            self.seq_provider
+                                                .as_deref()
+                                                .map(|sp| sp as &dyn SequenceProvider),
+                                            chrom,
+                                            tr,
+                                            ac,
+                                        );
+                                    }
 
                                     if let Some(ref pid) = tr.protein_id {
                                         let versioned_pid: String = match tr.protein_version {
@@ -1303,6 +1313,40 @@ pub fn hgvsc_for_allele(
             transcript.cdna_coding_end,
         ),
     }
+}
+
+/// Signed genomic displacement applied while rendering the transcript HGVS.
+/// VEP reports positive values for shifts toward increasing genomic
+/// coordinates and negative values for shifts toward decreasing coordinates.
+pub fn hgvs_offset_for_allele(
+    seq_provider: Option<&dyn SequenceProvider>,
+    chrom: &str,
+    transcript: &Transcript,
+    allele: &AlleleConsequenceResult,
+) -> Option<i64> {
+    let provider = seq_provider?;
+    let is_nonempty_indel = match (&allele.normalized_ref_allele, &allele.normalized_alt_allele) {
+        (Allele::Sequence(bases), Allele::Deletion)
+        | (Allele::Deletion, Allele::Sequence(bases)) => !bases.is_empty(),
+        _ => false,
+    };
+    if !is_nonempty_indel {
+        return None;
+    }
+    let start = allele.normalized_position.start;
+    let (shifted_start, _) = hgvs_normalize::three_prime_shift_intronic(
+        provider,
+        chrom,
+        start,
+        allele.normalized_position.end,
+        &allele.normalized_ref_allele,
+        &allele.normalized_alt_allele,
+        transcript.strand,
+        transcript.start,
+        transcript.end,
+    );
+    let offset = i128::from(shifted_start) - i128::from(start);
+    i64::try_from(offset).ok().filter(|offset| *offset != 0)
 }
 
 #[cfg(test)]
