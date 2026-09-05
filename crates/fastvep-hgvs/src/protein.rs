@@ -284,16 +284,11 @@ pub fn hgvsp_inframe_indel(
     };
     let prefix = format!("{}:p.", protein_id);
 
-    // A window whose residues all survive unchanged is synonymous, and HGVS
-    // names the whole span it covers: `p.Leu346_Leu347=`. Ensembl writes
-    // `p.LeuLeu346=` - two three-letter codes sharing one position, which is not
-    // a form HGVS defines - and reading one residue of the pair gave
-    // `p.Leu347=`, which names the second of two on a reverse-strand transcript
-    // and the first on a forward one. 137 rows over a 6,600-variant ClinVar
-    // sample; neither tool agreed with the other and neither was well formed.
+    // VEP writes a synonymous multi-residue window as all three-letter residues
+    // followed by the first position, for example `p.SerTer22=`.
     if !original_ref.is_empty() && original_ref == original_alt {
         let lo = protein_start.min(protein_end);
-        return Some(format!("{}{}=", prefix, residue_span(lo, &original_ref)));
+        return Some(format!("{}{}{}=", prefix, three_letter(&original_ref), lo));
     }
 
     let fallback = || unshifted_description(&prefix, protein_start, &original_ref, &original_alt);
@@ -508,6 +503,107 @@ pub fn hgvsp_frameshift_from_cds(
     strand: Strand,
     codon_table: &CodonTable,
 ) -> Option<String> {
+    hgvsp_frameshift_from_cds_with_tables(
+        protein_id,
+        cds_and_downstream,
+        cds_start,
+        cds_end,
+        ref_allele,
+        alt_allele,
+        strand,
+        codon_table,
+        codon_table,
+    )
+}
+
+/// Generate frameshift HGVSp while allowing VEP-compatible reference and
+/// alternate translation tables to differ.
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_frameshift_from_cds_with_tables(
+    protein_id: &str,
+    cds_and_downstream: &[u8],
+    cds_start: Option<u64>,
+    cds_end: Option<u64>,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    strand: Strand,
+    reference_codon_table: &CodonTable,
+    alternate_codon_table: &CodonTable,
+) -> Option<String> {
+    let (edited, first) = edited_cds(
+        cds_and_downstream,
+        cds_start,
+        cds_end,
+        ref_allele,
+        alt_allele,
+        strand,
+    )?;
+
+    hgvsp_frameshift_with_tables(
+        protein_id,
+        cds_and_downstream,
+        &edited,
+        first / 3,
+        reference_codon_table,
+        alternate_codon_table,
+    )
+}
+
+/// Generate the VEP stop-loss form and count to the next translated stop.
+///
+/// `protein_pos` is the reference terminator position. The extension distance
+/// is the distance from that terminator to the next terminator after applying
+/// the variant; when the transcript sequence contains no later stop, HGVS uses
+/// `extTer?`.
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_stop_lost_from_cds(
+    protein_id: &str,
+    protein_pos: u64,
+    alt_aa: u8,
+    cds_and_downstream: &[u8],
+    cds_start: Option<u64>,
+    cds_end: Option<u64>,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    strand: Strand,
+    codon_table: &CodonTable,
+) -> Option<String> {
+    let (edited, _) = edited_cds(
+        cds_and_downstream,
+        cds_start,
+        cds_end,
+        ref_allele,
+        alt_allele,
+        strand,
+    )?;
+    let next_stop = codon_table
+        .translate_seq(&edited)
+        .iter()
+        .position(|&aa| aa == b'*')
+        .map(|zero_based| zero_based as u64 + 1)
+        .filter(|&position| position > protein_pos)
+        .map(|position| position - protein_pos);
+    let distance = next_stop
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+
+    Some(format!(
+        "{}:p.Ter{}{}extTer{}",
+        protein_id,
+        protein_pos,
+        aa_one_to_three(alt_aa),
+        distance
+    ))
+}
+
+fn edited_cds(
+    cds_and_downstream: &[u8],
+    cds_start: Option<u64>,
+    cds_end: Option<u64>,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    strand: Strand,
+) -> Option<(Vec<u8>, usize)> {
     let (first, ref_len) = if *ref_allele == Allele::Deletion {
         // The reference covers no bases, and Ensembl's zero-length interval puts
         // the insertion point just after the lower coordinate. An insertion on
@@ -548,14 +644,7 @@ pub fn hgvsp_frameshift_from_cds(
     edited.extend_from_slice(&cds_and_downstream[..first]);
     edited.extend_from_slice(&alt_cds);
     edited.extend_from_slice(&cds_and_downstream[first + ref_len..]);
-
-    hgvsp_frameshift(
-        protein_id,
-        cds_and_downstream,
-        &edited,
-        first / 3,
-        codon_table,
-    )
+    Some((edited, first))
 }
 
 fn complement(base: u8) -> u8 {
@@ -588,6 +677,24 @@ pub fn hgvsp_frameshift(
     affected_codon_start: usize, // 0-based codon index where the frameshift starts
     codon_table: &CodonTable,
 ) -> Option<String> {
+    hgvsp_frameshift_with_tables(
+        protein_id,
+        ref_translateable,
+        alt_translateable,
+        affected_codon_start,
+        codon_table,
+        codon_table,
+    )
+}
+
+fn hgvsp_frameshift_with_tables(
+    protein_id: &str,
+    ref_translateable: &[u8],
+    alt_translateable: &[u8],
+    affected_codon_start: usize,
+    reference_codon_table: &CodonTable,
+    alternate_codon_table: &CodonTable,
+) -> Option<String> {
     let prefix = format!("{}:p.", protein_id);
 
     // Translate both sequences from the affected codon onwards
@@ -602,13 +709,13 @@ pub fn hgvsp_frameshift(
     let ref_peptide: Vec<u8> = ref_translateable[ref_start..]
         .chunks(3)
         .filter(|c| c.len() == 3)
-        .map(|c| codon_table.translate(&[c[0], c[1], c[2]]))
+        .map(|c| reference_codon_table.translate(&[c[0], c[1], c[2]]))
         .collect();
 
     let alt_peptide: Vec<u8> = alt_translateable[ref_start..]
         .chunks(3)
         .filter(|c| c.len() == 3)
-        .map(|c| codon_table.translate(&[c[0], c[1], c[2]]))
+        .map(|c| alternate_codon_table.translate(&[c[0], c[1], c[2]]))
         .collect();
 
     // Find the first position where amino acids differ
@@ -645,6 +752,10 @@ pub fn hgvsp_frameshift(
 
     let ref_aa3 = aa_one_to_three(ref_aa);
     let alt_aa3 = aa_one_to_three(alt_aa);
+
+    if ref_aa == b'*' && alt_aa == b'*' {
+        return Some(format!("{}Ter{}=", prefix, first_changed_pos));
+    }
 
     // A frameshift whose *first* changed residue is already a terminator is
     // described as the nonsense variant it is: `p.Leu1545Ter`, not
@@ -734,6 +845,16 @@ mod tests {
         // past it to the real stop (TAA) 4 codons in.
         assert_eq!(mito_result, Some("ENSP1:p.Arg1ProfsTer4".to_string()));
         assert_ne!(standard_result, mito_result);
+
+        let mixed_result = hgvsp_frameshift_with_tables(
+            "ENSP1",
+            b"AGACCCCCCCCC",
+            b"ACATGAAAATAA",
+            0,
+            &mitochondrial,
+            &standard,
+        );
+        assert_eq!(mixed_result, Some("ENSP1:p.Ter1ThrfsTer2".to_string()));
     }
 
     #[test]
@@ -1722,5 +1843,54 @@ mod window_tests {
         );
         assert_eq!(forward, reverse, "the two strands describe the same edit");
         assert!(forward.is_some());
+    }
+
+    #[test]
+    fn stop_loss_counts_to_the_next_stop_on_either_strand() {
+        let table = CodonTable::standard();
+        // M K * Q *; changing the first base of the first TAA to C makes Gln,
+        // and the next terminator is two residues later.
+        let cds = b"ATGAAATAACAATAA";
+        let forward = hgvsp_stop_lost_from_cds(
+            "P",
+            3,
+            b'Q',
+            cds,
+            Some(7),
+            Some(7),
+            &Allele::Sequence(b"T".to_vec()),
+            &Allele::Sequence(b"C".to_vec()),
+            Strand::Forward,
+            &table,
+        );
+        let reverse = hgvsp_stop_lost_from_cds(
+            "P",
+            3,
+            b'Q',
+            cds,
+            Some(7),
+            Some(7),
+            &Allele::Sequence(b"A".to_vec()),
+            &Allele::Sequence(b"G".to_vec()),
+            Strand::Reverse,
+            &table,
+        );
+
+        assert_eq!(forward, Some("P:p.Ter3GlnextTer2".to_string()));
+        assert_eq!(reverse, forward);
+
+        let no_later_stop = hgvsp_stop_lost_from_cds(
+            "P",
+            3,
+            b'Q',
+            b"ATGAAATAACAA",
+            Some(7),
+            Some(7),
+            &Allele::Sequence(b"T".to_vec()),
+            &Allele::Sequence(b"C".to_vec()),
+            Strand::Forward,
+            &table,
+        );
+        assert_eq!(no_later_stop, Some("P:p.Ter3GlnextTer?".to_string()));
     }
 }

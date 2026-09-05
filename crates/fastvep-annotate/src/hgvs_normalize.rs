@@ -260,8 +260,9 @@ pub fn three_prime_shift_intronic(
     }
 }
 
-/// Apply the HGVS 3'-rule to an exonic deletion when a non-coding transcript
-/// has no cached spliced sequence.
+/// Apply VEP's genomic HGVS 3'-shift to an exonic deletion, then map the result
+/// back to cDNA. `None` means the shifted deletion no longer has two exonic
+/// endpoints and must be rendered by the intronic path or suppressed.
 pub(crate) fn exonic_deletion_cdna_span(
     seq_provider: Option<&dyn SequenceProvider>,
     chrom: &str,
@@ -289,11 +290,6 @@ pub(crate) fn exonic_deletion_cdna_span(
         return original();
     }
 
-    let (lo, hi) = (start.min(end), start.max(end));
-    let exon = transcript
-        .exons
-        .iter()
-        .find(|exon| lo >= exon.start && hi <= exon.end)?;
     let (shifted_start, shifted_end) = three_prime_shift_intronic(
         provider,
         chrom,
@@ -302,13 +298,81 @@ pub(crate) fn exonic_deletion_cdna_span(
         ref_allele,
         alt_allele,
         transcript.strand,
-        exon.start,
-        exon.end,
+        transcript.start,
+        transcript.end,
     );
     Some((
         transcript.genomic_to_cdna(shifted_start)?,
         transcript.genomic_to_cdna(shifted_end)?,
     ))
+}
+
+/// Build a transcript's spliced sequence for one HGVS normalization without
+/// retaining it in the transcript cache.
+pub(crate) fn transient_spliced_sequence(
+    seq_provider: Option<&dyn SequenceProvider>,
+    transcript: &fastvep_genome::Transcript,
+) -> Option<String> {
+    let provider = seq_provider?;
+    let mut transcript = transcript.clone();
+    transcript
+        .build_sequences(|chrom, start, end| {
+            provider
+                .fetch_sequence(chrom, start, end)
+                .map_err(|error| error.to_string())
+        })
+        .ok()?;
+    transcript.spliced_seq
+}
+
+/// Whether VEP's genomic 3'-shift moves an indel past the transcript.
+///
+/// VEP suppresses transcript HGVS when the shifted insertion no longer fits on
+/// the transcript slice. A transcript-sequence-only shift instead stops at the
+/// last cDNA base and can incorrectly emit a terminal duplication.
+pub(crate) fn indel_shifts_beyond_transcript(
+    seq_provider: Option<&dyn SequenceProvider>,
+    chrom: &str,
+    transcript: &fastvep_genome::Transcript,
+    start: u64,
+    end: u64,
+    ref_allele: &fastvep_core::Allele,
+    alt_allele: &fastvep_core::Allele,
+) -> bool {
+    use fastvep_core::Allele;
+
+    let Some(provider) = seq_provider else {
+        return false;
+    };
+    let is_insertion = matches!(
+        (ref_allele, alt_allele),
+        (Allele::Deletion, Allele::Sequence(bases)) if !bases.is_empty()
+    );
+    let is_deletion = matches!(
+        (ref_allele, alt_allele),
+        (Allele::Sequence(bases), Allele::Deletion) if !bases.is_empty()
+    );
+    if !is_insertion && !is_deletion {
+        return false;
+    }
+
+    // Include one base beyond the transcript so a repeat can prove that the
+    // HGVS 3'-rule would move the allele out of the transcript slice.
+    let (shifted_start, shifted_end) = three_prime_shift_intronic(
+        provider,
+        chrom,
+        start,
+        end,
+        ref_allele,
+        alt_allele,
+        transcript.strand,
+        transcript.start.saturating_sub(1).max(1),
+        transcript.end.saturating_add(1),
+    );
+    shifted_start < transcript.start
+        || shifted_start > transcript.end
+        || shifted_end < transcript.start
+        || shifted_end > transcript.end
 }
 
 /// The block a 3'-shifted intronic insertion duplicates, in genomic coordinates.
@@ -478,20 +542,39 @@ pub fn hgvsc_intronic_shifted(
         (hgvs_ref, hgvs_alt),
         (Allele::Deletion, Allele::Sequence(_))
     );
-    let is_indel = is_insertion
-        || matches!(
-            (hgvs_ref, hgvs_alt),
-            (Allele::Sequence(_), Allele::Deletion)
-        );
+    let is_deletion = matches!(
+        (hgvs_ref, hgvs_alt),
+        (Allele::Sequence(_), Allele::Deletion)
+    );
+    let is_indel = is_insertion || is_deletion;
 
     // The walk is bounded by the intron the variant sits in, and an insertion
     // sits *between* two bases, so `var_start` alone does not always find it:
     // one written against the last intronic base has `var_start` in the exon
     // beyond it, and a reverse-strand transcript travels 3' back down into that
     // intron. Reading `var_end` when `var_start` lands outside places it.
-    let bounds = transcript
-        .intron_bounds_at(var_start)
-        .or_else(|| transcript.intron_bounds_at(var_end));
+    let start_intron = transcript.intron_bounds_at(var_start);
+    let end_intron = transcript.intron_bounds_at(var_end);
+    let bounds = if is_deletion
+        && start_intron != end_intron
+        && (start_intron.is_some() || end_intron.is_some())
+    {
+        // VEP 115 shifts a deletion on the genomic reference before mapping
+        // either endpoint to cDNA. A deletion that crosses a splice boundary
+        // may therefore move out of the intron it started in.
+        Some((transcript.start, transcript.end))
+    } else if is_deletion
+        && start_intron.is_none()
+        && end_intron.is_none()
+        && transcript.genomic_to_cdna(var_start).is_some()
+        && transcript.genomic_to_cdna(var_end).is_some()
+    {
+        // The caller also uses this renderer when a deletion starts in an exon
+        // but VEP's genomic 3'-shift moves it into an intron.
+        Some((transcript.start, transcript.end))
+    } else {
+        start_intron.or(end_intron)
+    };
     let (shifted_start, shifted_end) = match seq_provider.filter(|_| is_indel).zip(bounds) {
         Some((sp, (intron_start, intron_end))) => three_prime_shift_intronic(
             sp,
@@ -626,10 +709,40 @@ mod tests {
     struct HomopolymerRef;
     impl SequenceProvider for HomopolymerRef {
         fn fetch_sequence(&self, _chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
-            if start < 1 || end < start || end > 100 {
+            if start < 1 || end < start || end > 1_000 {
                 return Err(anyhow!("bad range"));
             }
             Ok(vec![b'C'; (end - start + 1) as usize])
+        }
+    }
+
+    struct SpliceBoundaryRef;
+    impl SequenceProvider for SpliceBoundaryRef {
+        fn fetch_sequence(&self, _chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+            if start < 1 || end < start || end > 1_000 {
+                return Err(anyhow!("bad range"));
+            }
+            Ok((start..=end)
+                .map(|pos| {
+                    if matches!(pos, 20 | 21 | 80 | 81) {
+                        b'T'
+                    } else {
+                        b'G'
+                    }
+                })
+                .collect())
+        }
+    }
+
+    struct SpliceJumpRef;
+    impl SequenceProvider for SpliceJumpRef {
+        fn fetch_sequence(&self, _chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+            if start < 1 || end < start || end > 1_000 {
+                return Err(anyhow!("bad range"));
+            }
+            Ok((start..=end)
+                .map(|pos| if matches!(pos, 20 | 81) { b'T' } else { b'G' })
+                .collect())
         }
     }
 
@@ -694,6 +807,149 @@ mod tests {
     }
 
     #[test]
+    fn transient_spliced_sequence_is_not_cached_on_the_transcript() {
+        let tr = transcript(Strand::Forward);
+        let sequence = transient_spliced_sequence(Some(&HomopolymerRef), &tr).unwrap();
+
+        assert_eq!(sequence, "C".repeat(40));
+        assert!(tr.spliced_seq.is_none());
+    }
+
+    #[test]
+    fn terminal_exonic_insertion_shift_is_detected_on_both_strands() {
+        for (strand, start, end) in [(Strand::Forward, 91, 90), (Strand::Reverse, 11, 10)] {
+            let tr = transcript(strand);
+            assert!(indel_shifts_beyond_transcript(
+                Some(&HomopolymerRef),
+                "1",
+                &tr,
+                start,
+                end,
+                &fastvep_core::Allele::Deletion,
+                &fastvep_core::Allele::from_str("C"),
+            ));
+            assert!(!indel_shifts_beyond_transcript(
+                Some(&HomopolymerRef),
+                "1",
+                &tr,
+                start,
+                end,
+                &fastvep_core::Allele::Deletion,
+                &fastvep_core::Allele::from_str("A"),
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_exonic_deletion_shift_is_detected_on_both_strands() {
+        for (strand, position) in [(Strand::Forward, 200), (Strand::Reverse, 101)] {
+            let mut tr = transcript(strand);
+            tr.start += 100;
+            tr.end += 100;
+            tr.gene.start += 100;
+            tr.gene.end += 100;
+            for exon in &mut tr.exons {
+                exon.start += 100;
+                exon.end += 100;
+            }
+
+            assert!(indel_shifts_beyond_transcript(
+                Some(&HomopolymerRef),
+                "1",
+                &tr,
+                position,
+                position,
+                &fastvep_core::Allele::from_str("C"),
+                &fastvep_core::Allele::Deletion,
+            ));
+        }
+    }
+
+    #[test]
+    fn exonic_deletion_can_shift_to_the_first_intronic_base() {
+        for (strand, position) in [(Strand::Forward, 20), (Strand::Reverse, 81)] {
+            let tr = transcript(strand);
+            let reference = fastvep_core::Allele::from_str("T");
+            assert_eq!(
+                exonic_deletion_cdna_span(
+                    Some(&SpliceBoundaryRef),
+                    "1",
+                    &tr,
+                    position,
+                    position,
+                    &reference,
+                    &fastvep_core::Allele::Deletion,
+                ),
+                None
+            );
+
+            let out = hgvsc_intronic_shifted(
+                Some(&SpliceBoundaryRef),
+                "1",
+                &tr,
+                "ENST00000000001.1",
+                position,
+                position,
+                &reference,
+                &fastvep_core::Allele::Deletion,
+                &reference,
+                &fastvep_core::Allele::Deletion,
+                Some(1),
+                Some(40),
+            );
+            assert_eq!(
+                out.as_deref(),
+                Some("ENST00000000001.1:c.20+1del"),
+                "{strand:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genomic_deletion_shift_does_not_jump_an_intron() {
+        let tr = transcript(Strand::Forward);
+        let span = exonic_deletion_cdna_span(
+            Some(&SpliceJumpRef),
+            "1",
+            &tr,
+            20,
+            20,
+            &fastvep_core::Allele::from_str("T"),
+            &fastvep_core::Allele::Deletion,
+        );
+
+        // cDNA bases 20 and 21 are both T, but genomic base 21 is G. VEP
+        // therefore leaves the deletion at cDNA 20 instead of skipping the
+        // intron and shifting it to the next exon.
+        assert_eq!(span, Some((20, 20)));
+    }
+
+    #[test]
+    fn an_unmapped_deletion_is_not_promoted_into_a_later_exon() {
+        let mut tr = transcript(Strand::Forward);
+        tr.exons.remove(0);
+        tr.cdna_coding_start = None;
+        tr.cdna_coding_end = None;
+
+        let out = hgvsc_intronic_shifted(
+            Some(&HomopolymerRef),
+            "1",
+            &tr,
+            "ENST00000000001.1",
+            80,
+            80,
+            &fastvep_core::Allele::from_str("C"),
+            &fastvep_core::Allele::Deletion,
+            &fastvep_core::Allele::from_str("C"),
+            &fastvep_core::Allele::Deletion,
+            None,
+            None,
+        );
+
+        assert_eq!(out, None);
+    }
+
+    #[test]
     fn reverse_exonic_deletion_shifts_without_a_cached_transcript_sequence() {
         let tr = transcript(Strand::Reverse);
         let span = exonic_deletion_cdna_span(
@@ -705,7 +961,28 @@ mod tests {
             &fastvep_core::Allele::from_str("C"),
             &fastvep_core::Allele::Deletion,
         );
-        assert_eq!(span, Some((20, 20)));
+        assert_eq!(span, Some((40, 40)));
+    }
+
+    #[test]
+    fn deletion_can_shift_from_an_intron_into_an_exon() {
+        let tr = transcript(Strand::Forward);
+        let out = hgvsc_intronic_shifted(
+            Some(&HomopolymerRef),
+            "1",
+            &tr,
+            "ENST00000000001.1",
+            80,
+            81,
+            &fastvep_core::Allele::from_str("CC"),
+            &fastvep_core::Allele::Deletion,
+            &fastvep_core::Allele::from_str("CC"),
+            &fastvep_core::Allele::Deletion,
+            Some(1),
+            Some(40),
+        );
+
+        assert_eq!(out.as_deref(), Some("ENST00000000001.1:c.39_40del"));
     }
 
     /// 20 exonic bases, then a `TG` repeat filling the intron, then exon 2. An

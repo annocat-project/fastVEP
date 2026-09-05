@@ -352,6 +352,23 @@ impl Transcript {
         }
         None
     }
+
+    /// Check if a genomic range overlaps an intron.
+    pub fn intron_overlapping(&self, range_start: u64, range_end: u64) -> Option<(usize, usize)> {
+        let (start, end) = (range_start.min(range_end), range_start.max(range_end));
+        let sorted = self.sorted_exons();
+        let n_introns = sorted.len().saturating_sub(1);
+        for i in 0..n_introns {
+            let (intron_start, intron_end) = match self.strand {
+                Strand::Forward => (sorted[i].end + 1, sorted[i + 1].start - 1),
+                Strand::Reverse => (sorted[i + 1].end + 1, sorted[i].start - 1),
+            };
+            if start <= intron_end && end >= intron_start {
+                return Some((i, n_introns));
+            }
+        }
+        None
+    }
 }
 
 /// An exon within a transcript.
@@ -562,6 +579,14 @@ mod tests {
         assert_eq!(tr.intron_at(1500), Some((0, 2)));
         assert_eq!(tr.intron_at(3000), Some((1, 2)));
         assert_eq!(tr.intron_at(1100), None); // exon
+    }
+
+    #[test]
+    fn test_intron_overlapping() {
+        let tr = make_test_transcript();
+        assert_eq!(tr.intron_overlapping(1200, 1201), Some((0, 2)));
+        assert_eq!(tr.intron_overlapping(2300, 4000), Some((1, 2)));
+        assert_eq!(tr.intron_overlapping(1000, 1200), None);
     }
 
     #[test]
