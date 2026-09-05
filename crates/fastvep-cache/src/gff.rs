@@ -87,77 +87,123 @@ fn parse_gff3_indexed_inner(
         .map(|n| n.to_string())
         .collect();
 
-    let mut all_lines: Vec<String> = Vec::new();
-    let mut seen_lines: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-    for (chrom, start, end) in regions {
-        // Find reference ID, trying with/without "chr" prefix
-        let ref_id = ref_names.iter().position(|n| n == chrom).or_else(|| {
-            if chrom.starts_with("chr") {
-                ref_names.iter().position(|n| n == &chrom[3..])
-            } else {
-                let with_chr = format!("chr{}", chrom);
-                ref_names.iter().position(|n| *n == with_chr)
-            }
-        });
-
-        let ref_id = match ref_id {
-            Some(id) => id,
-            None => continue,
-        };
-
-        let pos_start = Position::try_from((*start).max(1) as usize).unwrap_or(Position::MIN);
-        let pos_end = Position::try_from(*end as usize).unwrap_or(Position::MIN);
-        let query_interval: Interval = (pos_start..=pos_end).into();
-
-        let chunks = match index.query(ref_id, query_interval) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
+    let collect_lines = |query_regions: &[(String, u64, u64)]| -> Result<Vec<String>> {
         let file = std::fs::File::open(gff3_gz_path)?;
         let mut reader = bgzf::io::Reader::new(file);
+        let mut all_lines: Vec<String> = Vec::new();
+        let mut seen_lines: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-        for chunk in &chunks {
-            reader.seek(chunk.start())?;
-            let mut line = String::new();
-
-            loop {
-                line.clear();
-                let bytes = reader.read_line(&mut line)?;
-                if bytes == 0 {
-                    break;
+        for (chrom, start, end) in query_regions {
+            // Find reference ID, trying with/without "chr" prefix.
+            let ref_id = ref_names.iter().position(|n| n == chrom).or_else(|| {
+                if let Some(bare) = chrom.strip_prefix("chr") {
+                    ref_names.iter().position(|n| n == bare)
+                } else {
+                    let with_chr = format!("chr{}", chrom);
+                    ref_names.iter().position(|n| *n == with_chr)
                 }
+            });
 
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
+            let ref_id = match ref_id {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let pos_start = Position::try_from((*start).max(1) as usize).unwrap_or(Position::MIN);
+            let pos_end = Position::try_from(*end as usize).unwrap_or(Position::MIN);
+            let query_interval: Interval = (pos_start..=pos_end).into();
+
+            let chunks = match index.query(ref_id, query_interval) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            for chunk in &chunks {
+                reader.seek(chunk.start())?;
+                let mut line = String::new();
+
+                loop {
+                    line.clear();
+                    let bytes = reader.read_line(&mut line)?;
+                    if bytes == 0 {
+                        break;
+                    }
+
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        if reader.virtual_position() >= chunk.end() {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // Deduplicate lines by hashing (regions may overlap in tabix chunks).
+                    let hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        trimmed.hash(&mut h);
+                        h.finish()
+                    };
+                    if seen_lines.insert(hash) {
+                        all_lines.push(trimmed.to_string());
+                    }
+
                     if reader.virtual_position() >= chunk.end() {
                         break;
                     }
-                    continue;
-                }
-
-                // Deduplicate lines by hashing (regions may overlap in tabix chunks)
-                let hash = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    trimmed.hash(&mut h);
-                    h.finish()
-                };
-                if seen_lines.insert(hash) {
-                    all_lines.push(trimmed.to_string());
-                }
-
-                if reader.virtual_position() >= chunk.end() {
-                    break;
                 }
             }
         }
+
+        Ok(all_lines)
+    };
+
+    // A regional tabix query can see a transcript record and only the nearby
+    // subset of its exons/CDS records. Building a Transcript from that subset
+    // corrupts EXON/INTRON denominators and coding coordinates. First discover
+    // the overlapping transcript IDs, then query their complete spans and
+    // assemble only those transcripts from the complete records.
+    let seed_lines = collect_lines(regions)?;
+    let seed_transcripts = parse_gff3_lines(seed_lines.into_iter().map(Ok))?;
+    let (selected_ids, transcript_regions) =
+        overlapping_transcript_regions(&seed_transcripts, regions);
+    if selected_ids.is_empty() {
+        return Ok(Vec::new());
     }
 
-    // Lines were already collected into memory by the tabix-chunk loop above,
-    // so wrap them in `Ok` to satisfy the streaming-aware parser signature.
-    parse_gff3_lines(all_lines.into_iter().map(Ok))
+    let complete_lines = collect_lines(&transcript_regions)?;
+    let mut transcripts = parse_gff3_lines(complete_lines.into_iter().map(Ok))?;
+    transcripts.retain(|transcript| selected_ids.contains(transcript.stable_id.as_ref()));
+    Ok(transcripts)
+}
+
+fn overlapping_transcript_regions(
+    transcripts: &[Transcript],
+    regions: &[(String, u64, u64)],
+) -> (std::collections::HashSet<String>, Vec<(String, u64, u64)>) {
+    let mut ids = std::collections::HashSet::new();
+    let mut spans = Vec::new();
+    for transcript in transcripts {
+        if regions.iter().any(|(chrom, start, end)| {
+            contigs_match(chrom, transcript.chromosome.as_ref())
+                && transcript.start <= *end
+                && *start <= transcript.end
+        }) {
+            ids.insert(transcript.stable_id.to_string());
+            spans.push((
+                transcript.chromosome.to_string(),
+                transcript.start,
+                transcript.end,
+            ));
+        }
+    }
+    (ids, spans)
+}
+
+fn contigs_match(left: &str, right: &str) -> bool {
+    let left = left.strip_prefix("chr").unwrap_or(left);
+    let right = right.strip_prefix("chr").unwrap_or(right);
+    left == right || matches!((left, right), ("M", "MT") | ("MT", "M"))
 }
 
 /// Core GFF3 parsing logic: takes an iterator of `Result<String>` lines and
@@ -1055,6 +1101,19 @@ chr1\tensembl\tCDS\t1050\t1200\t.\t+\t0\tID=CDS:P1;Parent=transcript:TX3";
         let transcripts = parse_gff3(sample_gff3().as_bytes()).unwrap();
         assert!(!transcripts.is_empty());
         assert_eq!(transcripts[0].source.as_deref(), Some("GFF3"));
+    }
+
+    #[test]
+    fn indexed_selection_expands_an_overlapping_transcript_to_its_complete_span() {
+        let transcripts = parse_gff3(sample_gff3().as_bytes()).unwrap();
+        let (ids, regions) =
+            overlapping_transcript_regions(&transcripts, &[("1".to_string(), 2_100, 2_100)]);
+
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["ENST00000001".to_string()])
+        );
+        assert_eq!(regions, vec![("chr1".to_string(), 1_000, 5_000)]);
     }
 
     #[test]
