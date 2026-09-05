@@ -197,7 +197,27 @@ fn overlapping_transcript_regions(
             ));
         }
     }
-    (ids, spans)
+    (ids, merge_regions(spans))
+}
+
+fn merge_regions(mut regions: Vec<(String, u64, u64)>) -> Vec<(String, u64, u64)> {
+    regions.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+    let mut merged: Vec<(String, u64, u64)> = Vec::new();
+    for (chrom, start, end) in regions {
+        if let Some(last) = merged.last_mut() {
+            if last.0 == chrom && start <= last.2.saturating_add(1) {
+                last.2 = last.2.max(end);
+                continue;
+            }
+        }
+        merged.push((chrom, start, end));
+    }
+    merged
 }
 
 fn contigs_match(left: &str, right: &str) -> bool {
@@ -1114,6 +1134,19 @@ chr1\tensembl\tCDS\t1050\t1200\t.\t+\t0\tID=CDS:P1;Parent=transcript:TX3";
             std::collections::HashSet::from(["ENST00000001".to_string()])
         );
         assert_eq!(regions, vec![("chr1".to_string(), 1_000, 5_000)]);
+    }
+
+    #[test]
+    fn indexed_selection_merges_overlapping_transcript_spans() {
+        assert_eq!(
+            merge_regions(vec![
+                ("1".to_string(), 30, 40),
+                ("1".to_string(), 10, 20),
+                ("1".to_string(), 18, 35),
+                ("2".to_string(), 10, 20),
+            ]),
+            vec![("1".to_string(), 10, 40), ("2".to_string(), 10, 20)]
+        );
     }
 
     #[test]
