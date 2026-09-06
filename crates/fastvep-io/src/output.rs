@@ -1890,6 +1890,12 @@ pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
                 if let Some(ref h) = aa.hgvsp {
                     tc.insert("hgvsp".into(), serde_json::Value::String(h.clone()));
                 }
+                if let Some(offset) = aa.hgvs_offset {
+                    tc.insert(
+                        "hgvs_offset".into(),
+                        serde_json::Value::Number(offset.into()),
+                    );
+                }
                 if let Some(d) = aa.distance {
                     tc.insert("distance".into(), serde_json::Value::Number(d.into()));
                 }
@@ -2308,6 +2314,15 @@ mod tests {
 
         let projections = format_supplementary_vcf_info(&vf);
         assert!(projections.iter().any(|(id, _)| id == "FV_GNOMAD"));
+    }
+
+    #[test]
+    fn json_emits_hgvs_offset_with_its_transcript_consequence() {
+        let mut vf = projection_test_variant();
+        vf.transcript_variations[0].allele_annotations[0].hgvs_offset = Some(2);
+
+        let value = format_json(&vf, false);
+        assert_eq!(value["transcript_consequences"][0]["hgvs_offset"], 2);
     }
 
     #[test]
