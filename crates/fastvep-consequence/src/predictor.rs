@@ -725,10 +725,7 @@ impl ConsequencePredictor {
         // Ensembl's `_peptide` is the protein without its terminator; ours
         // carries it, because that is what the annotation's own translation
         // ends with.
-        let peptide_len = transcript
-            .peptide
-            .as_deref()
-            .map(|p| p.strip_suffix('*').unwrap_or(p).len());
+        let peptide = transcript.peptide.as_deref();
         let previous_cdna_base = transcript
             .cdna_coding_start
             .and_then(|start| start.checked_sub(2))
@@ -748,7 +745,7 @@ impl ConsequencePredictor {
         Some(self.terms_for_window(
             &window,
             overlaps_initiator,
-            peptide_len,
+            peptide,
             c1_deletion_retains_cds,
         ))
     }
@@ -770,7 +767,7 @@ impl ConsequencePredictor {
         &self,
         w: &CodonWindow,
         overlaps_initiator: bool,
-        peptide_len: Option<usize>,
+        peptide: Option<&str>,
         c1_deletion_retains_cds: bool,
     ) -> CodingChange {
         let (ref_pep, alt_pep) = (w.ref_aas.as_str(), w.alt_aas.as_str());
@@ -791,24 +788,43 @@ impl ConsequencePredictor {
         let ref_matches_alt_start_with_stop =
             ref_pep.len() == 1 && alt_pep.starts_with(ref_pep) && alt_pep.contains('*');
 
-        // The remaining clauses test the annotated terminator. One asks whether it sits at
-        // the same residue on both sides; the other whether the edited *protein*
-        // still matches the reference over the reference's own length and grows
-        // by fewer than three residues past it - only possible when nothing
-        // follows the window, so it needs the peptide's length. Deriving that
-        // from the CDS length instead assumes the CDS is exactly the peptide
-        // plus a terminator, and a `cds_end_NF` transcript is not.
-        let grows_past_the_last_residue = |pep_len: usize| {
-            // Nothing after the window means the edit cannot displace anything.
-            if w.tl_end < pep_len || w.tl_start == 0 {
+        // The remaining clauses test the annotated terminator. One asks whether
+        // it sits at the same residue on both sides. The other is VEP's exact
+        // `ref_eq_alt_sequence` test: edit the complete reference peptide, then
+        // ask whether its original-length prefix is unchanged and only one or
+        // two residues were appended. This can hold before the last residue in
+        // a repeat (for example inserting Glu into a poly-Glu tail), so position
+        // alone is insufficient. Compare iterators to avoid allocating a full
+        // mutant peptide for every coding indel.
+        let preserves_reference_with_short_tail = |annotated: &str| {
+            let reference = annotated.strip_suffix('*').unwrap_or(annotated).as_bytes();
+            let Some(start) = w.tl_start.checked_sub(1) else {
+                return false;
+            };
+            let replaced = if w.tl_end >= w.tl_start {
+                w.tl_end - w.tl_start + 1
+            } else {
+                0
+            };
+            let Some(suffix_start) = start.checked_add(replaced) else {
+                return false;
+            };
+            if start > reference.len() {
                 return false;
             }
-            let before = w.tl_start - 1;
-            let grown = before + alt_pep.len();
-            // The residues of the window that lie inside the peptide have to
-            // survive unchanged at the front of the replacement.
-            let kept = pep_len.saturating_sub(before).min(ref_pep.len());
-            grown > pep_len && grown - pep_len < 3 && alt_pep.starts_with(&ref_pep[..kept])
+            // Perl's `substr($sequence, $start, $length) = $replacement`
+            // removes only the available suffix when `$length` runs past the
+            // end. VEP relies on that for an incomplete terminal codon.
+            let suffix_start = suffix_start.min(reference.len());
+            let mutated_len = start + alt_pep.len() + reference.len() - suffix_start;
+            mutated_len > reference.len()
+                && mutated_len - reference.len() < 3
+                && reference[..start]
+                    .iter()
+                    .chain(alt_pep.as_bytes())
+                    .chain(&reference[suffix_start..])
+                    .take(reference.len())
+                    .eq(reference.iter())
         };
         // `stop_retained` also declines on an incomplete terminal codon.
         let stop_retained = !stop_lost
@@ -816,7 +832,7 @@ impl ConsequencePredictor {
             && !alt_pep.is_empty()
             && (ref_matches_alt_start_with_stop
                 || (ref_pep.contains('*') && ref_pep.find('*') == alt_pep.find('*'))
-                || peptide_len.is_some_and(grows_past_the_last_residue));
+                || peptide.is_some_and(preserves_reference_with_short_tail));
 
         // `frameshift` and `inframe_deletion` both decline when the codon the
         // change starts in is incomplete; `protein_altering_variant` does not.
@@ -2894,6 +2910,54 @@ mod tests {
             );
             assert_eq!(ac.impact, Impact::Moderate, "{strand:?}");
         }
+    }
+
+    #[test]
+    fn an_insertion_in_a_terminal_repeat_can_retain_the_reference_protein() {
+        let predictor = ConsequencePredictor::default();
+        let window = CodonWindow {
+            ref_aas: String::new(),
+            alt_aas: "E".into(),
+            ref_window: Vec::new(),
+            alt_window: b"GAG".to_vec(),
+            ref_codons: "-".into(),
+            alt_codons: "GAG".into(),
+            ref_len: 0,
+            alt_len: 3,
+            tl_start: 4,
+            tl_end: 3,
+            partial_codon: false,
+        };
+
+        let retained = predictor.terms_for_window(&window, false, Some("MEEEE*"), false);
+        assert_eq!(retained.consequence, Consequence::InframeInsertion);
+        assert_eq!(retained.additional, vec![Consequence::StopRetainedVariant]);
+
+        let displaced = predictor.terms_for_window(&window, false, Some("MEEDE*"), false);
+        assert_eq!(displaced.consequence, Consequence::InframeInsertion);
+        assert!(displaced.additional.is_empty());
+    }
+
+    #[test]
+    fn a_replacement_past_an_incomplete_peptide_uses_its_available_suffix() {
+        let predictor = ConsequencePredictor::default();
+        let window = CodonWindow {
+            ref_aas: "SX".into(),
+            alt_aas: "SX".into(),
+            ref_window: b"AGCN".to_vec(),
+            alt_window: b"AGCN".to_vec(),
+            ref_codons: "AGCN".into(),
+            alt_codons: "AGCN".into(),
+            ref_len: 2,
+            alt_len: 2,
+            tl_start: 3,
+            tl_end: 4,
+            partial_codon: false,
+        };
+
+        let retained = predictor.terms_for_window(&window, false, Some("MSS"), false);
+        assert_eq!(retained.consequence, Consequence::StopRetainedVariant);
+        assert!(retained.additional.is_empty());
     }
 
     /// Ensembl's insertion fixture at the third base of the initiator retains
