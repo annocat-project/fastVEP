@@ -16,7 +16,7 @@ use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeatur
 use fastvep_io::vcf::VcfParser;
 use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -265,6 +265,37 @@ fn wrap_maybe_gzip_reader(
     }
 }
 
+fn load_transcript_exclusions(path: &Path) -> Result<HashSet<String>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Reading transcript exclusion list: {}", path.display()))?;
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        anyhow::bail!("Transcript exclusion list must be non-empty and end with a line feed");
+    }
+    if bytes.contains(&b'\r') {
+        anyhow::bail!("Transcript exclusion list must use LF line endings");
+    }
+    let text = std::str::from_utf8(&bytes).context("Transcript exclusion list must be UTF-8")?;
+    let mut previous: Option<&str> = None;
+    let mut excluded = HashSet::new();
+    for (index, transcript_id) in text.lines().enumerate() {
+        if transcript_id.is_empty()
+            || transcript_id.chars().any(char::is_whitespace)
+            || !transcript_id.is_ascii()
+        {
+            anyhow::bail!(
+                "Invalid stable transcript ID on exclusion-list line {}",
+                index + 1
+            );
+        }
+        if previous.is_some_and(|value| value >= transcript_id) {
+            anyhow::bail!("Transcript exclusion list must be strictly sorted and unique");
+        }
+        excluded.insert(transcript_id.to_string());
+        previous = Some(transcript_id);
+    }
+    Ok(excluded)
+}
+
 pub struct AnnotateConfig {
     pub input: String,
     pub output: String,
@@ -317,6 +348,13 @@ pub struct AnnotateConfig {
 }
 
 pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
+    run_annotate_with_exclusions(config, None)
+}
+
+pub fn run_annotate_with_exclusions(
+    config: AnnotateConfig,
+    exclude_transcripts: Option<String>,
+) -> Result<()> {
     eprintln!("Annotating: {} -> {}", config.input, config.output);
     let mut performance = config
         .profile_output
@@ -334,6 +372,7 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
             (config.fasta.is_some(), "--fasta"),
             (config.cache_dir.is_some(), "--cache-dir"),
             (config.transcript_cache.is_some(), "--transcript-cache"),
+            (exclude_transcripts.is_some(), "--exclude-transcripts"),
             (config.acmg, "--acmg"),
             (config.hgvs, "--hgvs"),
             (config.pick, "--pick"),
@@ -349,6 +388,17 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
 
     // Parse `LABEL=path` syntax up front so a typo fails before we touch IO.
     let gff3_specs: Vec<Gff3Spec> = config.gff3.iter().map(|s| parse_gff3_arg(s)).collect();
+    let transcript_exclusions = if sa_only {
+        None
+    } else {
+        exclude_transcripts
+            .as_deref()
+            .map(|path| {
+                let path = PathBuf::from(path);
+                load_transcript_exclusions(&path).map(|ids| (path, ids))
+            })
+            .transpose()?
+    };
 
     // Load transcript models: try binary cache first, fall back to GFF3.
     // The auto-managed sidecar cache only kicks in for a single GFF3 — with
@@ -598,6 +648,19 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                 }
             }
         }
+    }
+
+    if let Some((path, excluded)) = transcript_exclusions {
+        let started = Instant::now();
+        let before = transcripts.len();
+        transcripts.retain(|transcript| !excluded.contains(transcript.stable_id.as_ref()));
+        eprintln!(
+            "Excluded {} of {} loaded transcripts using {} in {:.3} ms; the cache file was not modified",
+            before - transcripts.len(),
+            before,
+            path.display(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     let transcript_provider = IndexedTranscriptProvider::new(transcripts);
@@ -6065,5 +6128,61 @@ mod hgvsp_inframe_tests {
         assert!(output.contains("inframe_insertion"));
         assert!(!output.contains("p.Arg3="));
         assert!(output.contains("p.Arg3dup"));
+    }
+
+    #[test]
+    fn transcript_exclusion_is_validated_and_does_not_modify_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fasta = tmp.path().join("test.fa");
+        let input = tmp.path().join("input.vcf");
+        let output = tmp.path().join("output.vcf");
+        let cache = tmp.path().join("transcripts.cache");
+        let exclusions = tmp.path().join("exclude.txt");
+        fs::write(&fasta, FASTA).unwrap();
+        fs::write(&input, VCF).unwrap();
+        fs::write(&exclusions, b"ENST_INS1\n").unwrap();
+        let transcripts = parse_gff3_with_source(GFF3.as_bytes(), "Ensembl").unwrap();
+        fastvep_cache::transcript_cache::save_cache(&transcripts, &cache).unwrap();
+        let original_cache = fs::read(&cache).unwrap();
+
+        run_annotate_with_exclusions(
+            AnnotateConfig {
+                input: input.to_string_lossy().into(),
+                output: output.to_string_lossy().into(),
+                gff3: Vec::new(),
+                fasta: Some(fasta.to_string_lossy().into()),
+                output_format: "vcf".into(),
+                buffer_size: 4096,
+                pick: false,
+                hgvs: true,
+                distance: 5000,
+                cache_dir: None,
+                transcript_cache: Some(cache.to_string_lossy().into()),
+                sa_dir: Vec::new(),
+                sa_only: false,
+                acmg: false,
+                acmg_config: None,
+                proband: None,
+                mother: None,
+                father: None,
+                gene_list: None,
+                explicit_alleles: false,
+                qc_rules: None,
+                structured_output: None,
+                omit_supplementary_vcf: false,
+                show_progress: false,
+                profile_output: None,
+            },
+            Some(exclusions.to_string_lossy().into()),
+        )
+        .unwrap();
+
+        let annotated = fs::read_to_string(output).unwrap();
+        assert!(annotated.contains("intergenic_variant"));
+        assert!(!annotated.contains("ENST_INS1"));
+        assert_eq!(fs::read(cache).unwrap(), original_cache);
+
+        fs::write(&exclusions, b"ENST_TWO\r\nENST_ONE\r\n").unwrap();
+        assert!(load_transcript_exclusions(&exclusions).is_err());
     }
 }

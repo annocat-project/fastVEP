@@ -80,6 +80,11 @@ enum Commands {
         #[arg(long)]
         transcript_cache: Option<String>,
 
+        /// Sorted stable transcript IDs to exclude after loading and before indexing.
+        /// The cache file is never modified.
+        #[arg(long)]
+        exclude_transcripts: Option<String>,
+
         /// Directory containing supplementary annotation files (.osa, .osi, .oga).
         /// Repeat the option to load more than one directory.
         #[arg(long)]
@@ -338,6 +343,7 @@ fn main() -> Result<()> {
             distance,
             cache_dir,
             transcript_cache,
+            exclude_transcripts,
             sa_dir,
             sa_only,
             acmg,
@@ -353,33 +359,36 @@ fn main() -> Result<()> {
             no_progress,
             profile_output,
         } => {
-            pipeline::run_annotate(pipeline::AnnotateConfig {
-                input,
-                output,
-                gff3,
-                fasta,
-                output_format,
-                buffer_size,
-                pick,
-                hgvs,
-                distance,
-                cache_dir,
-                transcript_cache,
-                sa_dir,
-                sa_only,
-                acmg,
-                acmg_config,
-                proband,
-                mother,
-                father,
-                gene_list,
-                explicit_alleles,
-                qc_rules,
-                structured_output,
-                omit_supplementary_vcf,
-                show_progress: !no_progress,
-                profile_output,
-            })?;
+            pipeline::run_annotate_with_exclusions(
+                pipeline::AnnotateConfig {
+                    input,
+                    output,
+                    gff3,
+                    fasta,
+                    output_format,
+                    buffer_size,
+                    pick,
+                    hgvs,
+                    distance,
+                    cache_dir,
+                    transcript_cache,
+                    sa_dir,
+                    sa_only,
+                    acmg,
+                    acmg_config,
+                    proband,
+                    mother,
+                    father,
+                    gene_list,
+                    explicit_alleles,
+                    qc_rules,
+                    structured_output,
+                    omit_supplementary_vcf,
+                    show_progress: !no_progress,
+                    profile_output,
+                },
+                exclude_transcripts,
+            )?;
         }
         Commands::Cache {
             gff3,
