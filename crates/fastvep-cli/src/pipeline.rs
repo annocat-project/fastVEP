@@ -12,7 +12,7 @@ use fastvep_cache::providers::{
 use fastvep_consequence::ConsequencePredictor;
 use fastvep_hgvs;
 use fastvep_io::output;
-use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
+use fastvep_io::variant::{AlleleAnnotation, PositionRange, TranscriptVariation, VariationFeature};
 use fastvep_io::vcf::VcfParser;
 use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
@@ -1149,7 +1149,11 @@ pub fn run_annotate_with_exclusions(
                                                 ac.cds_start,
                                                 ac.cds_end,
                                             ),
-                                            ac.protein_range(),
+                                            ac.protein_range()
+                                                .map(|(start, end)| {
+                                                    PositionRange::complete(start, end)
+                                                })
+                                                .unwrap_or_default(),
                                         )
                                     });
                                 let mut ann = AlleleAnnotation {
@@ -1495,7 +1499,7 @@ pub fn run_annotate_with_exclusions(
                                 tv.gene_symbol.as_deref(),
                                 tv.canonical,
                                 aa.amino_acids.as_ref(),
-                                aa.protein_position.map(|(s, _)| s),
+                                aa.protein_position.first_known(),
                                 aa.hgvsc.as_deref(),
                                 aa.exon,
                                 &aa.supplementary,
@@ -1971,7 +1975,7 @@ fn enrich_compound_het_batch(
                 tv.gene_symbol.as_deref(),
                 tv.canonical,
                 aa.amino_acids.as_ref(),
-                aa.protein_position.map(|(s, _)| s),
+                aa.protein_position.first_known(),
                 aa.hgvsc.as_deref(),
                 aa.exon,
                 &aa.supplementary,
@@ -5382,9 +5386,9 @@ mod pick_tests {
                 allele: Allele::from_str("A"),
                 consequences,
                 impact: Impact::Modifier,
-                cdna_position: None,
-                cds_position: None,
-                protein_position: None,
+                cdna_position: PositionRange::default(),
+                cds_position: PositionRange::default(),
+                protein_position: PositionRange::default(),
                 amino_acids: None,
                 codons: None,
                 exon: None,

@@ -13,7 +13,7 @@
 
 use fastvep_core::{Allele, Consequence, Impact, Strand, VariantType};
 use fastvep_io::output::format_supplementary_vcf_info;
-use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
+use fastvep_io::variant::{AlleleAnnotation, PositionRange, TranscriptVariation, VariationFeature};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -51,9 +51,9 @@ fn annotation(allele: &str) -> AlleleAnnotation {
         allele: Allele::Sequence(allele.as_bytes().to_vec()),
         consequences: vec![Consequence::MissenseVariant],
         impact: Impact::Moderate,
-        cdna_position: Some((100, 100)),
-        cds_position: Some((90, 90)),
-        protein_position: Some((30, 30)),
+        cdna_position: PositionRange::complete(100, 100),
+        cds_position: PositionRange::complete(90, 90),
+        protein_position: PositionRange::complete(30, 30),
         amino_acids: None,
         codons: None,
         exon: Some((2, 6)),

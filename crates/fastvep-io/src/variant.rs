@@ -82,9 +82,9 @@ pub struct AlleleAnnotation {
     pub allele: Allele,
     pub consequences: Vec<Consequence>,
     pub impact: Impact,
-    pub cdna_position: Option<(u64, u64)>,
-    pub cds_position: Option<(u64, u64)>,
-    pub protein_position: Option<(u64, u64)>,
+    pub cdna_position: PositionRange,
+    pub cds_position: PositionRange,
+    pub protein_position: PositionRange,
     pub amino_acids: Option<(String, String)>,
     pub codons: Option<(String, String)>,
     pub exon: Option<(u32, u32)>,
@@ -102,6 +102,71 @@ pub struct AlleleAnnotation {
     pub supplementary: Vec<(String, String)>,
     /// ACMG-AMP classification result (serialized as serde_json::Value).
     pub acmg_classification: Option<serde_json::Value>,
+}
+
+/// A VEP position range whose first or last endpoint may be unknown.
+///
+/// VEP writes these as `?-N` or `N-?`. Position zero is not valid in these
+/// 1-based fields, so zero compactly represents an unknown endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PositionRange {
+    start: u64,
+    end: u64,
+}
+
+impl PositionRange {
+    pub const fn new(start: Option<u64>, end: Option<u64>) -> Self {
+        Self {
+            start: Self::encode(start),
+            end: Self::encode(end),
+        }
+    }
+
+    pub const fn complete(start: u64, end: u64) -> Self {
+        Self::new(Some(start), Some(end))
+    }
+
+    const fn encode(position: Option<u64>) -> u64 {
+        match position {
+            Some(0) => panic!("VEP positions are 1-based"),
+            Some(position) => position,
+            None => 0,
+        }
+    }
+
+    pub const fn start(self) -> Option<u64> {
+        if self.start == 0 {
+            None
+        } else {
+            Some(self.start)
+        }
+    }
+
+    pub const fn end(self) -> Option<u64> {
+        if self.end == 0 {
+            None
+        } else {
+            Some(self.end)
+        }
+    }
+
+    pub const fn first_known(self) -> Option<u64> {
+        match self.start() {
+            Some(start) => Some(start),
+            None => self.end(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod position_range_tests {
+    use super::PositionRange;
+
+    #[test]
+    fn position_range_is_compact() {
+        assert_eq!(std::mem::size_of::<PositionRange>(), 16);
+        assert!(std::mem::size_of::<PositionRange>() <= std::mem::size_of::<Option<(u64, u64)>>());
+    }
 }
 
 /// A known/existing variant from the variation cache.

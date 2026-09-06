@@ -25,7 +25,7 @@ use fastvep_consequence::{AlleleConsequenceResult, ConsequencePredictor};
 use fastvep_core::{Allele, Consequence};
 use fastvep_genome::Transcript;
 use fastvep_io::output;
-use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
+use fastvep_io::variant::{AlleleAnnotation, PositionRange, TranscriptVariation, VariationFeature};
 use fastvep_io::vcf::VcfParser;
 use rayon::prelude::*;
 use std::fs::File;
@@ -351,7 +351,9 @@ impl AnnotationContext {
                                     (
                                         zip_positions(ac.cdna_start, ac.cdna_end),
                                         zip_positions(ac.cds_start, ac.cds_end),
-                                        ac.protein_range(),
+                                        ac.protein_range()
+                                            .map(|(start, end)| PositionRange::complete(start, end))
+                                            .unwrap_or_default(),
                                     )
                                 });
                             let mut ann = AlleleAnnotation {
@@ -589,7 +591,7 @@ impl AnnotationContext {
                             tv.gene_symbol.as_deref(),
                             tv.canonical,
                             aa.amino_acids.as_ref(),
-                            aa.protein_position.map(|(s, _)| s),
+                            aa.protein_position.first_known(),
                             aa.hgvsc.as_deref(),
                             aa.exon,
                             &aa.supplementary,
@@ -637,9 +639,9 @@ pub fn annotate_sa_only_scaffold(vf: &mut VariationFeature) {
                 allele: alt.clone(),
                 consequences: vec![],
                 impact: fastvep_core::Impact::Modifier,
-                cdna_position: None,
-                cds_position: None,
-                protein_position: None,
+                cdna_position: PositionRange::default(),
+                cds_position: PositionRange::default(),
+                protein_position: PositionRange::default(),
                 amino_acids: None,
                 codons: None,
                 exon: None,
@@ -683,9 +685,9 @@ pub fn annotate_intergenic(vf: &mut VariationFeature) {
                 allele: alt.clone(),
                 consequences: vec![Consequence::IntergenicVariant],
                 impact: fastvep_core::Impact::Modifier,
-                cdna_position: None,
-                cds_position: None,
-                protein_position: None,
+                cdna_position: PositionRange::default(),
+                cds_position: PositionRange::default(),
+                protein_position: PositionRange::default(),
                 amino_acids: None,
                 codons: None,
                 exon: None,
@@ -719,12 +721,10 @@ pub fn annotate_intergenic(vf: &mut VariationFeature) {
     vf.most_severe_consequence = Some(Consequence::IntergenicVariant);
 }
 
-pub fn zip_positions(start: Option<u64>, end: Option<u64>) -> Option<(u64, u64)> {
+pub fn zip_positions(start: Option<u64>, end: Option<u64>) -> PositionRange {
     match (start, end) {
-        (Some(s), Some(e)) => Some((s.min(e), s.max(e))),
-        (Some(s), None) => Some((s, s)),
-        (None, Some(e)) => Some((e, e)),
-        _ => None,
+        (Some(s), Some(e)) => PositionRange::complete(s.min(e), s.max(e)),
+        pair => PositionRange::new(pair.0, pair.1),
     }
 }
 
@@ -733,7 +733,7 @@ pub fn zip_positions(start: Option<u64>, end: Option<u64>) -> Option<(u64, u64)>
 pub fn vep_position_ranges(
     transcript: &Transcript,
     allele: &AlleleConsequenceResult,
-) -> (Option<(u64, u64)>, Option<(u64, u64)>, Option<(u64, u64)>) {
+) -> (PositionRange, PositionRange, PositionRange) {
     let start = allele.normalized_position.start;
     let end = allele.normalized_position.end;
     let insertion = end.checked_add(1) == Some(start);
@@ -766,24 +766,20 @@ pub fn vep_position_ranges(
         cdna.0.and_then(|value| transcript.cdna_to_cds(value)),
         cdna.1.and_then(|value| transcript.cdna_to_cds(value)),
     );
-    let vep_range = |(first, last): (Option<u64>, Option<u64>)| {
-        first.map(|first| {
-            let last = last.unwrap_or(first);
-            (first.min(last), first.max(last))
-        })
+    let vep_range = |(first, last): (Option<u64>, Option<u64>)| match (first, last) {
+        (Some(first), Some(last)) => PositionRange::complete(first.min(last), first.max(last)),
+        pair => PositionRange::new(pair.0, pair.1),
     };
 
     let cds_range = if insertion_between_transcript_bases && (cds.0.is_none() || cds.1.is_none()) {
-        None
+        PositionRange::default()
     } else {
         vep_range(cds)
     };
-    let protein_range = cds_range.map(|(start, end)| {
-        (
-            Transcript::cds_to_protein(start),
-            Transcript::cds_to_protein(end),
-        )
-    });
+    let protein_range = PositionRange::new(
+        cds_range.start().map(Transcript::cds_to_protein),
+        cds_range.end().map(Transcript::cds_to_protein),
+    );
 
     (vep_range(cdna), cds_range, protein_range)
 }
@@ -1656,7 +1652,7 @@ fn enrich_compound_het(
                 tv.gene_symbol.as_deref(),
                 tv.canonical,
                 aa.amino_acids.as_ref(),
-                aa.protein_position.map(|(s, _)| s),
+                aa.protein_position.first_known(),
                 aa.hgvsc.as_deref(),
                 aa.exon,
                 &aa.supplementary,
@@ -1851,6 +1847,22 @@ mod tests {
     /// and produces well-formed output.
     fn empty_context() -> AnnotationContext {
         AnnotationContext::new(None, None, None, 0).expect("empty context should build")
+    }
+
+    #[test]
+    fn position_ranges_keep_unknown_endpoints() {
+        assert_eq!(
+            zip_positions(Some(10), None),
+            PositionRange::new(Some(10), None)
+        );
+        assert_eq!(
+            zip_positions(None, Some(20)),
+            PositionRange::new(None, Some(20))
+        );
+        assert_eq!(
+            zip_positions(Some(20), Some(10)),
+            PositionRange::complete(10, 20)
+        );
     }
 
     #[test]

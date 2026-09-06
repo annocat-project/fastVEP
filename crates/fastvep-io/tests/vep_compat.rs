@@ -5,7 +5,7 @@
 /// ensembl-vep's Parser_VCF.t test suite.
 use fastvep_core::{Allele, Impact, Strand, VariantType};
 use fastvep_io::output;
-use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
+use fastvep_io::variant::{AlleleAnnotation, PositionRange, TranscriptVariation, VariationFeature};
 use fastvep_io::vcf::{parse_vcf_line, VcfParser};
 
 // =============================================================================
@@ -490,9 +490,9 @@ fn mock_vf_missense() -> VariationFeature {
                 allele: Allele::from_str("C"),
                 consequences: vec![Consequence::MissenseVariant],
                 impact: Impact::Moderate,
-                cdna_position: Some((64, 64)),
-                cds_position: Some((4, 4)),
-                protein_position: Some((2, 2)),
+                cdna_position: PositionRange::complete(64, 64),
+                cds_position: PositionRange::complete(4, 4),
+                protein_position: PositionRange::complete(2, 2),
                 amino_acids: Some(("K".into(), "Q".into())),
                 codons: Some(("Aag".into(), "Cag".into())),
                 exon: Some((2, 3)),
@@ -593,9 +593,9 @@ fn test_csq_frameshift_codon_format() {
                 allele: Allele::Deletion,
                 consequences: vec![Consequence::FrameshiftVariant],
                 impact: Impact::High,
-                cdna_position: Some((480, 480)),
-                cds_position: Some((5, 5)),
-                protein_position: Some((2, 2)),
+                cdna_position: PositionRange::complete(480, 480),
+                cds_position: PositionRange::complete(5, 5),
+                protein_position: PositionRange::complete(2, 2),
                 amino_acids: Some(("E".into(), "X".into())),
                 codons: Some(("gAg".into(), "gg".into())),
                 exon: Some((3, 28)),
@@ -816,9 +816,9 @@ fn test_csq_frameshift_full_42_field_match() {
                 allele: Allele::Deletion,
                 consequences: vec![Consequence::FrameshiftVariant],
                 impact: Impact::High,
-                cdna_position: Some((258, 258)),
-                cds_position: Some((5, 5)),
-                protein_position: Some((2, 2)),
+                cdna_position: PositionRange::complete(258, 258),
+                cds_position: PositionRange::complete(5, 5),
+                protein_position: PositionRange::complete(2, 2),
                 amino_acids: Some(("E".into(), "X".into())),
                 codons: Some(("gAg".into(), "gg".into())),
                 exon: Some((3, 5)),
@@ -959,9 +959,9 @@ fn test_csq_downstream_variant_match() {
                 allele: Allele::from_str("C"),
                 consequences: vec![Consequence::DownstreamGeneVariant],
                 impact: Impact::Modifier,
-                cdna_position: None,
-                cds_position: None,
-                protein_position: None,
+                cdna_position: PositionRange::default(),
+                cds_position: PositionRange::default(),
+                protein_position: PositionRange::default(),
                 amino_acids: None,
                 codons: None,
                 exon: None,
@@ -1049,9 +1049,9 @@ fn test_csq_intron_variant_match() {
                 allele: Allele::from_str("T"),
                 consequences: vec![Consequence::IntronVariant],
                 impact: Impact::Modifier,
-                cdna_position: None,
-                cds_position: None,
-                protein_position: None,
+                cdna_position: PositionRange::default(),
+                cds_position: PositionRange::default(),
+                protein_position: PositionRange::default(),
                 amino_acids: None,
                 codons: None,
                 exon: None,

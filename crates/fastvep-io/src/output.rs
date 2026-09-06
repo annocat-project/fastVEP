@@ -1,4 +1,4 @@
-use crate::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
+use crate::variant::{AlleleAnnotation, PositionRange, TranscriptVariation, VariationFeature};
 use fastvep_core::{Allele, Consequence};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -401,23 +401,31 @@ fn escape_csq_value(value: &str) -> String {
         .replace(' ', "_")
 }
 
-fn write_position_range(pos: Option<(u64, u64)>, buf: &mut String) {
-    match pos {
-        Some((start, end)) if start == end => {
+fn write_position_range(pos: PositionRange, buf: &mut String) {
+    match (pos.start(), pos.end()) {
+        (Some(start), Some(end)) if start == end => {
             let _ = write!(buf, "{}", start);
         }
-        Some((start, end)) => {
+        (Some(start), Some(end)) => {
             let _ = write!(buf, "{}-{}", start, end);
         }
-        None => {}
+        (Some(start), None) => {
+            let _ = write!(buf, "{}-?", start);
+        }
+        (None, Some(end)) => {
+            let _ = write!(buf, "?-{}", end);
+        }
+        (None, None) => {}
     }
 }
 
-fn format_position_range(pos: Option<(u64, u64)>) -> String {
-    match pos {
-        Some((start, end)) if start == end => start.to_string(),
-        Some((start, end)) => format!("{}-{}", start, end),
-        None => String::new(),
+fn format_position_range(pos: PositionRange) -> String {
+    match (pos.start(), pos.end()) {
+        (Some(start), Some(end)) if start == end => start.to_string(),
+        (Some(start), Some(end)) => format!("{}-{}", start, end),
+        (Some(start), None) => format!("{}-?", start),
+        (None, Some(end)) => format!("?-{}", end),
+        (None, None) => String::new(),
     }
 }
 
@@ -1845,16 +1853,22 @@ pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
                 if let Some(ref pid) = tv.protein_id {
                     tc.insert("protein_id".into(), serde_json::Value::String(pid.clone()));
                 }
-                if let Some((s, e)) = aa.cdna_position {
+                if let Some(s) = aa.cdna_position.start() {
                     tc.insert("cdna_start".into(), serde_json::Value::Number(s.into()));
+                }
+                if let Some(e) = aa.cdna_position.end() {
                     tc.insert("cdna_end".into(), serde_json::Value::Number(e.into()));
                 }
-                if let Some((s, e)) = aa.cds_position {
+                if let Some(s) = aa.cds_position.start() {
                     tc.insert("cds_start".into(), serde_json::Value::Number(s.into()));
+                }
+                if let Some(e) = aa.cds_position.end() {
                     tc.insert("cds_end".into(), serde_json::Value::Number(e.into()));
                 }
-                if let Some((s, e)) = aa.protein_position {
+                if let Some(s) = aa.protein_position.start() {
                     tc.insert("protein_start".into(), serde_json::Value::Number(s.into()));
+                }
+                if let Some(e) = aa.protein_position.end() {
                     tc.insert("protein_end".into(), serde_json::Value::Number(e.into()));
                 }
                 if let Some(ref aas) = aa.amino_acids {
@@ -2190,9 +2204,23 @@ mod tests {
 
     #[test]
     fn test_format_position_range() {
-        assert_eq!(format_position_range(Some((100, 100))), "100");
-        assert_eq!(format_position_range(Some((100, 200))), "100-200");
-        assert_eq!(format_position_range(None), "");
+        assert_eq!(
+            format_position_range(PositionRange::complete(100, 100)),
+            "100"
+        );
+        assert_eq!(
+            format_position_range(PositionRange::complete(100, 200)),
+            "100-200"
+        );
+        assert_eq!(
+            format_position_range(PositionRange::new(Some(100), None)),
+            "100-?"
+        );
+        assert_eq!(
+            format_position_range(PositionRange::new(None, Some(200))),
+            "?-200"
+        );
+        assert_eq!(format_position_range(PositionRange::default()), "");
     }
 
     fn projection_test_variant() -> VariationFeature {
@@ -2229,9 +2257,9 @@ mod tests {
                     allele: Allele::from_str("G"),
                     consequences: vec![Consequence::MissenseVariant],
                     impact: Impact::Moderate,
-                    cdna_position: None,
-                    cds_position: None,
-                    protein_position: None,
+                    cdna_position: PositionRange::default(),
+                    cds_position: PositionRange::default(),
+                    protein_position: PositionRange::default(),
                     amino_acids: None,
                     codons: None,
                     exon: None,
@@ -2290,6 +2318,27 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn partial_positions_match_vcf_and_structured_json() {
+        let mut vf = projection_test_variant();
+        let annotation = &mut vf.transcript_variations[0].allele_annotations[0];
+        annotation.cdna_position = PositionRange::new(Some(100), None);
+        annotation.cds_position = PositionRange::new(None, Some(90));
+        annotation.protein_position = PositionRange::complete(30, 30);
+
+        assert_eq!(
+            format_csq(&vf, &["cDNA_position", "CDS_position", "Protein_position"]),
+            "100-?|?-90|30"
+        );
+        let consequence = &format_json(&vf, false)["transcript_consequences"][0];
+        assert_eq!(consequence["cdna_start"], 100);
+        assert!(consequence.get("cdna_end").is_none());
+        assert!(consequence.get("cds_start").is_none());
+        assert_eq!(consequence["cds_end"], 90);
+        assert_eq!(consequence["protein_start"], 30);
+        assert_eq!(consequence["protein_end"], 30);
     }
 
     #[test]
