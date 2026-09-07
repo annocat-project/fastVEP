@@ -1653,6 +1653,9 @@ fn normalized_csq_allele(
     else {
         return alt_allele.to_string();
     };
+    if reference.len() == alternate.len() {
+        return alt_allele.to_string();
+    }
 
     let mut ref_end = reference.len();
     let mut alt_end = alternate.len();
@@ -2194,6 +2197,14 @@ mod tests {
         assert_eq!(normalized_csq_allele(&reference, &alternate, 1), "-");
         assert_eq!(normalized_csq_allele(&reference, &alternate, 2), "C");
         assert_eq!(alternate.to_string(), "C");
+    }
+
+    #[test]
+    fn csq_allele_preserves_equal_length_padded_substitution() {
+        assert_eq!(
+            normalized_csq_allele(&Allele::from_str("AC"), &Allele::from_str("AG"), 1),
+            "AG"
+        );
     }
 
     #[test]

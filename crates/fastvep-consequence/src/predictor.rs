@@ -66,21 +66,6 @@ pub struct AlleleConsequenceResult {
     pub distance: Option<i64>,
 }
 
-/// Resolve a codon-table residue against the transcript's own peptide.
-///
-/// The codon table cannot see readthrough. A selenoprotein's in-frame UGA
-/// translates to `*` here, while `build_sequences` has already resolved it to
-/// selenocysteine from the annotated CDS extent, so a substitution at that codon
-/// reads as `stop_lost` and a synonymous change reads as `stop_retained`.
-///
-/// The peptide is consulted only when the table says terminator and the peptide
-/// disagrees, which is exactly the readthrough case; every other position still
-/// decides by the codon table alone.
-///
-/// This describes the *reference* protein, so it must never be applied to an alt
-/// residue that the variant changed - doing so would rewrite a genuine
-/// `stop_gained` into the reference residue. Callers pass alt residues through
-/// only for codons the variant leaves untouched.
 /// Whether the transcript's annotation claims a complete initiator codon.
 ///
 /// A `cds_start_NF` transcript does not, and neither does one whose CDS is
@@ -94,16 +79,27 @@ fn start_codon_known(transcript: &Transcript) -> bool {
     transcript.codon_table_start_phase == 0 && !transcript.flags.iter().any(|f| f == "cds_start_NF")
 }
 
-fn resolve_readthrough_residue(transcript: &Transcript, codon_index: usize, translated: u8) -> u8 {
-    if translated != b'*' {
-        return translated;
-    }
-    transcript
+/// Resolve a reference codon against the transcript's annotated peptide.
+///
+/// The codon table cannot see an `initial_met` edit or selenocysteine
+/// readthrough. The cached peptide can. Keep the correction deliberately
+/// limited to those two source annotations; other peptide/translation
+/// disagreements require their own causal replay before they may affect output.
+///
+/// This describes the *reference* protein, so it must never be applied to an alt
+/// residue that the variant changed - doing so would rewrite a genuine
+/// `stop_gained` into the reference residue. Callers pass alt residues through
+/// only for codons the variant leaves untouched.
+fn resolve_annotated_residue(transcript: &Transcript, codon_index: usize, translated: u8) -> u8 {
+    let annotated = transcript
         .peptide
         .as_deref()
-        .and_then(|p| p.as_bytes().get(codon_index).copied())
-        .filter(|&b| b != b'*')
-        .unwrap_or(translated)
+        .and_then(|peptide| peptide.as_bytes().get(codon_index).copied());
+    match annotated {
+        Some(b'M') if codon_index == 0 => b'M',
+        Some(residue) if translated == b'*' && residue != b'*' => residue,
+        _ => translated,
+    }
 }
 
 /// Drop the common prefix and the common suffix of two sequences, Ensembl's
@@ -1125,7 +1121,7 @@ impl ConsequencePredictor {
                         table.translate(codon)
                     };
                     if reference_codon {
-                        resolve_readthrough_residue(transcript, index, translated) as char
+                        resolve_annotated_residue(transcript, index, translated) as char
                     } else {
                         translated as char
                     }
@@ -1981,6 +1977,60 @@ mod tests {
             ac.consequences
         );
         assert_eq!(ac.impact, Impact::Moderate);
+    }
+
+    #[test]
+    fn source_edited_reference_residue_does_not_rewrite_changed_alt_residue() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_coding_transcript();
+        tr.translateable_seq
+            .as_mut()
+            .unwrap()
+            .replace_range(..3, "CTG");
+        tr.peptide = Some("M".to_string());
+
+        let result = predictor.predict(
+            &GenomicPosition::new("chr1", 1051, 1051, Strand::Forward),
+            &Allele::from_str("T"),
+            &[Allele::from_str("A")],
+            &[&tr],
+            None,
+        );
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+
+        assert!(ac.consequences.contains(&Consequence::StartLost));
+        assert_eq!(ac.amino_acids, Some(("M".into(), "Q".into())));
+        assert_eq!(ac.codons, Some(("cTg".into(), "cAg".into())));
+    }
+
+    #[test]
+    fn annotated_residue_resolution_is_limited_to_known_source_edits() {
+        let mut tr = make_coding_transcript();
+        tr.peptide = Some("MWG".to_string());
+
+        assert_eq!(resolve_annotated_residue(&tr, 0, b'L'), b'M');
+        assert_eq!(resolve_annotated_residue(&tr, 1, b'*'), b'W');
+        assert_eq!(resolve_annotated_residue(&tr, 2, b'A'), b'A');
+    }
+
+    #[test]
+    fn cds_start_nf_suppresses_a_start_lost_claim() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_coding_transcript();
+        tr.flags.push("cds_start_NF".into());
+
+        let result = predictor.predict(
+            &GenomicPosition::new("chr1", 1050, 1050, Strand::Forward),
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+
+        assert_eq!(ac.consequences, vec![Consequence::MissenseVariant]);
+        assert_eq!(ac.impact, Impact::Moderate);
+        assert_eq!(ac.amino_acids, Some(("M".into(), "V".into())));
     }
 
     #[test]
