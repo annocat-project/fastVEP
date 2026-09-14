@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "fastvep-web"
 version.workspace = true
 edition.workspace = true

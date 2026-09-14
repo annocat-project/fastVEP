@@ -66,6 +66,55 @@ pub fn sa_cache_budget_bytes() -> usize {
 /// Default zstd compression level (3 is a good speed/ratio tradeoff).
 pub const ZSTD_LEVEL: i32 = 3;
 
+/// Decode at most `cap` bytes; callers request their limit + 1 to detect overflow.
+/// Bulk decoding avoids streaming's history-buffer copies for ordinary chunks.
+/// Larger chunks retain the bounded streaming path, without reserving the full
+/// 256 MiB format limit for every active source.
+pub(crate) fn decompress_at_most(data: &[u8], cap: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut raw = match zstd::bulk::decompress(data, cap.min(2 * DEFAULT_BLOCK_SIZE)) {
+        Ok(raw) => raw,
+        Err(_) => {
+            let mut raw = Vec::new();
+            zstd::stream::Decoder::with_buffer(data)?
+                .take(cap as u64)
+                .read_to_end(&mut raw)?;
+            raw
+        }
+    };
+    raw.shrink_to_fit();
+    Ok(raw)
+}
+
+#[cfg(test)]
+mod decompression_tests {
+    use super::*;
+
+    #[test]
+    fn bulk_and_fallback_preserve_streaming_bytes_and_limits() {
+        use std::io::Read;
+        for size in [0, 123, 2 * DEFAULT_BLOCK_SIZE + 17] {
+            let expected = vec![b'x'; size];
+            // The existing writer omits frame content size; bulk writers include it.
+            for compressed in [zstd::encode_all(expected.as_slice(), 1).unwrap(),
+                zstd::bulk::compress(&expected, 1).unwrap()] {
+                for cap in [31, size + 1] {
+                    let mut old = Vec::new();
+                    zstd::stream::Decoder::new(compressed.as_slice()).unwrap()
+                        .take(cap as u64).read_to_end(&mut old).unwrap();
+                    assert_eq!(decompress_at_most(&compressed, cap).unwrap(), old);
+                }
+                let mut joined = compressed.clone();
+                joined.extend(zstd::encode_all(&b"tail"[..], 1).unwrap());
+                let mut expected_joined = expected.clone();
+                expected_joined.extend_from_slice(b"tail");
+                assert_eq!(decompress_at_most(&joined, size + 5).unwrap(), expected_joined);
+                assert!(decompress_at_most(&compressed[..compressed.len() - 1], size + 1).is_err());
+            }
+        }
+    }
+}
+
 /// Hard cap on a single bincode-serialized index payload (4 GiB). Used by
 /// `.osa.idx`, `.osi`, and `.oga` readers to refuse malformed/malicious files
 /// that claim absurd payload sizes, before allocating a buffer.

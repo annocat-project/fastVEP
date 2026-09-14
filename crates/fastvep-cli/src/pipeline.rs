@@ -363,7 +363,21 @@ pub fn run_annotate_with_exclusions(
 pub fn run_annotate_with_mature_mirna_ranges(
     config: AnnotateConfig,
     exclude_transcripts: Option<String>,
-    mut mature_mirna_ranges: HashMap<String, Vec<(u64, u64)>>,
+    mature_mirna_ranges: HashMap<String, Vec<(u64, u64)>>,
+) -> Result<()> {
+    run_annotate_sink_inner(config, exclude_transcripts, mature_mirna_ranges, None, 0, false)
+}
+
+pub fn run_annotate_with_output_sink(config: AnnotateConfig, exclude_transcripts: Option<String>, retain_vcf: bool, skip_records: u64,
+    sink: &mut dyn FnMut(Vec<fastvep_io::variant::VariationFeature>, Option<u64>) -> Result<()>) -> Result<()> {
+    run_annotate_sink_inner(config, exclude_transcripts, HashMap::new(), Some(sink), skip_records, retain_vcf)
+}
+
+fn run_annotate_sink_inner(config: AnnotateConfig, exclude_transcripts: Option<String>,
+    mut mature_mirna_ranges: HashMap<String, Vec<(u64,u64)>>,
+    mut sink: Option<&mut dyn FnMut(Vec<fastvep_io::variant::VariationFeature>, Option<u64>) -> Result<()>>,
+    skip_records: u64,
+    retain_vcf: bool,
 ) -> Result<()> {
     eprintln!("Annotating: {} -> {}", config.input, config.output);
     let mut performance = config
@@ -884,6 +898,7 @@ pub fn run_annotate_with_mature_mirna_ranges(
     // Open input VCF (supports plain text or gzipped VCF)
     let input_reader = open_vcf_input_reader(&config.input)?;
     let mut vcf_parser = VcfParser::new(input_reader)?;
+    for _ in 0..skip_records { vcf_parser.next_variant()?.ok_or_else(|| anyhow::anyhow!("resume prefix exceeds input"))?; }
 
     // Extract sample names from VCF #CHROM header
     let sample_names: Vec<String> = vcf_parser
@@ -894,8 +909,10 @@ pub fn run_annotate_with_mature_mirna_ranges(
         .unwrap_or_default();
 
     // Open output
-    let output_writer: Box<dyn io::Write> = if config.output == "-" {
+    let output_writer: Box<dyn io::Write> = if sink.is_some() && !retain_vcf { Box::new(io::sink()) } else if config.output == "-" {
         Box::new(io::stdout())
+    } else if sink.is_some() && retain_vcf && skip_records > 0 {
+        Box::new(std::fs::OpenOptions::new().append(true).open(&config.output)?)
     } else {
         Box::new(
             File::create(&config.output)
@@ -944,7 +961,8 @@ pub fn run_annotate_with_mature_mirna_ranges(
     // doesn't redo an O(specs × keys) membership scan for every variant.
     let supplementary_specs = output::LoadedSupplementarySpecs::new(&sa_json_keys, &gene_json_keys);
 
-    // Write headers based on output format
+    // A resumed retained VCF already has its original header.
+    if !(sink.is_some() && retain_vcf && skip_records > 0) {
     match config.output_format.as_str() {
         "vcf" => {
             // Pass through original VCF headers
@@ -999,6 +1017,7 @@ pub fn run_annotate_with_mature_mirna_ranges(
         _ => {}
     }
 
+    }
     let output_sink_baseline = writer.get_ref().blocked();
     let structured_sink_baseline = structured_writer
         .as_ref()
@@ -1594,7 +1613,19 @@ pub fn run_annotate_with_mature_mirna_ranges(
         }
 
         // Phase 3: Write output sequentially (preserves VCF order)
+        let output_records = batch.len();
+        if let Some(sink) = sink.as_mut() {
+            if retain_vcf {
+                for (vf, _) in &batch {
+                    write_vcf_line(&mut writer, vf, sa_only, &owned_vcf_info_ids, !config.omit_supplementary_vcf)?;
+                }
+            }
+            let records: Vec<_> = batch.drain(..).map(|(vf, _)| vf).collect();
+            let vcf_bytes = if retain_vcf { writer.flush()?; Some(std::fs::metadata(&config.output)?.len()) } else { None };
+            sink(records, vcf_bytes)?;
+        }
         for (vf, _) in &batch {
+            if sink.is_some() { continue; }
             if let Some(sidecar) = structured_writer.as_mut() {
                 let structured_started = phase_start(&performance);
                 let json = output::format_json(vf, sa_only);
@@ -1659,7 +1690,7 @@ pub fn run_annotate_with_mature_mirna_ranges(
             }
         }
 
-        meter.update_n(batch.len() as u64);
+        meter.update_n(output_records as u64);
     } // end batch loop
 
     // Close JSON array

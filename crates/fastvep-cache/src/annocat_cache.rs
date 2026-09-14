@@ -87,7 +87,13 @@ impl Write for DigestWriter {
 
 fn semantic_digest(payload: &PayloadV1) -> Result<String> {
     let mut hash = DigestWriter(Sha256::new());
-    bincode::serialize_into(&mut hash, payload)?;
+    if std::env::var_os("ANNOCAT_BENCH_CACHE_BUFFERED").is_some() {
+        let mut buffered = io::BufWriter::with_capacity(64 * 1024, &mut hash);
+        bincode::serialize_into(&mut buffered, payload)?;
+        buffered.flush()?;
+    } else {
+        bincode::serialize_into(&mut hash, payload)?;
+    }
     Ok(format!("{:x}", hash.0.finalize()))
 }
 
@@ -156,12 +162,15 @@ pub fn load(path: &Path) -> Result<LoadedCache> {
         "Cache payload checksum mismatch"
     );
     file.seek(SeekFrom::Start(start))?;
-    let mut decoder = zstd::Decoder::new(file)?;
+    let capacity = if std::env::var_os("ANNOCAT_BENCH_CACHE_BUFFERED").is_some() {64 * 1024} else {0};
+    let mut decoder = io::BufReader::with_capacity(capacity, zstd::Decoder::new(file)?);
+    let decode_started = std::time::Instant::now();
     use bincode::Options;
     let payload: PayloadV1 = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(8 * 1024 * 1024 * 1024)
         .deserialize_from(&mut decoder)?;
+    if std::env::var_os("ANNOCAT_BENCH_PROFILE").is_some() {eprintln!("cacheDecodeSeconds={}", decode_started.elapsed().as_secs_f64());}
     let mut trailing = [0];
     ensure!(
         decoder.read(&mut trailing)? == 0,
@@ -171,10 +180,12 @@ pub fn load(path: &Path) -> Result<LoadedCache> {
         payload.transcripts.len() as u64 == header.transcript_count,
         "Cache transcript count mismatch"
     );
+    let semantic_started = std::time::Instant::now();
     ensure!(
         semantic_digest(&payload)? == header.semantic_sha256,
         "Cache semantic digest mismatch"
     );
+    if std::env::var_os("ANNOCAT_BENCH_PROFILE").is_some() {eprintln!("cacheSemanticDigestSeconds={}", semantic_started.elapsed().as_secs_f64());}
     let mut transcripts: Vec<Transcript> = payload.transcripts.into_iter().map(Into::into).collect();
     ensure!(
         transcripts.iter().filter(|tr| tr.is_coding()).count() as u64

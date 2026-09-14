@@ -6,7 +6,6 @@
 
 use crate::common::ZSTD_LEVEL;
 use anyhow::Result;
-use std::io::Read;
 
 /// Hard cap on block decompressed size (256 MiB). Defends against zstd bombs
 /// in maliciously crafted .osa files. Real blocks are typically <= 8 MiB.
@@ -19,6 +18,47 @@ pub struct BlockEntry {
     pub ref_allele: String,
     pub alt_allele: String,
     pub json: String,
+}
+
+/// Offsets into one validated decoded buffer; the 256 MiB cap fits u32 offsets.
+/// No per-record string allocations.
+struct EntryOffsets {
+    position: u32,
+    reference: std::ops::Range<u32>,
+    alternate: std::ops::Range<u32>,
+    json: std::ops::Range<u32>,
+}
+
+pub(crate) struct DecodedBlock {
+    raw: Vec<u8>,
+    entries: Vec<EntryOffsets>,
+}
+
+pub(crate) struct BlockEntryRef<'a> {
+    pub position: u32,
+    pub ref_allele: &'a str,
+    pub alt_allele: &'a str,
+    pub json: &'a str,
+}
+
+impl DecodedBlock {
+    pub(crate) fn entry(&self, index: usize) -> BlockEntryRef<'_> {
+        let e = &self.entries[index];
+        // Every field was checked when the block was decoded.
+        let text = |range: &std::ops::Range<u32>| std::str::from_utf8(&self.raw[range.start as usize..range.end as usize]).unwrap();
+        BlockEntryRef { position: e.position, ref_allele: text(&e.reference),
+            alt_allele: text(&e.alternate), json: text(&e.json) }
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.raw.capacity() + self.entries.capacity() * std::mem::size_of::<EntryOffsets>()
+    }
+
+    pub(crate) fn at_position(&self, position: u32) -> impl Iterator<Item = BlockEntryRef<'_>> {
+        let start = self.entries.partition_point(|entry| entry.position < position);
+        (start..self.entries.len()).take_while(move |&i| self.entries[i].position == position)
+            .map(|i| self.entry(i))
+    }
 }
 
 /// An in-memory block that accumulates entries and compresses them.
@@ -105,88 +145,14 @@ impl SaBlock {
         Ok(compressed)
     }
 
-    /// Decompress and deserialize a block from compressed bytes.
+    /// Decode through the same validated block representation used by lookups.
     pub fn decompress(data: &[u8]) -> Result<Vec<BlockEntry>> {
-        // Streaming-decompress with a hard cap so a zstd bomb can never force
-        // an oversized allocation. `decode_all` would have to materialize the
-        // entire output before we could measure it.
-        let mut decoder = zstd::stream::Decoder::new(data)?;
-        let mut raw = Vec::new();
-        (&mut decoder)
-            .take(MAX_BLOCK_DECOMPRESSED as u64 + 1)
-            .read_to_end(&mut raw)?;
-        if raw.len() > MAX_BLOCK_DECOMPRESSED {
-            anyhow::bail!(
-                "Decompressed block exceeds limit ({} bytes)",
-                MAX_BLOCK_DECOMPRESSED
-            );
-        }
-        let mut cursor: usize = 0;
-
-        // Helper: ensure `n` more bytes are available starting at cursor.
-        let need = |cursor: usize, n: usize, raw: &[u8]| -> Result<()> {
-            let end = cursor
-                .checked_add(n)
-                .ok_or_else(|| anyhow::anyhow!("Block cursor overflow"))?;
-            if end > raw.len() {
-                anyhow::bail!("Unexpected end of block data");
-            }
-            Ok(())
-        };
-
-        need(cursor, 4, &raw)?;
-        let count = u32::from_le_bytes(raw[cursor..cursor + 4].try_into()?) as usize;
-        cursor += 4;
-
-        // Each entry requires at least 12 bytes after the count field:
-        // 4 position + 2 ref_len + 0 ref + 2 alt_len + 0 alt + 4 json_len + 0 json.
-        // Validate against the bytes remaining in the block, and do not use the
-        // untrusted count for large upfront allocation.
-        let remaining = raw.len() - cursor;
-        if count > remaining / 12 {
-            anyhow::bail!("Block claims {} entries, exceeds data size", count);
-        }
-
-        let mut entries = Vec::new();
-        for _ in 0..count {
-            // Position
-            need(cursor, 4, &raw)?;
-            let position = u32::from_le_bytes(raw[cursor..cursor + 4].try_into()?);
-            cursor += 4;
-
-            // Ref allele
-            need(cursor, 2, &raw)?;
-            let ref_len = u16::from_le_bytes(raw[cursor..cursor + 2].try_into()?) as usize;
-            cursor += 2;
-            need(cursor, ref_len, &raw)?;
-            let ref_allele = std::str::from_utf8(&raw[cursor..cursor + ref_len])?.to_string();
-            cursor += ref_len;
-
-            // Alt allele
-            need(cursor, 2, &raw)?;
-            let alt_len = u16::from_le_bytes(raw[cursor..cursor + 2].try_into()?) as usize;
-            cursor += 2;
-            need(cursor, alt_len, &raw)?;
-            let alt_allele = std::str::from_utf8(&raw[cursor..cursor + alt_len])?.to_string();
-            cursor += alt_len;
-
-            // JSON
-            need(cursor, 4, &raw)?;
-            let json_len = u32::from_le_bytes(raw[cursor..cursor + 4].try_into()?) as usize;
-            cursor += 4;
-            need(cursor, json_len, &raw)?;
-            let json = std::str::from_utf8(&raw[cursor..cursor + json_len])?.to_string();
-            cursor += json_len;
-
-            entries.push(BlockEntry {
-                position,
-                ref_allele,
-                alt_allele,
-                json,
-            });
-        }
-
-        Ok(entries)
+        let block = DecodedBlock::decompress(data)?;
+        Ok((0..block.entries.len()).map(|i| {
+            let entry = block.entry(i);
+            BlockEntry { position: entry.position, ref_allele: entry.ref_allele.to_owned(),
+                alt_allele: entry.alt_allele.to_owned(), json: entry.json.to_owned() }
+        }).collect())
     }
 
     /// Binary search for a variant in sorted decompressed entries.
@@ -234,6 +200,28 @@ impl SaBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_block_preserves_borrowed_fields_and_duplicate_order() {
+        let mut block = SaBlock::new(1024);
+        for (position, reference, alternate, json) in [
+            (10, "A", "G", "{\"gene\":\"α\"}"),
+            (10, "A", "GGGG", "{\"score\":2}"),
+            (11, "", "", "{}"),
+        ] {
+            assert!(block.add(BlockEntry { position, ref_allele: reference.into(),
+                alt_allele: alternate.into(), json: json.into() }));
+        }
+        let decoded = DecodedBlock::decompress(&block.compress().unwrap()).unwrap();
+        for (i, expected) in block.entries.iter().enumerate() {
+            let actual = decoded.entry(i);
+            assert_eq!((actual.position, actual.ref_allele, actual.alt_allele, actual.json),
+                (expected.position, expected.ref_allele.as_str(), expected.alt_allele.as_str(), expected.json.as_str()));
+        }
+        assert_eq!(decoded.at_position(10).map(|e| e.alt_allele).collect::<Vec<_>>(), ["G", "GGGG"]);
+        assert_eq!(decoded.at_position(11).count(), 1);
+        assert_eq!(decoded.at_position(12).count(), 0);
+    }
 
     #[test]
     fn test_block_round_trip() {
@@ -333,4 +321,83 @@ mod tests {
         assert!(block.is_empty());
         assert_eq!(block.len(), 0);
     }
+}
+
+impl DecodedBlock {
+    /// Decompress and deserialize a block from compressed bytes.
+    pub(crate) fn decompress(data: &[u8]) -> Result<Self> {
+        // Keep the same hard cap for both bulk decoding and its streaming fallback.
+        let raw = crate::common::decompress_at_most(data, MAX_BLOCK_DECOMPRESSED + 1)?;
+        if raw.len() > MAX_BLOCK_DECOMPRESSED {
+            anyhow::bail!(
+                "Decompressed block exceeds limit ({} bytes)",
+                MAX_BLOCK_DECOMPRESSED
+            );
+        }
+        let mut cursor: usize = 0;
+
+        // Helper: ensure `n` more bytes are available starting at cursor.
+        let need = |cursor: usize, n: usize, raw: &[u8]| -> Result<()> {
+            let end = cursor
+                .checked_add(n)
+                .ok_or_else(|| anyhow::anyhow!("Block cursor overflow"))?;
+            if end > raw.len() {
+                anyhow::bail!("Unexpected end of block data");
+            }
+            Ok(())
+        };
+
+        need(cursor, 4, &raw)?;
+        let count = u32::from_le_bytes(raw[cursor..cursor + 4].try_into()?) as usize;
+        cursor += 4;
+
+        // Each entry requires at least 12 bytes after the count field:
+        // 4 position + 2 ref_len + 0 ref + 2 alt_len + 0 alt + 4 json_len + 0 json.
+        // Validate against the bytes remaining in the block, and do not use the
+        // untrusted count for large upfront allocation.
+        let remaining = raw.len() - cursor;
+        if count > remaining / 12 {
+            anyhow::bail!("Block claims {} entries, exceeds data size", count);
+        }
+
+        let mut entries = Vec::new();
+        for _ in 0..count {
+            // Position
+            need(cursor, 4, &raw)?;
+            let position = u32::from_le_bytes(raw[cursor..cursor + 4].try_into()?);
+            cursor += 4;
+
+            // Ref allele
+            need(cursor, 2, &raw)?;
+            let ref_len = u16::from_le_bytes(raw[cursor..cursor + 2].try_into()?) as usize;
+            cursor += 2;
+            need(cursor, ref_len, &raw)?;
+            std::str::from_utf8(&raw[cursor..cursor + ref_len])?;
+            let ref_allele = cursor as u32..(cursor + ref_len) as u32;
+            cursor += ref_len;
+
+            // Alt allele
+            need(cursor, 2, &raw)?;
+            let alt_len = u16::from_le_bytes(raw[cursor..cursor + 2].try_into()?) as usize;
+            cursor += 2;
+            need(cursor, alt_len, &raw)?;
+            std::str::from_utf8(&raw[cursor..cursor + alt_len])?;
+            let alt_allele = cursor as u32..(cursor + alt_len) as u32;
+            cursor += alt_len;
+
+            // JSON
+            need(cursor, 4, &raw)?;
+            let json_len = u32::from_le_bytes(raw[cursor..cursor + 4].try_into()?) as usize;
+            cursor += 4;
+            need(cursor, json_len, &raw)?;
+            std::str::from_utf8(&raw[cursor..cursor + json_len])?;
+            let json = cursor as u32..(cursor + json_len) as u32;
+            cursor += json_len;
+
+            entries.push(EntryOffsets { position, reference: ref_allele, alternate: alt_allele, json });
+        }
+
+        Ok(Self { raw, entries })
+    }
+
 }

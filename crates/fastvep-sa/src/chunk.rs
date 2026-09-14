@@ -15,11 +15,17 @@ pub struct JsonBlobLines {
 
 impl JsonBlobLines {
     pub fn from_text(text: String) -> Self {
+        Self::from_text_with_fast_lines(text, std::env::var_os("ANNOCAT_BENCH_FAST_LINES").is_some())
+    }
+
+    fn from_text_with_fast_lines(text: String, fast: bool) -> Self {
         debug_assert!(u32::try_from(text.len()).is_ok());
         let mut ends = Vec::new();
-        for (index, byte) in text.bytes().enumerate() {
-            if byte == b'\n' {
-                ends.push(index as u32);
+        if fast {
+            ends.extend(memchr::memchr_iter(b'\n', text.as_bytes()).map(|i| i as u32));
+        } else {
+            for (index, byte) in text.bytes().enumerate() {
+                if byte == b'\n' { ends.push(index as u32); }
             }
         }
         ends.push(text.len() as u32);
@@ -447,6 +453,22 @@ mod tests {
         let json = chunk.reconstruct_json(0, &fields, &[]);
         assert!(json.contains("\"allAf\":"));
         assert!(json.contains("\"allAc\":42"));
+    }
+
+    #[test]
+    fn fast_json_blob_lines_match_original_and_split() {
+        for seed in ["", "\n", "a", "a\n", "\na", "α\r\nβ\n\n", "{\"value\":123.45}\n"] {
+            for repeat in [0, 1, 2, 31, 1024] {
+                let text = seed.repeat(repeat);
+                let old = JsonBlobLines::from_text_with_fast_lines(text.clone(), false);
+                let fast = JsonBlobLines::from_text_with_fast_lines(text.clone(), true);
+                assert_eq!(old.ends, fast.ends);
+                let expected: Vec<_> = text.split('\n').collect();
+                assert_eq!(fast.len(), expected.len());
+                for (i, value) in expected.iter().enumerate() { assert_eq!(fast.get(i), Some(*value)); }
+                assert_eq!(fast.get(expected.len()), None);
+            }
+        }
     }
 
     #[test]

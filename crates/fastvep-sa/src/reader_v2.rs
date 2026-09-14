@@ -929,11 +929,10 @@ impl Osa2Reader {
         let json_blobs = match self.read_entry(&format!("{}json_blobs.zst", prefix))? {
             Some(buf) => {
                 let decode_started = self.profiling_started();
-                let mut decoder = zstd::stream::Decoder::new(buf.as_slice())?;
-                let mut decompressed = Vec::new();
-                (&mut decoder)
-                    .take(MAX_JSON_BLOB_DECOMPRESSED as u64 + 1)
-                    .read_to_end(&mut decompressed)?;
+                let audit = std::env::var_os("ANNOCAT_BENCH_SA_AUDIT").is_some();
+                let audit_start = audit.then(Instant::now);
+                let decompressed = crate::common::decompress_at_most(
+                    &buf, MAX_JSON_BLOB_DECOMPRESSED + 1)?;
                 if decompressed.len() > MAX_JSON_BLOB_DECOMPRESSED {
                     let width = 1u64 << self.metadata.chunk_bits;
                     anyhow::bail!(
@@ -950,8 +949,14 @@ impl Osa2Reader {
                     self.json_blob_bytes
                         .fetch_add(decompressed.len() as u64, Ordering::Relaxed);
                 }
+                let zstd_seconds = audit_start.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                let utf_started = audit.then(Instant::now);
+                let blob_bytes = decompressed.len();
                 let text = String::from_utf8(decompressed)?;
+                let utf_seconds = utf_started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                let lines_started = audit.then(Instant::now);
                 let blobs = JsonBlobLines::from_text(text);
+                if audit { eprintln!("SA_DECODE {}", serde_json::json!({"source":self.sa_metadata.json_key,"chrom":chrom,"chunk":chunk_id,"bytes":blob_bytes,"zstdSeconds":zstd_seconds,"utfSeconds":utf_seconds,"lineSeconds":lines_started.unwrap().elapsed().as_secs_f64()})); }
                 Self::add_elapsed(&self.json_blob_decode_nanos, decode_started);
                 Some(blobs)
             }
@@ -1015,6 +1020,7 @@ impl Osa2Reader {
         Self::add_elapsed(&self.chunk_build_nanos, chunk_started);
         self.chunk_load_count.fetch_add(1, Ordering::Relaxed);
         let bytes = chunk_bytes(&chunk);
+        if std::env::var_os("ANNOCAT_BENCH_SA_AUDIT").is_some() { eprintln!("SA_LOAD {}", serde_json::json!({"source":self.sa_metadata.json_key,"chrom":chrom,"chunk":chunk_id,"bytes":bytes,"format":"osa2"})); }
 
         let mut cache = cache_mutex
             .lock()

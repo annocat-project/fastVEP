@@ -5,7 +5,7 @@
 //! byte-budgeted LRU cache shared across batches and across queries on the
 //! same block.
 
-use crate::block::{BlockEntry, SaBlock};
+use crate::block::{BlockEntry, DecodedBlock, SaBlock};
 use crate::common::{chrom_aliases, OSA_MAGIC, OSA_SCHEMA_VERSION, SCHEMA_VERSION};
 use crate::index::{BlockRef, SaIndex};
 use crate::reader_v2::Osa2Reader;
@@ -167,20 +167,6 @@ static GLOBAL_BLOCK_CACHE: std::sync::LazyLock<Mutex<BlockCache>> =
         Mutex::new(BlockCache::new(crate::common::sa_cache_budget_bytes()))
     });
 
-/// Approximate in-memory footprint of a decompressed block: the BlockEntry
-/// struct slots in the `Vec`, plus the heap storage backing each entry's
-/// three `String`s. The `Vec` capacity is bounded by its length here
-/// because the writer pre-sizes the allocation, so `len * size_of` is a
-/// reasonable proxy for the slab.
-fn block_bytes(entries: &[BlockEntry]) -> usize {
-    let slot_bytes = std::mem::size_of::<BlockEntry>().saturating_mul(entries.len());
-    let string_bytes: usize = entries
-        .iter()
-        .map(|e| e.ref_allele.len() + e.alt_allele.len() + e.json.len())
-        .sum();
-    slot_bytes.saturating_add(string_bytes)
-}
-
 /// A cache key: which reader a block came from, plus its file offset. The
 /// reader id namespaces entries so shards that happen to share an offset don't
 /// collide in the single shared cache.
@@ -195,7 +181,7 @@ type CacheKey = (u64, u64);
 /// returns the evicted entry on capacity overflow), so the inner `LruCache`
 /// can never silently drop an entry without `total_bytes` reflecting it.
 struct BlockCache {
-    lru: LruCache<CacheKey, (Arc<Vec<BlockEntry>>, usize)>,
+    lru: LruCache<CacheKey, (Arc<DecodedBlock>, usize)>,
     total_bytes: usize,
     budget_bytes: usize,
 }
@@ -210,11 +196,11 @@ impl BlockCache {
         }
     }
 
-    fn get(&mut self, key: CacheKey) -> Option<Arc<Vec<BlockEntry>>> {
+    fn get(&mut self, key: CacheKey) -> Option<Arc<DecodedBlock>> {
         self.lru.get(&key).map(|(arc, _)| Arc::clone(arc))
     }
 
-    fn put(&mut self, key: CacheKey, value: Arc<Vec<BlockEntry>>, bytes: usize) {
+    fn put(&mut self, key: CacheKey, value: Arc<DecodedBlock>, bytes: usize) {
         // Replace-in-place: drop the old bytes first so the budget loop
         // below sees the correct `total_bytes`.
         if let Some((_, old_bytes)) = self.lru.pop(&key) {
@@ -398,7 +384,7 @@ impl SaReader {
                     anyhow::bail!("OSA blocks are not coordinate ordered on {}", chromosome);
                 }
                 previous_end = Some(block.end_pos);
-                let entries = self.decompress_block(block.file_offset, block.compressed_len)?;
+                let entries = SaBlock::decompress(self.compressed_block(block.file_offset, block.compressed_len)?)?;
                 if entries.is_empty() {
                     anyhow::bail!("OSA block is empty on {}", chromosome);
                 }
@@ -508,8 +494,8 @@ impl SaReader {
         }
     }
 
-    /// Decompress a block straight from the mmap. Pure: touches no cache state.
-    fn decompress_block(&self, file_offset: u64, compressed_len: u32) -> Result<Vec<BlockEntry>> {
+    /// Validate and borrow a compressed block from the mmap without copying it.
+    fn compressed_block(&self, file_offset: u64, compressed_len: u32) -> Result<&[u8]> {
         let offset: usize = file_offset
             .try_into()
             .map_err(|_| anyhow::anyhow!("Block offset {} too large for usize", file_offset))?;
@@ -545,12 +531,12 @@ impl SaReader {
             );
         }
 
-        SaBlock::decompress(&self.mmap[data_start..data_end])
+        Ok(&self.mmap[data_start..data_end])
     }
 
     /// Return the decompressed block at the given file offset, hitting or
     /// populating the shared LRU cache as needed.
-    fn get_block(&self, block_ref: &BlockRef) -> Result<Arc<Vec<BlockEntry>>> {
+    fn get_block(&self, block_ref: &BlockRef) -> Result<Arc<DecodedBlock>> {
         let key: CacheKey = (self.reader_id, block_ref.file_offset);
         let cache_mutex = self.cache();
 
@@ -578,15 +564,16 @@ impl SaReader {
         }
         let inflate_started = profiling_enabled.then(Instant::now);
         let chunk_started = inflate_started;
-        let entries = self.decompress_block(block_ref.file_offset, block_ref.compressed_len)?;
+        let entries = DecodedBlock::decompress(self.compressed_block(block_ref.file_offset, block_ref.compressed_len)?)?;
         Self::add_elapsed(&self.inflate_nanos, inflate_started);
         Self::add_elapsed(&self.chunk_build_nanos, chunk_started);
         if profiling_enabled {
             self.decompressed_bytes
-                .fetch_add(block_bytes(&entries) as u64, Ordering::Relaxed);
+                .fetch_add(entries.heap_bytes() as u64, Ordering::Relaxed);
         }
         self.decompress_count.fetch_add(1, Ordering::Relaxed);
-        let bytes = block_bytes(&entries);
+        let bytes = entries.heap_bytes();
+        if std::env::var_os("ANNOCAT_BENCH_SA_AUDIT").is_some() { eprintln!("SA_LOAD {}", serde_json::json!({"source":self.metadata.json_key,"offset":block_ref.file_offset,"bytes":bytes,"format":"osa"})); }
         let arc = Arc::new(entries);
 
         let mut cache = cache_mutex
@@ -635,7 +622,7 @@ impl SaReader {
 
     fn find_match(
         &self,
-        entries: &[BlockEntry],
+        entries: &DecodedBlock,
         position: u32,
         ref_allele: &str,
         alt_allele: &str,
@@ -651,34 +638,26 @@ impl SaReader {
             ""
         };
 
-        SaBlock::find_by_position(
-            entries,
-            position,
-            allele_ref,
-            allele_alt,
-            self.metadata.is_positional,
-        )
-        .map(|idx| entries[idx].json.clone())
+        entries.at_position(position)
+            .find(|entry| self.metadata.is_positional
+                || (entry.ref_allele == allele_ref && entry.alt_allele == allele_alt))
+            .map(|entry| entry.json.to_owned())
     }
 
     fn find_matches(
         &self,
-        entries: &[BlockEntry],
+        entries: &DecodedBlock,
         position: u32,
         ref_allele: &str,
         alt_allele: &str,
         matches: &mut Vec<String>,
     ) {
-        let start = entries.partition_point(|entry| entry.position < position);
-        for entry in &entries[start..] {
-            if entry.position != position {
-                break;
-            }
+        for entry in entries.at_position(position) {
             if self.metadata.is_positional
                 || !self.metadata.match_by_allele
                 || (entry.ref_allele == ref_allele && entry.alt_allele == alt_allele)
             {
-                matches.push(entry.json.clone());
+                matches.push(entry.json.to_owned());
             }
         }
     }
@@ -1057,18 +1036,24 @@ mod tests {
         );
     }
 
+    fn cached_test_block(entry: BlockEntry) -> Arc<DecodedBlock> {
+        let mut block = SaBlock::new(1024 * 1024);
+        assert!(block.add(entry));
+        Arc::new(DecodedBlock::decompress(&block.compress().unwrap()).unwrap())
+    }
+
     #[test]
     fn block_cache_evicts_lru_when_byte_budget_exceeded() {
         // Three "blocks" of 100 bytes each, budget of 250 bytes — the third
         // insert must evict the first to stay within budget.
         let mut cache = BlockCache::new(250);
         let mk = |i: u32| {
-            Arc::new(vec![BlockEntry {
+            cached_test_block(BlockEntry {
                 position: i,
                 ref_allele: "A".into(),
                 alt_allele: "G".into(),
                 json: "x".repeat(100),
-            }])
+            })
         };
         cache.put((0, 0), mk(0), 100);
         cache.put((0, 1), mk(1), 100);
@@ -1088,12 +1073,12 @@ mod tests {
         // otherwise concurrent workers querying the same oversized block
         // would each re-decompress it.
         let mut cache = BlockCache::new(50);
-        let entry = Arc::new(vec![BlockEntry {
+        let entry = cached_test_block(BlockEntry {
             position: 1,
             ref_allele: "A".into(),
             alt_allele: "G".into(),
             json: "x".repeat(1000),
-        }]);
+        });
         cache.put((0, 0), entry, 1000);
         assert!(
             cache.get((0, 0)).is_some(),
@@ -1107,17 +1092,17 @@ mod tests {
         // cache: reader 0's block and reader 1's block at offset 0 coexist.
         let mut cache = BlockCache::new(10_000);
         let mk = |tag: &str| {
-            Arc::new(vec![BlockEntry {
+            cached_test_block(BlockEntry {
                 position: 1,
                 ref_allele: "A".into(),
                 alt_allele: "G".into(),
                 json: tag.to_string(),
-            }])
+            })
         };
         cache.put((0, 0), mk("reader0"), 100);
         cache.put((1, 0), mk("reader1"), 100);
-        assert_eq!(cache.get((0, 0)).unwrap()[0].json, "reader0");
-        assert_eq!(cache.get((1, 0)).unwrap()[0].json, "reader1");
+        assert_eq!(cache.get((0, 0)).unwrap().entry(0).json, "reader0");
+        assert_eq!(cache.get((1, 0)).unwrap().entry(0).json, "reader1");
         assert_eq!(cache.len_for_reader(0), 1);
         assert_eq!(cache.len_for_reader(1), 1);
     }

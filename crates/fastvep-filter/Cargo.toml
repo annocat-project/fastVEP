@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "fastvep-filter"
 version.workspace = true
 edition.workspace = true
