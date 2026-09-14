@@ -27,6 +27,39 @@ AnnoCAT processes large local VCF files, installs annotation sources as verified
 chromosome shards, and stores complete structured evidence for its result viewer.
 This fork adds the interfaces and correctness rules needed for that workflow.
 
+The maintained engine is on `codex/vep115-concordance`. AnnoCAT pins an exact
+commit and builds both its library integration and the standalone `fastvep`
+companion from that source. The branch name and upstream version alone do not
+identify a qualified build.
+
+### VEP 115 compatibility
+
+Consequence and HGVS work targets Ensembl VEP 115 with the pinned GRCh38
+reference, transcript sources and annotation options. Regression corpora and
+source-path audits cover allele normalization, splice boundaries, partial CDS,
+mitochondrial translation, transcript coordinates and protein HGVS. This is not
+a claim of exhaustive agreement for every possible input or VEP configuration.
+
+Reviewed exceptions intentionally avoid reproducing VEP crashes, reversed HGVS
+coordinate order at coding/UTR boundaries, and intronic offsets beyond a
+transcript's final exon. Qualification must distinguish those exact exceptions
+from unexplained differences. Passing Rust tests alone does not establish
+whole-genome annotation concordance.
+
+### Public transcript caches
+
+The public Ensembl builder combines matching GFF3, reference sequence and
+Ensembl core enrichment inputs into an `ANNOCATC1` transcript cache. It retains
+complete transcript membership, VEP 115 core metadata, mature miRNA ranges and
+translation sequence edits. Legacy `FSTVEP02` caches remain readable; their
+capabilities differ, so merely opening an older cache does not qualify it as
+equivalent to a newly enriched cache.
+
+AnnoCAT manages source downloads, verifies their manifests and publishes the
+built cache after verification. Existing caches remain read-only during
+annotation. Basic GFF3/FASTA cache construction below is separate from the
+enriched public-builder path.
+
 ### Supplementary annotation caches
 
 - Read OSA1 and OSA2 caches through one verified provider interface.
@@ -48,6 +81,10 @@ This fork adds the interfaces and correctness rules needed for that workflow.
 
 ### Annotation output
 
+- Expose an in-memory output interface for AnnoCAT's direct-Parquet worker,
+  avoiding mandatory intermediate VCF and NDJSON files. AnnoCAT owns Parquet
+  writing, result schemas, representative-transcript display and recovery;
+  the standalone `fastvep` CLI does not provide a direct-Parquet command.
 - Write newline-delimited structured annotations beside VCF output in the same
   annotation pass.
 - Store supplementary evidence once per allele instead of once per transcript.
@@ -115,7 +152,7 @@ On Windows, the binary is `target\release\fastvep.exe`.
 
 ## Usage
 
-Build and verify a transcript cache:
+Build and verify a basic transcript cache:
 
 ```bash
 fastvep cache \
@@ -127,6 +164,11 @@ fastvep cache-verify \
   --input grch38.fastvep.cache \
   --require-primary-coding-sequences
 ```
+
+For enriched public construction, `fastvep cache` also accepts
+`--ensembl-core-manifest` and `--ensembl-core-dir` together. Use the versioned
+manifest and matching downloaded inputs managed by AnnoCAT; do not mix Ensembl
+releases. Run `fastvep cache --help` for the complete options.
 
 Annotate a VCF with a transcript cache and supplementary databases:
 
@@ -193,7 +235,7 @@ workflow.
 | Command | Purpose |
 |---|---|
 | `annotate` | Predict consequences and attach supplementary annotations |
-| `cache` | Build a transcript cache from GFF3 and optional FASTA data |
+| `cache` | Build a basic or Ensembl-core-enriched transcript cache |
 | `cache-verify` | Fully decode and validate a transcript cache |
 | `sa-build` | Build an OSA or interval annotation database |
 | `sa-convert` | Convert a verified CADD or SpliceAI OSA1 shard to OSA2 |
@@ -215,6 +257,13 @@ Changes to consequence prediction, HGVS, cache encoding, or source parsing must
 keep the existing compatibility and parity tests passing. AnnoCAT release builds
 also verify the pinned history, dependency lock, complete test suite, and binary
 checksum before packaging.
+
+The [engine synchronization record](docs/annocat-engine-sync-2026-09-14.md)
+describes the source comparison and its validation limits. Historical receipts
+retain their original commit IDs. The tag
+`archive/annocat-2026-09-14-before-message-amend` preserves the engine used by
+the September 14 local releases before two commit messages were expanded;
+the amended commits have identical source trees.
 
 ## Citation
 
