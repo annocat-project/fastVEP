@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "fastvep-cache"
 version.workspace = true
 edition.workspace = true

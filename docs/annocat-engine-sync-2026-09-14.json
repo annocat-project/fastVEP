@@ -1,0 +1,826 @@
+{
+  "date": "2026-09-14",
+  "branch": "codex/vep115-concordance",
+  "preservedConcordanceCommit": "38349c52092ccfd62b6454e1844b22090bce959a",
+  "embeddedRepositoryCommit": "c7a4d61",
+  "embeddedPath": "third-party/fastvep-engine",
+  "comparedFileCount": 161,
+  "changedFileCount": 22,
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "72d9152202a884d37a9599fbf03c67203afd45c646d1a641f5926f688f3ad1d5",
+      "changed": true
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "4587e01567a425343957ef4ffbd1e8e62981285c24be6028d10308509b471cdf",
+      "changed": true
+    },
+    {
+      "path": "LICENSE.md",
+      "sha256": "1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-annotate/Cargo.toml",
+      "sha256": "e9da5838ae7bd111a12d5f7f5305b5c0461ceebfd019d9ad4c57218a551b1107",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-annotate/src/hgvs_normalize.rs",
+      "sha256": "f5e6fae64987b0492b6dfa93f0da06aeff7dcffbf6ff9da94249acfc20e7eb1f",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-annotate/src/lib.rs",
+      "sha256": "5ef630676298fa36ef98e714da70ec89385fc90bfa0a434e415b41a1e2d294ce",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-annotate/tests/mitochondrial.rs",
+      "sha256": "1af998cfb416c75ef74dee10561bab52af88dab5dc4ea901a5b537c28f1953c0",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-annotate/tests/sa_provider_loading.rs",
+      "sha256": "8d05e094b8a3177325db2dcf759c024627897c9042c36408ec4b9e8074981ea9",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/Cargo.toml",
+      "sha256": "34f4b15fd143770483fe6bd37888cdaf03185198aa10eaed81e8836541c9cc27",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-cache/examples/apply_causal_overlay.rs",
+      "sha256": "84b5518771af87cbea9c030718578bd919af80c0a39ed02dcd40157fd7751aff",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/examples/apply_inventory_candidate.rs",
+      "sha256": "4bb2fe1b4eccc48064d900c904c93373b98af4a7612d934b4b4f24f6a646793d",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/examples/build_public_cache.rs",
+      "sha256": "8f7a96f387d341c393e953eb527b4737b622a19f3460df9ed555e7ebb0cb14c6",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/examples/compare_cached_peptides.rs",
+      "sha256": "a6e47428cd3c62881df7c7b60654a8b1a81119802c6b67073f3997af50af3845",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/examples/export_transcript_inventory.rs",
+      "sha256": "7527929b4c92d2af161df9cac8af672a24a3be7fb2a02b539dcf9c6dbd8deec2",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/examples/extract_concordance_region_cache.rs",
+      "sha256": "67f6b237363b2bda57fd2885f620c4f2e58bc6974d79470f56736af2e150edbf",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/examples/inspect_cached_transcript.rs",
+      "sha256": "b41743a65c6dc35bebc9e6813c78c77369b4898352aa51a79894b1fa817af9cf",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/annocat_cache.rs",
+      "sha256": "8a17cdbfcf6f5a425279209042e6f1efff6d6fab985c2f086e98c898b19a5e31",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-cache/src/annotation.rs",
+      "sha256": "ef22c1ff14ef59e38613e9d1feec307bd5ff5438414a577e3025930aafd830ef",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/ensembl_core.rs",
+      "sha256": "ebba65c882c56532473ab1c257749b1f9fcba177458bdf9fdfbc0cf84e34ac03",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/fasta.rs",
+      "sha256": "ea35861ffcfac9a7bd5a21f4c94dca0a8b2e3fa44a34d648ab0916f2ec9de202",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/gff.rs",
+      "sha256": "de68bc85c16e40b9c8592900f5784a452772068a531d9bbc5efa8958cfe9c467",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/info.rs",
+      "sha256": "c843c7acac0d4effd57559095031bbfccba119a275e300a1c4dca5be76f950ca",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/lib.rs",
+      "sha256": "ba61f58c6e47e9463a0a1ca7edb63af6ffeaf9f97eefc4c63d2122e7ea2e8bd2",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/normalize.rs",
+      "sha256": "19f2e94c27bd4eee90125d23e7c5d9cca3d6bd50f8aa790972e435d188350fdb",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/providers.rs",
+      "sha256": "d2a94ab68cec98c62766d1ab7bb7060b029a1402bad8a4a7f9ccce9feeb5922b",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/regulatory.rs",
+      "sha256": "4a2d2fa3856d47acf881732f439d62cf4bd14fcaf0f86a8afe6a5e79ff925442",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/transcript_cache.rs",
+      "sha256": "9013c51782d2ec964d2255c62ed6429c46b29612cfb6b18f20a71036334df674",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/transcript_wire.rs",
+      "sha256": "4ca2b3625e77e638de855ac40027a08df42ecd842e96ac61285f4848665b6fcf",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cache/src/variation.rs",
+      "sha256": "cc73717076bf83b08df740e0664a27c68916c4d5ad1b7be20db5652056719c62",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/Cargo.toml",
+      "sha256": "189339cf7754215ceb1c3a9e9ccb8c4405c0b8c6865f343424679de46901b02b",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-classification/src/combiner.rs",
+      "sha256": "31e8618251e3bd39f2d02dc858bab7e6df38aa5367ca01577ac5751a3b062804",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/config.rs",
+      "sha256": "554dffcd01740740d75aff1ae91206708f4b5daf750e79a50d064dd2fd8c866d",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/lib.rs",
+      "sha256": "629340ea64c25ae0687bc6e09b641c3fbe012bb1b58448cc969044cdaff595e4",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/sa_extract.rs",
+      "sha256": "f5e7ffba01278078e103e4c2dfb0a87295034c6e5af847dc4bb56789f441bdb3",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/types.rs",
+      "sha256": "9f3d34218991934a505e018db39b4738f20df77e9a8df79a37a88afef90b4030",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/criteria/benign_standalone.rs",
+      "sha256": "d994e5305bfe99919b024d23470bdf37f388ea4d414fd63143b21c1ba6d94909",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/criteria/benign_strong.rs",
+      "sha256": "b4f0a852cda897cb66772c04e81281e534c3ed99ae1815a2e6577bcaf6e00d01",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/criteria/benign_supporting.rs",
+      "sha256": "b15c2f9ddd6c9edc7d8c0d4251c5406c3fad74552d7d86759939d1d6abfb4fb9",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/criteria/mod.rs",
+      "sha256": "311f8e34816e81b1e3aecba6ab040db1684028eca4b50335e7100e373064aaf1",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/criteria/pathogenic_moderate.rs",
+      "sha256": "af9f141ff06e52a823e264d6c2c7ec3b98321b384c8cd7da800ea6a83d67ad8c",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/criteria/pathogenic_strong.rs",
+      "sha256": "a5f02a712d2f7eede313013f6fc209fb6e3cf2b3630a8abb77b58d2ce36edf50",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/criteria/pathogenic_supporting.rs",
+      "sha256": "1da4cae3931c019fcb1d45031c35874b6411822830e2ceedb9bd84e5ec253923",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-classification/src/criteria/pvs1.rs",
+      "sha256": "165980e54d8b74a22443d4757c35364d0459f29ba4f65ef04270e5f304c8d2aa",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/Cargo.toml",
+      "sha256": "fe47b937d04e00c7d7c26f66d400f387b8a714caf54d3bf7eab8e327222e26ff",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-cli/examples/replay_mature_mirna.rs",
+      "sha256": "64bb27648b51de33c133852c9d0f067a173b8cdd41997190294c0993a1ab91a5",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/fixtures/spliceai/gnomad-mini.vcf",
+      "sha256": "e8d854efc0fc6fce2f7975f5db61e4e7ad63f4e0836c7e41d2cb4ca9e26689cd",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/fixtures/spliceai/input-no-spliceai-info.vcf",
+      "sha256": "d90622ce4f9a96b68489b3f757260e4d1d8ac3ea777eef87099c1375e4679062",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/fixtures/spliceai/mini.gff3",
+      "sha256": "f300c757f7bde29df65ce672cf4a27db6dc877948648ae95ccc451d3dd17d266",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/fixtures/spliceai/spliceai-indel-mini.vcf",
+      "sha256": "9831ef75c940508766b94995fc2818f5270a243d27b6bd85dfb0a29de9c7fb48",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/fixtures/spliceai/spliceai-mini.vcf",
+      "sha256": "00eec2cfdf68a9cc0c55422b1d85ae6517d4a2af3ad0bbf5519b405cd82cb582",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/src/lib.rs",
+      "sha256": "37cea801e352c50ad3f5c016f4a9f1c535c93640d49b80cada6eef6bc80aee0b",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/src/main.rs",
+      "sha256": "c6545a098e4eefb3164d044ee1932b5184e5355fcba0e1d750e2be894ab79e9f",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/src/parallel_records.rs",
+      "sha256": "b584d747d7e313b873f10c5c185d49eed9ec38bb336061d55916b792f17c8fde",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/src/pipeline.rs",
+      "sha256": "6cabc70b0ecdd07d02692b13846dfe496185ab147c35c6069a4b759c04c25008",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-cli/src/progress.rs",
+      "sha256": "152d5de52b59ff4a9860f1f2f00efae8ab1131ba377d5c169aeb99933750b88f",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/src/webserver.rs",
+      "sha256": "664cf2a6c19187d8760b9ee1fb9ad9b5f661ef1c74998911ce509a4be54c7d4c",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/tests/cache_synonyms.rs",
+      "sha256": "bff71bda37968663b7bf7affcd4168cadb43704e02e5bc466cd09c3ce6e101d9",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/tests/hgvsc_multiallelic.rs",
+      "sha256": "15436938086bc1691aabed9b97bf8f9ce48ae249323de79a523cf2061ba6bb8f",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/tests/hgvsp_reverse_strand_anchor.rs",
+      "sha256": "1f8dc064c65ece67521c278872a9aa7f9700fa6c3f9e757b97906fa6e1c13db6",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/tests/sa_build_oga.rs",
+      "sha256": "9207f609877b4d3f20dbbcb7607379aa4b4c17accc09ad43518ea64ccbb28ecc",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/tests/sa_build_osa2.rs",
+      "sha256": "29f83e1d2f3ede1d187d1a8312a3a6c0b77633d009d38a93ade428633cbef6dd",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-cli/tests/sa_build_streaming.rs",
+      "sha256": "4ddbdf4c1643518f9b2aa3b11f509815fed8c50d587bad498757ed2b5cf1c584",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-consequence/Cargo.toml",
+      "sha256": "919c2961eb16f38ab0b8f4970dcd7c5fc19c4f63e8ee75e154fa35f83629d290",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-consequence/src/lib.rs",
+      "sha256": "9bcba975c305471e99aedc2934906d0ff72439f2c3cece826ab88debb2d57dab",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-consequence/src/predictor.rs",
+      "sha256": "2fdce7c8383c9c36758c428d8f70e577f866082b8c4432108aeaf051c2a55313",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-consequence/src/splice.rs",
+      "sha256": "1465037229b1c092710a6e91caae73988d81ec0605bb3cf87fc2c07c9c99d7ed",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-consequence/src/sv_predictor.rs",
+      "sha256": "8c3741c2ab77bac5e01adf1f50ed2cf780d27c15d161f4f492b6453926f62a03",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-core/Cargo.toml",
+      "sha256": "e9b0ea44790df89b5f84e6449c1336de5b36a204529f87db81b671f5720efda8",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-core/src/annotation_types.rs",
+      "sha256": "de8789c9b6c2e1831237dc31ef5fe8b01883326bc14b01f8770eaef44dab22c6",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-core/src/chrom.rs",
+      "sha256": "b824c6e697c1c0c116c5a0112416dbf879718c6a421b6bdc8167c21add2b84fc",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-core/src/consequence.rs",
+      "sha256": "ab5e09c73ec96f0439933ef6d580655ddbcc4764a9c3295365de99a476186440",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-core/src/hgvs.rs",
+      "sha256": "3259bdfb11a8bd5597897015ba1f6b178e811c23b42340f0587182bc56000741",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-core/src/lib.rs",
+      "sha256": "74ef8a676259efcf3fb0670e8fcd62375c6338c2e18640869a839f64bb3cc469",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-core/src/position.rs",
+      "sha256": "cb0d581fece8b03123fdb104c2eedc198701e3b2dc85e390b81f8442e51685dd",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-filter/Cargo.toml",
+      "sha256": "89bde22e6408bab9858f4f1a56ccbd746e84387d082330be6003de177d66507c",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-filter/src/evaluator.rs",
+      "sha256": "a5c307ecbdc67fe556b79d47a5a44719dd72fad092f1192bb94dd40fe56374eb",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-filter/src/lexer.rs",
+      "sha256": "4613463c948f9db72ce77683852a3eee65ca6acdb76861eb7f5e00f2233f0eac",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-filter/src/lib.rs",
+      "sha256": "92c4fa9130606ac583a237d78b100f11f1c59f65403809ef937a8f6cf823cf17",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-filter/src/parser.rs",
+      "sha256": "a9f8e49a7994d9b87e60cd1d9da12aa2cc9e36902bc7f22649533d7da289da8e",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-genome/Cargo.toml",
+      "sha256": "3e0f3bdbac57d6be8c4156ff8829b950fc45f8776feda40a3e58510e1385b4e8",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-genome/src/codon.rs",
+      "sha256": "b35721fabbaabd5a10483f77f02b3a1a073e915406dcbacb3eb13ad6efe053c0",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-genome/src/lib.rs",
+      "sha256": "95fcb1a11a2869e0cc93e72d229c08c801658cb0b71ddae6b3210349c7f27d3a",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-genome/src/mitochondrial.rs",
+      "sha256": "8cc3bcb873f8bcabc63c566f2f3ee849f7f3bca90d4373991b2f9c78e349a0ac",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-genome/src/transcript.rs",
+      "sha256": "137c0ef678119a2c23597b4eee8faaf7786f80f626aead08bb85a30595b64fc2",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-hgvs/Cargo.toml",
+      "sha256": "544e3f7f4b5a11b3fd7255d0bf5b4e6e869168ebda0aee4048c4c35963ccddb4",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-hgvs/src/coding.rs",
+      "sha256": "8377a9a641918aa4b8ea785a4909ccf79c94fd99eef23230af33ba757ec3330d",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-hgvs/src/genomic.rs",
+      "sha256": "6e55ac64d97cf97e8c53e2849585f0aaf1d4a3b7e425892849b5bebfe8c460ad",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-hgvs/src/lib.rs",
+      "sha256": "e706ada762e8588ecad8ebeea3c78560c10f3bf527f67de8de452e7ee388e3ec",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-hgvs/src/protein.rs",
+      "sha256": "3c1dbacb66ca1f72acc54d7b0e7af1afe335238448ea5fc6005f09205dde0edb",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-io/Cargo.toml",
+      "sha256": "045e0a609061d3e349636f8180f8830a7bcd703a8cddacf9c0b58fcd91f85056",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-io/src/geneset.rs",
+      "sha256": "e5225ea3cd2c4c82908cf4db9e4366e32ad161becc499a5d0919775de65e803a",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-io/src/lib.rs",
+      "sha256": "d4ab658eb954c2d7ef1f996585cb36d65068671907410c27d182aa64a47eb9c2",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-io/src/output.rs",
+      "sha256": "487162daea55c0c75f163abdb044ab6ce3ab92a2320e04ac2239c71577074300",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-io/src/qc.rs",
+      "sha256": "aac9c50bca4d27b808dff91317dda96495effd326925595353bdc6d03f96393f",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-io/src/sample.rs",
+      "sha256": "f50d5ae44f0afdd8a77665fa724ca65747a1addff5938110a70483ca59a75ec0",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-io/src/variant.rs",
+      "sha256": "cb6e424e5a8756c43d65dc6e91b9f4494bcb1140b94c12e2342971d64008cad9",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-io/src/vcf.rs",
+      "sha256": "e642295063bc10d5b907fe4377243731808b7be369da725254117a68cb853f9f",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-io/tests/projection_allocations.rs",
+      "sha256": "ba1b0cf98343e1b5aecb4dfed4ee8c783224f1a892d029d6946eeb27152731f3",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-io/tests/vep_compat.rs",
+      "sha256": "e4f47b01b4808bf76803026fc0c64b85f6092fa760ec9c0f43aeee3f64af78d2",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/Cargo.toml",
+      "sha256": "3308d8aa3d9a000aa6e4586c1621501b58e2f78dfe0abda66e5bd39b223e91b7",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-sa/examples/bench_osa2_open.rs",
+      "sha256": "b324808dc2ac6625a5adbcdfa7b133ccfe5596d71554a76f97fe5cfa99bd0cca",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/examples/bench_sa_parallel.rs",
+      "sha256": "cd438a23fca395efb1b9474c15871cd2db0e3339b342d53f6cfae6bc1508e5c7",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/examples/bench_sa_reader.rs",
+      "sha256": "56c56a18f7f9f414624203be0755de30cdb885bc72da9f2f9653c215669b6db7",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/examples/bench_shapes.rs",
+      "sha256": "9aadc89ee791ab037679a076e40052d594ca68de83e31beb16e543ddd4c541a3",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/examples/bench_v1_vs_v2.rs",
+      "sha256": "fe28e7241690deda118ee5b994e68ba480e778f91f1dd12057b6225cc154ea53",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/examples/dump_sa.rs",
+      "sha256": "352f1f4109e2e21af3785c36b4b3269423b42eb17c701c9328f26fd10e8d3762",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/examples/probe_sa.rs",
+      "sha256": "69375a91628acde21e81d5eca2168cb0a62cf13c16e8487f98a26c260ccdef8e",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/block.rs",
+      "sha256": "4685a302036572f238b9c9243a724b1da82bad4564aabcf2e5cb648bdb6f093a",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-sa/src/bloom.rs",
+      "sha256": "c1efe47ff980a6f4d5389b623e6b9f2a3637ead4ce8cf62a8015c43ff4d6c1f5",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/chunk.rs",
+      "sha256": "86487e62b4e053ee02098bf4c3bbb587459ff7d0f7101717883c3be409d9d8d7",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-sa/src/common.rs",
+      "sha256": "c670bc9b302e0a3555e3fcfb3b3d3e39e88b39ec92ff07173157d58ea32d7e78",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-sa/src/custom.rs",
+      "sha256": "27680f25747cd89c4eb1bd4483e33072c60b0c7b9dcd6b0bb2cd462dc2de1e38",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/fields.rs",
+      "sha256": "f7bcdb03034eb885805fdee9d3e5c3bd25d9eaabbbf6aa8391c37bc89a612ec6",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/gene.rs",
+      "sha256": "b07b47fc73dc5b3342575bf184c4e1e1049528e297e006f6d2cbeb99a0fae6a4",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/index.rs",
+      "sha256": "5af66899e73521694b98f8131cec7c49e40101a7e898c10572c122f267c81c4d",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/interval.rs",
+      "sha256": "f5e24a5f179bf47d8b2caa41ccf1fd09ab152cf7afe7872e9349c13f5e51f215",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/kmer16.rs",
+      "sha256": "83edb67548250863cbc23dd29d953fb8bf5344d19f810c6a5b29cf4a50b8c60c",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/lib.rs",
+      "sha256": "c2cdb21feb11965e34d212f111181f1183bd657a1ba1cfd62a9634b49a49bca4",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/reader_v2.rs",
+      "sha256": "fc13cea82c49fa23bca77220cad716df9811bb0aa7b56a26debc1a45b1ef12c6",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-sa/src/reader.rs",
+      "sha256": "3384f1b34c70fb0668c07fe6e8b52a73f89829c1027b41c6ec1471724264f989",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-sa/src/sharded.rs",
+      "sha256": "fa6d7b246d021f655484bf58604a79add95c259701e9d1c7140e10854f9fd8f2",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/var32.rs",
+      "sha256": "3d5ba4591349bb9083b3d691930915315cd4c81db5adb05b6d826e6f202399f6",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/writer_v2.rs",
+      "sha256": "aa884c7a6b2e588d32028f0a0840696485b344d34e03f67a598aab91a75661cb",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/writer.rs",
+      "sha256": "40e3aa89b05812f72ef1db0b067e5039145716ee2d29b07e5d564d6119eadaf0",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/zigzag.rs",
+      "sha256": "ffe5fcca187888e2ef378bd9fb4b1e27d8a878d6daa561e16c33cf31e7ffc18f",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/zipdir.rs",
+      "sha256": "53d9605caf3a98cd5ef4905cbb94187d9b4c5f74e5dd0a041cc8d9144ca9df9a",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/alphamissense.rs",
+      "sha256": "58f081809b401af3c79c9c069fc7f9e6ccb38e711e2bcfaa0b84e5937104fc20",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/cadd.rs",
+      "sha256": "9510c343fa621b81aa3b9b43a417fc67b5b3f5bf202a6a35a4202d76699615a5",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/clinvar_protein.rs",
+      "sha256": "74df9b6c716102bd7db11b714bb37d9075adb5ed2787dcaec81ecdfd78b56a0e",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/clinvar.rs",
+      "sha256": "991573b55b1ade38918d3397b8247e04b4c6b2b8870f3037058d41dbf73d922e",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/cosmic.rs",
+      "sha256": "86f97dbb7c2513e7cd65db735dcf1ae4baefd90897f7ee2094cd1f04199b94b2",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/dbnsfp.rs",
+      "sha256": "5880e5fce54384f8dfe8ad4591d9108629be8d3ae3dd8cbfe3502796b2ec2d90",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/dbsnp.rs",
+      "sha256": "0f057230e0e1c95535437fcceb40d021d2c042ac07773c14ec4e7e15facf76fa",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/gnomad_gene.rs",
+      "sha256": "5c030e7aa0aa88ab5a200bcc81f81f1264e71899b74b38a1c37aaf97a16aeaaa",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/gnomad.rs",
+      "sha256": "c482931798f0223dcbb169c79e7632e9c734dc1409b958bb61b99889fc515e43",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/mitomap.rs",
+      "sha256": "2235a45ce5ccb508838dfb55d9145db0d69a11274f09943bfcc956443bfd221c",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/mod.rs",
+      "sha256": "addabc1d6a05455d27cb20a07e83bef306a024878fa8b9ed13d72083a5b8ddc8",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/omim.rs",
+      "sha256": "e06140e7c8685a8cde1c9c6bf04aa52248c73053fb0e609304d8f6b501f378c6",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/onekg.rs",
+      "sha256": "4da582ba22f5f60b3db906954e303941ad05a721e4f63531fb506cc844dc21bc",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/primateai.rs",
+      "sha256": "652908c5de1974854801f24c74efee6912fe1753c10f96cac73d833daf1cfb87",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/revel.rs",
+      "sha256": "b8b88172a93ecb78dd10ae64e18e24f0b7cde8480dd4ceca2a28fbc4dd8e97ae",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/scores.rs",
+      "sha256": "5c86b90ede0382b7d36560d2999595bec9285fdda7a27af0cc3cdf295b579960",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/spliceai.rs",
+      "sha256": "62ea1abe7c29bd33dd4c32d78349444790da902aa38467ed3ec9a757b06ea621",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/src/sources/topmed.rs",
+      "sha256": "0a27fd91517266e2ad220788cc5d97deda84653e65052df4993bab3238237c2e",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/failed_chunk_is_not_retried.rs",
+      "sha256": "841b58e0efff269271037b9a79732a857b6e9d758d4937f4881c9fab17d1344b",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/gnomad_indel_normalization.rs",
+      "sha256": "4fb4f2b3dc9be735c7f095eecfb8fa885365095b015297dfe17cd8d6f78eac67",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/issue_37_contig_naming.rs",
+      "sha256": "a88ed2b473ec01cceafb70fec6b23e370e60dc2b03a46a5694cb4f6abc926ac6",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/issue_37_v2_cache_coherence.rs",
+      "sha256": "1e192ac4dcb356fe08ac71acab5871775f1b8413c3d116b83090b450b7fd5cbe",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/issue_78_open_cost.rs",
+      "sha256": "86724d0d53438a9c6c32454eebe13c305003727fd3bc46cbb95318edad0f5ca0",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/osa2_duplicate_keys.rs",
+      "sha256": "807323097f57352e97029a6738181b02c2d9a747f8cc837bce6de521727244de",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/round_trip.rs",
+      "sha256": "9eefe751e36b66a259b406ae89af63ada523f2bb92291feced6338d4743c1938",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/v2_long_variants.rs",
+      "sha256": "0008dd211022dd7f21ed47bc1c154b5ee800867414494a712fd1bac8aff9ebd3",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/v2_parallel_cache.rs",
+      "sha256": "92d00191baf901d4dac4d833fbdb499e109b1b280e4ce24593580e02a1c8067c",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-sa/tests/v2_stream_writer.rs",
+      "sha256": "29b80ed98db5cf6fde6aa14b91f4a4ade21e237c4759889225716799c44ab3bc",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-web/Cargo.toml",
+      "sha256": "0d20803222a48cd7a5cce69770371d72a85efeeb062a54b036b277430bb7faf2",
+      "changed": true
+    },
+    {
+      "path": "crates/fastvep-web/src/context.rs",
+      "sha256": "b54969b8e201a8b3c51e75acc86863bcc6d310f2c8de36f2f74ad4e3715e0ef1",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-web/src/errors.rs",
+      "sha256": "d254d7222dfb709698514cad25ca9ef7c0851cf7b1caf5ee847aae3772b8419c",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-web/src/handlers.rs",
+      "sha256": "9efaa9c08db50d158cbc0f3fd088b0a469cfc40286dd2dfc1681c93f6716e2a0",
+      "changed": false
+    },
+    {
+      "path": "crates/fastvep-web/src/main.rs",
+      "sha256": "ed3c73e3e99dc29471cc33b8967e15004599d209ed4d5325effae8496da50443",
+      "changed": false
+    },
+    {
+      "path": "web/index.html",
+      "sha256": "360d482d58756dd7504132d595022926192b36616314c2dadbd85214a47a80ef",
+      "changed": false
+    },
+    {
+      "path": "web/assets/logo.png",
+      "sha256": "ececcfc3c8af0424c382fc1cc4413bbe5b06f4829632ff6a2a1b79465e975138",
+      "changed": false
+    }
+  ],
+  "note": "Exact file bytes copied from the embedded engine. ANNOCAT.md and qualified-snapshot.json are AnnoCat provenance documents and are not runtime source. Standalone repository-only files are preserved. No upstream ports or new biological changes.",
+  "validation": {
+    "libraryCommand": "cargo test --workspace --lib --offline --locked -j 2",
+    "libraryExitCode": 0,
+    "integrationCommand": "cargo test --workspace --test '*' --offline --locked -j 2",
+    "integrationExitCode": 0,
+    "integrationPassed": 120,
+    "integrationIgnored": 0,
+    "integrationSuites": 20
+  }
+}

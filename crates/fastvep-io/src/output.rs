@@ -3196,3 +3196,34 @@ mod tests {
         assert_eq!(baseline[0].split('\t').count(), 17);
     }
 }
+
+/// Cell projection for a structured consumer: preserve the existing CSQ field
+/// contract without joining and splitting a VCF/CSQ record.
+pub fn csq_maps(vf: &VariationFeature, fields: &[&str]) -> Vec<serde_json::Map<String,Value>> {
+    let resolved: Vec<_> = fields.iter().map(|f| CsqField::from_name(f)).collect();
+    let mut rows = Vec::new();
+    for tv in &vf.transcript_variations {
+        for aa in &tv.allele_annotations {
+            rows.push(csq_entry_map(vf,tv,aa,fields,&resolved));
+        }
+    }
+    rows
+}
+
+fn csq_entry_map(vf: &VariationFeature, tv: &TranscriptVariation, aa: &AlleleAnnotation,
+    fields: &[&str], resolved: &[CsqField]) -> serde_json::Map<String, Value> {
+    let mut row=serde_json::Map::new();
+    for (name, field) in fields.iter().zip(resolved) {
+        let mut cell=String::new();
+        format_csq_entry_into(vf,tv,aa,std::slice::from_ref(field),&mut cell);
+        row.insert((*name).into(),Value::String(cell));
+    }
+    row
+}
+
+/// Format one already-selected annotation using the same CSQ cell writers.
+pub fn csq_map_at(vf: &VariationFeature, ordinal: usize, fields: &[&str]) -> serde_json::Map<String, Value> {
+    let (tv,aa)=vf.transcript_variations.iter().flat_map(|tv|tv.allele_annotations.iter().map(move|aa|(tv,aa))).nth(ordinal).expect("selected CSQ ordinal");
+    let resolved:Vec<_>=fields.iter().map(|f|CsqField::from_name(f)).collect();
+    csq_entry_map(vf,tv,aa,fields,&resolved)
+}
