@@ -3,5 +3,5 @@ mod splice;
 pub mod sv_predictor;
 
 pub use predictor::{
-    AlleleConsequenceResult, ConsequencePredictor, PredictionResult, TranscriptConsequence,
+    vep_input_position, AlleleConsequenceResult, ConsequencePredictor, PredictionResult, TranscriptConsequence,
 };

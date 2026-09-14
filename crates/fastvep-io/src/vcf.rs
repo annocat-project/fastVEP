@@ -171,24 +171,36 @@ pub fn parse_vcf_line(line: &str) -> Result<VariationFeature> {
                     .collect();
             }
         } else {
-            // Single alt indel: strip shared first base
+            // VEP 115 Parser::post_process_vfs calls minimise_alleles for
+            // biallelic indels: trim the common prefix before the suffix.
+            // Do this before annotation so CDS windows and HGVS use the same
+            // allele coordinates. Original VCF fields remain available below.
             let alt = &alt_allele_strs[0];
-            if !ref_allele_str.is_empty()
-                && !alt.is_empty()
-                && ref_allele_str.as_bytes()[0] == alt.as_bytes()[0]
+            let reference = ref_allele_str.as_bytes();
+            let alternate = alt.as_bytes();
+            let prefix = reference.iter().zip(alternate).take_while(|(a, b)| a == b).count();
+            let mut ref_end = reference.len();
+            let mut alt_end = alternate.len();
+            while ref_end > prefix && alt_end > prefix
+                && reference[ref_end - 1] == alternate[alt_end - 1]
             {
-                ref_allele_str = if ref_allele_str.len() > 1 {
-                    ref_allele_str[1..].to_string()
-                } else {
-                    "-".to_string()
-                };
-                alt_allele_strs[0] = if alt.len() > 1 {
-                    alt[1..].to_string()
-                } else {
-                    "-".to_string()
-                };
-                start += 1;
+                ref_end -= 1;
+                alt_end -= 1;
             }
+            let trimmed_alt = if alt_end == prefix { "-" } else { &alt[prefix..alt_end] }.to_string();
+            ref_allele_str = if ref_end == prefix { "-" } else { &ref_allele_str[prefix..ref_end] }.to_string();
+            alt_allele_strs[0] = trimmed_alt;
+            start += prefix as u64;
+        }
+    }
+
+    // VEP Parser::next validates after create_VariationFeatures and its
+    // case-sensitive trimming. validate_vf then uppercases sequence alleles.
+    // Keep the original VCF fields below unchanged.
+    if !has_symbolic {
+        ref_allele_str.make_ascii_uppercase();
+        for allele in &mut alt_allele_strs {
+            allele.make_ascii_uppercase();
         }
     }
 
@@ -267,7 +279,7 @@ pub fn parse_vcf_line(line: &str) -> Result<VariationFeature> {
         vcf_fields: Some(vcf_fields),
         transcript_variations: Vec::new(),
         existing_variants: Vec::new(),
-        minimised: false,
+        minimised: !has_symbolic && !is_non_variant,
         most_severe_consequence: None,
         variant_type,
         sv_end,
@@ -350,6 +362,25 @@ fn classify_small_variant(ref_allele: &Allele, alt_alleles: &[Allele]) -> Varian
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lowercase_alleles_are_uppercased_after_trimming() {
+        for (reference, alternate, start, end, alleles) in [
+            ("a", "g", 100, 100, "A/G"),
+            ("a", "at", 101, 100, "-/T"),
+            ("a", "AT", 100, 100, "A/AT"),
+            ("A", "at", 100, 100, "A/AT"),
+            ("a", "at,an", 101, 100, "-/T/N"),
+        ] {
+            let line = format!("1\t100\t.\t{reference}\t{alternate}\t.\tPASS\t.");
+            let vf = parse_vcf_line(&line).unwrap();
+            assert_eq!((vf.position.start, vf.position.end), (start, end));
+            assert_eq!(vf.allele_string, alleles);
+            let original = vf.vcf_fields.unwrap();
+            assert_eq!(original.ref_allele, reference);
+            assert_eq!(original.alt, alternate);
+        }
+    }
 
     #[test]
     fn test_parse_snv() {
@@ -474,6 +505,26 @@ mod tests {
         assert_eq!(variants.len(), 2);
         assert_eq!(variants[0].position.start, 100);
         assert_eq!(variants[1].position.start, 200);
+    }
+
+    #[test]
+    fn biallelic_indels_trim_prefix_then_suffix_before_annotation() {
+        for (reference, alternate, start, end, alleles) in [
+            ("GGAA", "GGAAA", 104, 103, "-/A"),
+            ("GAAGC", "GAAG", 104, 104, "C/-"),
+            ("CAT", "CGGAT", 101, 100, "-/GG"),
+            ("GAT", "GCT", 100, 102, "GAT/GCT"),
+            ("GGAA", "GGAAA,GGAC", 101, 103, "GAA/GAAA/GAC"),
+        ] {
+            let line = format!("1\t100\t.\t{reference}\t{alternate}\t.\tPASS\t.");
+            let vf = parse_vcf_line(&line).unwrap();
+            assert_eq!((vf.position.start, vf.position.end), (start, end));
+            assert_eq!(vf.allele_string, alleles);
+            let original = vf.vcf_fields.as_ref().unwrap();
+            assert_eq!(original.pos, 100);
+            assert_eq!(original.ref_allele, reference);
+            assert_eq!(original.alt, alternate);
+        }
     }
 
     #[test]

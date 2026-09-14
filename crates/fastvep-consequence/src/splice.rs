@@ -68,12 +68,81 @@ fn overlaps(var_start: u64, var_end: u64, site_start: u64, site_end: u64) -> boo
 ///
 /// And what is matched against a site is not the variant's span but the parts
 /// of it that differ; see [`for_each_differing_region`].
+#[cfg(test)]
 pub fn splice_effects(
     transcript: &Transcript,
     var_start: u64,
     var_end: u64,
     ref_allele: &Allele,
     alt_allele: &Allele,
+) -> SpliceEffects {
+    let touches_exon = overlaps_exon_for_consequence_predicates(transcript, var_start, var_end);
+    splice_effects_preclassified(
+        transcript,
+        var_start,
+        var_end,
+        ref_allele,
+        alt_allele,
+        touches_exon,
+    )
+}
+
+/// Whether VEP 115 preclassifies a variant as exonic.
+///
+/// A transcript containing any intron whose coordinate difference is at most
+/// 12 (a genomic length of at most 13 bases) makes VEP stretch every exon by 12
+/// bases for this one predicate. Exact EXON output remains unstretched.
+pub(crate) fn overlaps_exon_for_consequence_predicates(
+    transcript: &Transcript,
+    var_start: u64,
+    var_end: u64,
+) -> bool {
+    let mut has_frameshift_intron = false;
+    for_each_intron(transcript, |start, end| {
+        has_frameshift_intron |= end - start <= 12;
+    });
+    if !has_frameshift_intron && var_end.checked_add(1) == Some(var_start) {
+        return matches!(
+            (transcript.exon_at(var_end), transcript.exon_at(var_start)),
+            (Some(left), Some(right)) if left == right
+        );
+    }
+
+    let stretch = u64::from(has_frameshift_intron) * 12;
+    let (start, end) = (var_start.min(var_end), var_start.max(var_end));
+    transcript.exons.iter().any(|exon| {
+        overlaps(
+            start,
+            end,
+            exon.start.saturating_sub(stretch),
+            exon.end.saturating_add(stretch),
+        )
+    })
+}
+
+/// Whether the variant itself lies in one of VEP 115's frameshift introns.
+/// This is narrower than exon preclassification: one short intron stretches
+/// every exon for candidate selection, but only a variant inside that short
+/// intron is treated as coding or cDNA sequence.
+pub(crate) fn within_frameshift_intron(
+    transcript: &Transcript,
+    var_start: u64,
+    var_end: u64,
+) -> bool {
+    let mut within = false;
+    for_each_intron(transcript, |start, end| {
+        within |= end - start <= 12 && overlaps(var_start, var_end, start, end);
+    });
+    within
+}
+
+pub(crate) fn splice_effects_preclassified(
+    transcript: &Transcript,
+    var_start: u64,
+    var_end: u64,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    touches_exon: bool,
 ) -> SpliceEffects {
     // Which introns are looked at is decided by the variant's *whole* span, not
     // by the differing regions: Ensembl selects the intron lists once from
@@ -88,11 +157,6 @@ pub fn splice_effects(
     // predicate runs: `include => { exon => 0, intron => 1 }` in
     // `Utils/Config.pm`, so a delins that starts in an exon and runs into the
     // tract earns an acceptor term and no tract term.
-    let mut touches_exon = false;
-    for exon in &transcript.exons {
-        touches_exon |= overlaps(var_start, var_end, exon.start, exon.end);
-    }
-
     let mut start_site = false;
     let mut end_site = false;
     let mut fifth = false;
@@ -103,6 +167,7 @@ pub fn splice_effects(
     let mut polypy_rev = false;
     let mut region = false;
     let mut intronic = false;
+    let mut boundary_order = None;
 
     // Regions outside, introns inside - the nesting Ensembl uses, and it is
     // observable. `splice_region` is *assigned* rather than or-assigned on each
@@ -121,11 +186,13 @@ pub fn splice_effects(
             // Ensembl's zero-length interval for an insertion; see `overlaps`.
             let insertion = r_end + 1 == r_start;
             let (lo, hi) = (r_start.min(r_end), r_start.max(r_end));
+            let (selection_start, selection_end) = (var_start.min(var_end), var_start.max(var_end));
             for_each_intron(transcript, |intron_start, intron_end| {
-                // An intron short enough to be a frameshift intron - 12 bases or
-                // fewer - is skipped whole: Ensembl treats a variant inside one as
+                // VEP marks an intron as frameshifting when the difference
+                // between its inclusive endpoints is at most 12 (so its genomic
+                // length is at most 13 bases), then treats variants inside it as
                 // exonic rather than spliced.
-                if intron_end - intron_start < 12
+                if intron_end - intron_start <= 12
                     && overlaps(r_start, r_end, intron_start, intron_end)
                 {
                     return;
@@ -134,12 +201,12 @@ pub fn splice_effects(
                 // `_overlapped_introns`: the intron plus a 3-base flank. Only the
                 // polypyrimidine tract and `intronic` are read from this set.
                 if overlaps(
-                    var_start,
-                    var_end,
+                    selection_start,
+                    selection_end,
                     intron_start.saturating_sub(3),
                     intron_end + 3,
                 ) {
-                    intronic |= overlaps(r_start, r_end, intron_start + 2, back(2))
+                    intronic |= overlaps(lo, hi, intron_start + 2, back(2))
                         || (insertion && (r_start == intron_start + 2 || r_end == back(2)));
                     // The two polypyrimidine tests are the only ones Ensembl runs
                     // against the *sorted* pair - `_intron_effects` swaps `$start`
@@ -162,13 +229,13 @@ pub fn splice_effects(
                 // reported `splice_donor_variant` for a frameshift five bases inside
                 // an exon, on the strength of padding that reached the donor.
                 if !(overlaps(
-                    var_start,
-                    var_end,
+                    selection_start,
+                    selection_end,
                     intron_start.saturating_sub(3),
                     intron_start + 7,
                 ) || overlaps(
-                    var_start,
-                    var_end,
+                    selection_start,
+                    selection_end,
                     intron_end.saturating_sub(7),
                     intron_end + 3,
                 )) {
@@ -180,10 +247,18 @@ pub fn splice_effects(
                 fifth_rev |= overlaps(r_start, r_end, back(4), back(4));
                 donor_region |= overlaps(r_start, r_end, intron_start + 2, intron_start + 5);
                 donor_region_rev |= overlaps(r_start, r_end, back(5), back(2));
-                if !start_site && !end_site {
-                    region = intron_overlap(r_start, r_end, intron_start, intron_end, insertion);
-                }
             });
+            if !start_site && !end_site {
+                // Set::IntervalTree returns matching nodes in tree preorder,
+                // not transcript order. Only this overwritten flag observes it.
+                let introns = boundary_order.get_or_insert_with(||
+                    vep_boundary_introns(transcript, selection_start, selection_end));
+                if let Some(&(start, end)) = introns.iter().rev().find(|&&(start, end)|
+                    end - start > 12 || !overlaps(r_start, r_end, start, end))
+                {
+                    region = intron_overlap(r_start, r_end, start, end, insertion);
+                }
+            }
         },
     );
 
@@ -356,10 +431,131 @@ where
     }
 }
 
+// VEP BaseTranscriptVariation::_create_intron_trees inserts both boundaries
+// in transcript order. Set::IntervalTree 0.12 uses conventional red-black
+// insertion (equal keys go right), then root/left/right traversal for fetch.
+// Stdlib ordered maps do not expose that topology. Keep only the insertion
+// topology here; range pruning and tree mutation APIs are unnecessary.
+fn vep_boundary_introns(transcript: &Transcript, low: u64, high: u64) -> Vec<(u64, u64)> {
+    let mut boundaries = Vec::new();
+    for_each_intron(transcript, |start, end| {
+        boundaries.push((i128::from(start) - 3, i128::from(start) + 7, (start, end)));
+        boundaries.push((i128::from(end) - 7, i128::from(end) + 3, (start, end)));
+    });
+    let selected_boundary = |i: usize| i128::from(low) <= boundaries[i].1
+        && boundaries[i].0 <= i128::from(high);
+    let selected: Vec<_> = boundaries.iter().enumerate()
+        .filter(|&(i, _)| selected_boundary(i))
+        .map(|(i, _)| i).collect();
+    if selected.iter().all(|&i| boundaries[i].2 == boundaries[*selected.first().unwrap()].2) {
+        return selected.into_iter().map(|i| boundaries[i].2).collect();
+    }
+    vep_interval_preorder(&boundaries.iter().map(|b| b.0).collect::<Vec<_>>())
+        .into_iter().filter(|&i| selected_boundary(i))
+        .map(|i| boundaries[i].2).collect()
+}
+
+fn vep_interval_preorder(keys: &[i128]) -> Vec<usize> {
+    #[derive(Clone, Default)]
+    struct Node { child: [usize; 2], parent: usize, red: bool }
+    // Index zero is the black nil sentinel; real nodes retain insertion index+1.
+    let mut nodes = vec![Node::default(); keys.len() + 1];
+    let mut root = 0;
+    fn rotate(nodes: &mut [Node], root: &mut usize, x: usize, side: usize) {
+        let y = nodes[x].child[1 - side];
+        let middle = nodes[y].child[side];
+        nodes[x].child[1 - side] = middle;
+        if middle != 0 { nodes[middle].parent = x; }
+        let parent = nodes[x].parent;
+        nodes[y].parent = parent;
+        if parent == 0 { *root = y; }
+        else {
+            let edge = usize::from(nodes[parent].child[1] == x);
+            nodes[parent].child[edge] = y;
+        }
+        nodes[y].child[side] = x;
+        nodes[x].parent = y;
+    }
+    for index in 0..keys.len() {
+        let mut parent = 0;
+        let mut cursor = root;
+        let mut side = 0;
+        while cursor != 0 {
+            parent = cursor;
+            side = usize::from(keys[index] >= keys[cursor - 1]);
+            cursor = nodes[cursor].child[side];
+        }
+        let mut x = index + 1;
+        nodes[x].parent = parent;
+        nodes[x].red = true;
+        if parent == 0 { root = x; } else { nodes[parent].child[side] = x; }
+        while nodes[nodes[x].parent].red {
+            let parent = nodes[x].parent;
+            let grandparent = nodes[parent].parent;
+            let side = usize::from(nodes[grandparent].child[1] == parent);
+            let uncle = nodes[grandparent].child[1 - side];
+            if nodes[uncle].red {
+                nodes[parent].red = false;
+                nodes[uncle].red = false;
+                nodes[grandparent].red = true;
+                x = grandparent;
+            } else {
+                if nodes[parent].child[1 - side] == x {
+                    x = parent;
+                    rotate(&mut nodes, &mut root, x, side);
+                }
+                let parent = nodes[x].parent;
+                let grandparent = nodes[parent].parent;
+                nodes[parent].red = false;
+                nodes[grandparent].red = true;
+                rotate(&mut nodes, &mut root, grandparent, 1 - side);
+            }
+        }
+        nodes[root].red = false;
+    }
+    let mut order = Vec::with_capacity(keys.len());
+    let mut stack = vec![root];
+    while let Some(x) = stack.pop() {
+        if x == 0 { continue; }
+        order.push(x - 1);
+        stack.push(nodes[x].child[1]);
+        stack.push(nodes[x].child[0]);
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fastvep_genome::{Exon, Gene, Transcript, Translation};
+
+    #[test]
+    fn boundary_order_matches_vep_interval_tree_012() {
+        // Captured from the same installed Set::IntervalTree 0.12 as VEP.
+        // Ascending, reverse transcript pairs, duplicate keys, and mixed keys.
+        for (keys, expected) in [
+            (vec![], vec![]), (vec![10], vec![0]),
+            (vec![10, 20, 30, 40], vec![1, 0, 2, 3]),
+            (vec![30, 40, 10, 20], vec![0, 2, 3, 1]),
+            (vec![10, 10, 10, 10], vec![1, 0, 2, 3]),
+            (vec![60, 70, 40, 50, 20, 30, 0, 10], vec![2, 4, 6, 7, 5, 0, 3, 1]),
+            (vec![5, 0, 5, 3, 9, 1, 4, 8, 2, 7, 6], vec![0, 5, 1, 3, 8, 6, 7, 10, 2, 9, 4]),
+        ] {
+            assert_eq!(vep_interval_preorder(&keys), expected);
+        }
+        // Verified P21 source trace, reverse strand, spanning two introns.
+        let mut tr = make_forward_transcript();
+        tr.strand = Strand::Reverse;
+        tr.exons = [(54184161, 54184261), (54179149, 54179352), (54174700, 54174822)]
+            .into_iter().enumerate().map(|(i, (start, end))| Exon {
+                stable_id: format!("E{i}"), start, end, strand: Strand::Reverse,
+                phase: 0, end_phase: 0, rank: (i + 1) as u32,
+            }).collect();
+        let (left, right) = ((54174823, 54179148), (54179353, 54184160));
+        assert_eq!(vep_boundary_introns(&tr, 54174818, 54184164), vec![right, left, left, right]);
+        assert_eq!(vep_boundary_introns(&tr, 54174820, 54174820), vec![left]);
+        assert!(vep_boundary_introns(&tr, 1, 2).is_empty());
+    }
 
     // One-site views of `splice_effects`, so each test reads as the question it
     // is asking. A single-base position is the degenerate span `(p, p)`.
@@ -463,7 +659,47 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
+    }
+
+    #[test]
+    fn a_short_intron_stretches_every_exon_for_preclassification() {
+        let mut tr = make_forward_transcript();
+        tr.exons.insert(
+            1,
+            Exon {
+                stable_id: "E_SHORT".into(),
+                start: 1202,
+                end: 1300,
+                strand: Strand::Forward,
+                phase: 0,
+                end_phase: 0,
+                rank: 2,
+            },
+        );
+
+        // The first intron is one base long. VEP consequently stretches every
+        // exon by 12 bases, including E2 at 2000, so this otherwise intronic
+        // position is preclassified as exonic.
+        assert!(overlaps_exon_for_consequence_predicates(&tr, 1990, 1990));
+        assert!(!effects(&tr, 1990, 1990).polypyrimidine_tract);
+
+        // Without the short intron, the same position is intronic and belongs
+        // to the acceptor polypyrimidine tract.
+        let ordinary = make_forward_transcript();
+        assert!(!overlaps_exon_for_consequence_predicates(
+            &ordinary, 1990, 1990
+        ));
+        assert!(effects(&ordinary, 1990, 1990).polypyrimidine_tract);
+    }
+
+    #[test]
+    fn vep_frameshift_intron_threshold_includes_thirteen_bases() {
+        let mut tr = make_forward_transcript();
+        tr.exons[1].start = 1214; // intron 1201..1213: end - start == 12
+
+        assert!(overlaps_exon_for_consequence_predicates(&tr, 1220, 1220));
     }
 
     #[test]
@@ -643,6 +879,7 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
     }
 

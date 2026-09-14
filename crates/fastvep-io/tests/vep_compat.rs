@@ -495,7 +495,7 @@ fn mock_vf_missense() -> VariationFeature {
                 protein_position: PositionRange::complete(2, 2),
                 amino_acids: Some(("K".into(), "Q".into())),
                 codons: Some(("Aag".into(), "Cag".into())),
-                exon: Some((2, 3)),
+                exon: Some((2, 2, 3)),
                 intron: None,
                 distance: None,
                 hgvsc: None,
@@ -598,7 +598,7 @@ fn test_csq_frameshift_codon_format() {
                 protein_position: PositionRange::complete(2, 2),
                 amino_acids: Some(("E".into(), "X".into())),
                 codons: Some(("gAg".into(), "gg".into())),
-                exon: Some((3, 28)),
+                exon: Some((3, 3, 28)),
                 intron: None,
                 distance: None,
                 hgvsc: None,
@@ -821,7 +821,7 @@ fn test_csq_frameshift_full_42_field_match() {
                 protein_position: PositionRange::complete(2, 2),
                 amino_acids: Some(("E".into(), "X".into())),
                 codons: Some(("gAg".into(), "gg".into())),
-                exon: Some((3, 5)),
+                exon: Some((3, 3, 5)),
                 intron: None,
                 distance: None,
                 hgvsc: None,
@@ -1055,7 +1055,7 @@ fn test_csq_intron_variant_match() {
                 amino_acids: None,
                 codons: None,
                 exon: None,
-                intron: Some((1, 5)),
+                intron: Some((1, 1, 5)),
                 distance: None,
                 hgvsc: None,
                 hgvsp: None,
@@ -1114,4 +1114,7 @@ fn test_csq_intron_variant_match() {
     assert_eq!(fields[27], "NM_004300.4");
     assert_eq!(fields[29], "1"); // TSL (shifted +1)
     assert_eq!(fields[30], "P3"); // APPRIS (shifted +1)
+    let mut range_variant = vf.clone();
+    range_variant.transcript_variations[0].allele_annotations[0].intron = Some((1, 2, 5));
+    assert_eq!(output::format_csq(&range_variant, output::DEFAULT_CSQ_FIELDS).split('|').nth(9), Some("1-2/5"));
 }

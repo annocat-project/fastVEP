@@ -144,6 +144,7 @@ fn predict_sv_for_transcript(
             normalized_ref_allele: Allele::Deletion,
             normalized_alt_allele: allele.clone(),
             consequences: vec![consequence],
+            frameshift: consequence == Consequence::FrameshiftVariant,
             impact: consequence.impact(),
             cdna_start: None,
             cdna_end: None,
@@ -185,6 +186,7 @@ fn predict_sv_for_transcript(
         ),
         normalized_ref_allele: Allele::Deletion,
         normalized_alt_allele: allele.clone(),
+        frameshift: consequences.contains(&Consequence::FrameshiftVariant),
         consequences,
         impact,
         cdna_start: None,
@@ -382,6 +384,7 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
     }
 

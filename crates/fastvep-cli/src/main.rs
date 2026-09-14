@@ -170,6 +170,13 @@ enum Commands {
 
     /// Build a binary transcript cache for fast startup
     Cache {
+        /// Pinned public Ensembl Core source manifest for an AnnoCAT cache build.
+        #[arg(long, requires = "ensembl_core_dir")]
+        ensembl_core_manifest: Option<String>,
+
+        /// Directory containing the manifest's verified Core downloads.
+        #[arg(long, requires = "ensembl_core_manifest")]
+        ensembl_core_dir: Option<String>,
         /// GFF3 annotation file(s). May be repeated or comma-separated to
         /// build a merged cache (Ensembl + RefSeq); each value may be
         /// `LABEL=path` to control the SOURCE column.
@@ -391,19 +398,36 @@ fn main() -> Result<()> {
             )?;
         }
         Commands::Cache {
+            ensembl_core_manifest,
+            ensembl_core_dir,
             gff3,
             fasta,
             synonyms,
             output,
             no_progress,
         } => {
-            pipeline::run_cache_build(
-                &gff3,
-                fasta.as_deref(),
-                synonyms.as_deref(),
-                &output,
-                !no_progress,
-            )?;
+            if let Some(manifest) = ensembl_core_manifest {
+                let _cache_build_lock = pipeline::acquire_cache_build_lock(&output)?;
+                anyhow::ensure!(gff3.len()==1 && fasta.is_some() && synonyms.is_none(),
+                    "A public Ensembl cache requires one GFF3, an indexed FASTA, and no synonym override");
+                let spec = pipeline::parse_gff3_arg(&gff3[0]);
+                let header = fastvep_cache::ensembl_core::build(
+                    std::path::Path::new(&spec.path),
+                    std::path::Path::new(fasta.as_deref().unwrap()),
+                    std::path::Path::new(ensembl_core_dir.as_deref().unwrap()),
+                    std::path::Path::new(&manifest),
+                    std::path::Path::new(&output),
+                )?;
+                println!("{}", serde_json::to_string(&header)?);
+            } else {
+                pipeline::run_cache_build(
+                    &gff3,
+                    fasta.as_deref(),
+                    synonyms.as_deref(),
+                    &output,
+                    !no_progress,
+                )?;
+            }
         }
         Commands::CacheVerify {
             input,
