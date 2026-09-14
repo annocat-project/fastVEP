@@ -397,7 +397,10 @@ fn intronic_coord(
     // the exon. PVS1 reads that offset to decide whether a splice consequence
     // reached the canonical dinucleotide, and stood itself down on 15
     // ClinVar-pathogenic donor and acceptor deletions on the strength of it.
-    let anchor = if let Some(ce) = coding_end.filter(|&ce| cdna_pos > ce) {
+    let terminal_coding_anchor = coding_end == Some(cdna_pos) && offset != 0;
+    let anchor = if terminal_coding_anchor {
+        "*".to_string()
+    } else if let Some(ce) = coding_end.filter(|&ce| cdna_pos > ce) {
         format!("*{}", cdna_pos - ce)
     } else {
         let raw = cdna_pos as i64 - coding_start as i64 + 1;
@@ -405,6 +408,7 @@ fn intronic_coord(
         format!("{}", if raw <= 0 { raw - 1 } else { raw })
     };
     match offset.cmp(&0) {
+        std::cmp::Ordering::Greater if terminal_coding_anchor => format!("{}{}", anchor, offset),
         std::cmp::Ordering::Greater => format!("{}+{}", anchor, offset),
         std::cmp::Ordering::Less => format!("{}{}", anchor, offset),
         std::cmp::Ordering::Equal => anchor,
@@ -765,6 +769,25 @@ mod tests {
             None,
         );
         assert_eq!(result, Some("ENST00000001:c.152-3A>G".to_string()));
+    }
+
+    #[test]
+    fn intron_at_terminal_coding_base_uses_vep_star_anchor() {
+        let allele = Allele::Sequence(b"A".to_vec());
+        let alternate = Allele::Sequence(b"G".to_vec());
+
+        assert_eq!(
+            hgvsc_intronic("ENST1", 100, 2, &allele, &alternate, 1, Some(100)),
+            Some("ENST1:c.*2A>G".to_string())
+        );
+        assert_eq!(
+            hgvsc_intronic("ENST1", 100, -3, &allele, &alternate, 1, Some(100)),
+            Some("ENST1:c.*-3A>G".to_string())
+        );
+        assert_eq!(
+            hgvsc_intronic("ENST1", 100, 0, &allele, &alternate, 1, Some(100)),
+            Some("ENST1:c.100A>G".to_string())
+        );
     }
 
     #[test]

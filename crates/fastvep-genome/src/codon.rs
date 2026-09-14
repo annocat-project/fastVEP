@@ -3,6 +3,7 @@ use std::collections::HashMap;
 /// Standard genetic code codon translation table.
 pub struct CodonTable {
     table: HashMap<[u8; 3], u8>,
+    ncbi_table: u8,
 }
 
 impl CodonTable {
@@ -100,7 +101,10 @@ impl CodonTable {
         for (codon, aa) in codons {
             table.insert(*codon, aa);
         }
-        Self { table }
+        Self {
+            table,
+            ncbi_table: 1,
+        }
     }
 
     /// Create a codon table from an NCBI translation table number.
@@ -115,6 +119,7 @@ impl CodonTable {
             table.table.insert(*b"AGG", b'*');
             table.table.insert(*b"ATA", b'M');
             table.table.insert(*b"TGA", b'W');
+            table.ncbi_table = 2;
         }
         table
     }
@@ -145,6 +150,30 @@ impl CodonTable {
     /// Check if a codon is a stop codon.
     pub fn is_stop(&self, codon: &[u8; 3]) -> bool {
         self.translate(codon) == b'*'
+    }
+
+    /// Check whether BioPerl recognizes this codon as an initiator for the
+    /// selected NCBI translation table. Ensembl uses this rule to normalize
+    /// the first residue of a reference translation to methionine.
+    pub fn is_start_codon(&self, codon: &[u8; 3]) -> bool {
+        let upper = [
+            codon[0].to_ascii_uppercase(),
+            codon[1].to_ascii_uppercase(),
+            codon[2].to_ascii_uppercase(),
+        ];
+        match self.ncbi_table {
+            2 => matches!(&upper, b"ATG" | b"GTG" | b"ATT" | b"ATC" | b"ATA"),
+            _ => matches!(&upper, b"ATG" | b"CTG" | b"TTG"),
+        }
+    }
+
+    /// Apply Ensembl's reference-translation initiator normalization.
+    pub fn normalize_reference_initiator(&self, peptide: &mut [u8], cds: &[u8]) {
+        if let (Some(first), Some([a, b, c])) = (peptide.first_mut(), cds.get(..3)) {
+            if *first != b'M' && self.is_start_codon(&[*a, *b, *c]) {
+                *first = b'M';
+            }
+        }
     }
 
     /// Check if a codon is the standard start codon (ATG).
@@ -316,5 +345,13 @@ mod tests {
         assert!(!table.is_stop(b"ATG"));
         assert!(CodonTable::is_start(b"ATG"));
         assert!(!CodonTable::is_start(b"TTT"));
+        assert!(table.is_start_codon(b"CTG"));
+        assert!(table.is_start_codon(b"TTG"));
+        assert!(!table.is_start_codon(b"GTG"));
+
+        let mitochondrial = CodonTable::from_ncbi_table(2);
+        assert!(mitochondrial.is_start_codon(b"ATT"));
+        assert!(mitochondrial.is_start_codon(b"GTG"));
+        assert!(!mitochondrial.is_start_codon(b"CTG"));
     }
 }

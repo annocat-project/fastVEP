@@ -340,6 +340,7 @@ fn parse_gff3_lines(lines: impl Iterator<Item = Result<String>>) -> Result<Vec<T
             | "C_gene_segment"
             | "NMD_transcript_variant"
             | "pseudogenic_transcript"
+            | "processed_transcript"
             | "unconfirmed_transcript" => {
                 let transcript_id = attrs
                     .get("ID")
@@ -812,6 +813,7 @@ fn parse_gff3_lines(lines: impl Iterator<Item = Result<String>>) -> Result<Vec<T
             gencode_primary: gff_tr.gencode_primary,
             flags: gff_tr.flags.clone(),
             codon_table_start_phase: first_cds_ensembl_phase,
+            reference_peptide: None,
         });
     }
 
@@ -1156,5 +1158,15 @@ chr1\tensembl\tCDS\t1050\t1200\t.\t+\t0\tID=CDS:P1;Parent=transcript:TX3";
         let bad = ">\nACGT\n";
         let res = crate::fasta::FastaReader::from_reader(bad.as_bytes());
         assert!(res.is_err(), "FASTA with empty header should fail to parse");
+    }
+
+    #[test]
+    fn processed_transcript_features_preserve_membership_and_exons() {
+        let gff = "1\tensembl\tgene\t10\t30\t.\t+\t.\tID=gene:ENSG1;biotype=processed_transcript\n1\tensembl\tprocessed_transcript\t10\t30\t.\t+\t.\tID=transcript:ENST1;Parent=gene:ENSG1;biotype=processed_transcript\n1\tensembl\texon\t10\t30\t.\t+\t.\tID=exon:ENSE1;Parent=transcript:ENST1;rank=1\n";
+        let transcripts = parse_gff3(gff.as_bytes()).unwrap();
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].stable_id.as_ref(), "ENST1");
+        assert_eq!(transcripts[0].exons.len(), 1);
+        assert!(!transcripts[0].is_coding());
     }
 }

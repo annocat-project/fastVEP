@@ -46,6 +46,10 @@ pub struct Transcript {
     pub spliced_seq: Option<String>,
     pub translateable_seq: Option<String>,
     pub peptide: Option<String>,
+    /// Full-reference initiator normalization for HGVS, when it differs from
+    /// the consequence peptide. Derived from CDS and source edits on load.
+    #[serde(skip)]
+    pub reference_peptide: Option<String>,
 
     // Annotation metadata
     pub canonical: bool,
@@ -209,6 +213,8 @@ impl Transcript {
                     CodonTable::standard()
                 };
                 let mut peptide_bytes = codon_table.translate_seq(translateable.as_bytes());
+                codon_table
+                    .normalize_reference_initiator(&mut peptide_bytes, translateable.as_bytes());
                 resolve_readthrough_selenocysteine(
                     &mut peptide_bytes,
                     translateable.as_bytes(),
@@ -264,6 +270,16 @@ impl Transcript {
             }
         }
         None
+    }
+
+    /// First/last overlapping exon ranks (0-indexed), and total exons.
+    pub fn exon_range_overlapping(&self, start: u64, end: u64) -> Option<(usize, usize, usize)> {
+        let sorted = self.sorted_exons();
+        let mut ranks = sorted.iter().enumerate()
+            .filter(|(_, exon)| start <= exon.end && end >= exon.start)
+            .map(|(rank, _)| rank);
+        let first = ranks.next()?;
+        Some((first, ranks.last().unwrap_or(first), sorted.len()))
     }
 
     /// Map a genomic position in an intron to HGVSc offset notation.
@@ -353,21 +369,37 @@ impl Transcript {
         None
     }
 
-    /// Check if a genomic range overlaps an intron.
-    pub fn intron_overlapping(&self, range_start: u64, range_end: u64) -> Option<(usize, usize)> {
+    /// First/last overlapping intron ranks (0-indexed), and total introns.
+    pub fn intron_overlapping(&self, range_start: u64, range_end: u64) -> Option<(usize, usize, usize)> {
         let (start, end) = (range_start.min(range_end), range_start.max(range_end));
         let sorted = self.sorted_exons();
         let n_introns = sorted.len().saturating_sub(1);
+        let mut first = None;
+        let mut last = 0;
         for i in 0..n_introns {
             let (intron_start, intron_end) = match self.strand {
                 Strand::Forward => (sorted[i].end + 1, sorted[i + 1].start - 1),
                 Strand::Reverse => (sorted[i + 1].end + 1, sorted[i].start - 1),
             };
             if start <= intron_end && end >= intron_start {
-                return Some((i, n_introns));
+                first.get_or_insert(i);
+                last = i;
             }
         }
-        None
+        first.map(|first| (first, last, n_introns))
+    }
+}
+
+/// Spliced insertion offset in cDNA or CDS space. Endpoints retain genomic
+/// order; Mapper::map_insert reconstructs an interval from a sole exon flank.
+pub fn insertion_point(start: Option<u64>, end: Option<u64>, strand: Strand) -> Option<u64> {
+    match (start, end) {
+        (Some(s), Some(e)) if s.min(e).checked_add(1) == Some(s.max(e)) => Some(s.min(e)),
+        (Some(s), None) if strand == Strand::Reverse => Some(s),
+        (Some(s), None) => s.checked_sub(1),
+        (None, Some(e)) if strand == Strand::Forward => Some(e),
+        (None, Some(e)) => e.checked_sub(1),
+        _ => None,
     }
 }
 
@@ -520,6 +552,7 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
     }
 
@@ -584,9 +617,14 @@ mod tests {
     #[test]
     fn test_intron_overlapping() {
         let tr = make_test_transcript();
-        assert_eq!(tr.intron_overlapping(1200, 1201), Some((0, 2)));
-        assert_eq!(tr.intron_overlapping(2300, 4000), Some((1, 2)));
+        assert_eq!(tr.intron_overlapping(1200, 1201), Some((0, 0, 2)));
+        assert_eq!(tr.intron_overlapping(2300, 4000), Some((1, 1, 2)));
         assert_eq!(tr.intron_overlapping(1000, 1200), None);
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let mut tr = tr.clone();
+            tr.strand = strand;
+            assert_eq!(tr.intron_overlapping(1500, 3000), Some((0, 1, 2)));
+        }
     }
 
     #[test]

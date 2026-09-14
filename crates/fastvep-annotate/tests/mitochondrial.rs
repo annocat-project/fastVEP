@@ -80,6 +80,7 @@ fn mt_transcript(exon_start: u64, exon_end: u64, cds_len: u64) -> Transcript {
         gencode_primary: false,
         flags: vec![],
         codon_table_start_phase: 0,
+        reference_peptide: None,
     }
 }
 

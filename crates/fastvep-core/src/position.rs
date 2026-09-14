@@ -156,6 +156,16 @@ impl Allele {
         }
     }
 
+    /// Whether this allele can supply a defined VEP peptide (deletions included).
+    pub fn is_unambiguous_dna(&self) -> bool {
+        match self {
+            Self::Sequence(bases) => !bases.is_empty()
+                && bases.iter().all(|b| matches!(b.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T')),
+            Self::Deletion => true,
+            Self::Missing | Self::Symbolic(_) => false,
+        }
+    }
+
     /// Returns true if this is a symbolic allele (e.g., `<DEL>`, `<DUP>`).
     pub fn is_symbolic(&self) -> bool {
         matches!(self, Allele::Symbolic(_))

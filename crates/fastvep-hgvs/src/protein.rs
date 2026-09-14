@@ -1,6 +1,17 @@
 use fastvep_core::{Allele, Strand};
 use fastvep_genome::codon::{aa_one_to_three, CodonTable};
 
+// VEP 115.2 converts BioPerl's Xaa spelling to Ter immediately before it
+// formats protein HGVS. Keep the conversion local to HGVSp: Amino_acids still
+// uses X to represent the translated cache value.
+fn hgvs_aa_one_to_three(aa: u8) -> &'static str {
+    if aa == b'X' {
+        "Ter"
+    } else {
+        aa_one_to_three(aa)
+    }
+}
+
 /// Generate HGVSp (protein) notation.
 ///
 /// Format: ENSP00000001:p.Arg41Lys (missense)
@@ -15,18 +26,18 @@ pub fn hgvsp(
     is_frameshift: bool,
 ) -> Option<String> {
     let prefix = format!("{}:p.", protein_id);
-    let ref_aa3 = aa_one_to_three(ref_aa);
+    let ref_aa3 = hgvs_aa_one_to_three(ref_aa);
 
     if is_frameshift {
         return Some(format!("{}{}{}fs", prefix, ref_aa3, protein_pos));
     }
 
-    if ref_aa == alt_aa {
+    if ref_aa3 == hgvs_aa_one_to_three(alt_aa) {
         // Synonymous
         return Some(format!("{}{}{}=", prefix, ref_aa3, protein_pos));
     }
 
-    let alt_aa3 = aa_one_to_three(alt_aa);
+    let alt_aa3 = hgvs_aa_one_to_three(alt_aa);
 
     if alt_aa == b'*' {
         // Stop gained
@@ -42,13 +53,36 @@ pub fn hgvsp(
     Some(format!("{}{}{}{}", prefix, ref_aa3, protein_pos, alt_aa3))
 }
 
+/// Format the protein uncertainty for a consequence already classified as
+/// `start_lost`. VEP applies that predicate before its protein formatter; the
+/// formatter clips common peptide ends and does not infer the consequence from
+/// placeholder residues.
+pub fn hgvsp_start_lost(
+    protein_id: &str,
+    protein_start: u64,
+    ref_aas: &str,
+    alt_aas: &str,
+    ref_peptide: Option<&[u8]>,
+) -> Option<String> {
+    hgvsp_inframe_indel_with_context(
+        protein_id,
+        protein_start,
+        protein_start + ref_aas.len().saturating_sub(1) as u64,
+        ref_aas,
+        alt_aas,
+        ref_peptide,
+        Strand::Forward,
+        true, None, None,
+)
+}
+
 /// Render a 1-based inclusive residue range, e.g. `Gly41` or `Asn587_Asp600`.
 fn residue_span(first_pos: u64, residues: &[u8]) -> String {
-    let first = aa_one_to_three(residues[0]);
+    let first = hgvs_aa_one_to_three(residues[0]);
     if residues.len() == 1 {
         format!("{}{}", first, first_pos)
     } else {
-        let last = aa_one_to_three(residues[residues.len() - 1]);
+        let last = hgvs_aa_one_to_three(residues[residues.len() - 1]);
         format!(
             "{}{}_{}{}",
             first,
@@ -75,7 +109,7 @@ fn residue_span(first_pos: u64, residues: &[u8]) -> String {
 /// count are the same number, so nothing here distinguishes them.
 fn uncertain_from_initiator(start: u64, residues: &[u8]) -> String {
     if residues.len() == 1 {
-        format!("{}{}?", aa_one_to_three(residues[0]), start)
+        format!("{}{}?", hgvs_aa_one_to_three(residues[0]), start)
     } else {
         format!(
             "{}{}_?{}",
@@ -87,7 +121,44 @@ fn uncertain_from_initiator(start: u64, residues: &[u8]) -> String {
 }
 
 fn three_letter(residues: &[u8]) -> String {
-    residues.iter().map(|&b| aa_one_to_three(b)).collect()
+    residues.iter().map(|&b| hgvs_aa_one_to_three(b)).collect()
+}
+
+// VEP clips the complete peptide pair first, then its final ins/delins
+// formatter removes anything after the first translated terminator.
+fn through_terminator(residues: &[u8]) -> &[u8] {
+    match residues
+        .iter()
+        .position(|&residue| matches!(residue, b'*' | b'X'))
+    {
+        Some(stop) => &residues[..=stop],
+        None => residues,
+    }
+}
+
+fn clip_residues(
+    mut reference: Vec<u8>,
+    mut alternate: Vec<u8>,
+    mut start: u64,
+) -> (Vec<u8>, Vec<u8>, u64) {
+    // VEP _clip_alleles returns the untouched notation if prefix scanning
+    // reaches a recreated stop, before committing any preceding prefix trim.
+    if reference.iter().zip(&alternate)
+        .take_while(|(r, a)| r == a)
+        .any(|(r, _)| *r == b'*')
+    {
+        return (reference, alternate, start);
+    }
+    while !reference.is_empty() && !alternate.is_empty() && reference[0] == alternate[0] {
+        reference.remove(0);
+        alternate.remove(0);
+        start += 1;
+    }
+    while !reference.is_empty() && !alternate.is_empty() && reference.last() == alternate.last() {
+        reference.pop();
+        alternate.pop();
+    }
+    (reference, alternate, start)
 }
 
 /// Describe the change using only the residues the caller supplied, without
@@ -97,13 +168,20 @@ fn three_letter(residues: &[u8]) -> String {
 fn unshifted_description(
     prefix: &str,
     start: u64,
+    end: u64,
     reference: &[u8],
     alternate: &[u8],
 ) -> Option<String> {
     if reference.is_empty() {
         return None;
     }
-    let range = residue_span(start, reference);
+    // VEP peptide() suppresses a partial X after a sole stop, but keeps the
+    // translation endpoints. Its delins formatter still names both endpoints.
+    let range = if reference == b"*" && end > start && !alternate.is_empty() {
+        format!("Ter{}_Ter{}", start, end)
+    } else {
+        residue_span(start, reference)
+    };
     if alternate.is_empty() {
         Some(format!("{}{}del", prefix, range))
     } else {
@@ -111,7 +189,7 @@ fn unshifted_description(
             "{}{}delins{}",
             prefix,
             range,
-            three_letter(alternate)
+            three_letter(through_terminator(alternate))
         ))
     }
 }
@@ -221,13 +299,11 @@ fn anchor_candidates(
 /// are normalised per the HGVS 3'-rule - shifted as far C-terminal as they can
 /// go, with duplications collapsed to `dup`. `delins` is not shifted.
 ///
-/// This agrees with Ensembl VEP except within the last `n - 1` residues of the
-/// protein, for a change of `n` residues. VEP's `_shift_3prime`
-/// (`Bio::EnsEMBL::Variation::TranscriptVariationAllele`) bounds its scan at
-/// `length(post_seq) - n` while comparing a single residue per step, so it
-/// halts `n - 1` residues short of the terminus. We shift to the terminus,
-/// which is what the 3'-rule specifies and what our HGVSc for the same variant
-/// already describes. See issue #94.
+/// The shift bound intentionally follows Ensembl VEP 115.2's `_shift_3prime`
+/// (`Bio::EnsEMBL::Variation::TranscriptVariationAllele`): for a change of `n`
+/// residues, VEP only scans through `length(post_seq) - n`. This can halt
+/// `n - 1` residues before the protein terminus, but reproducing that bound is
+/// required for VEP-compatible HGVSp output.
 ///
 /// `strand` says which end of `ref_aas` the caller's `protein_start` names,
 /// which the coordinate convention fixes rather than leaves open: see
@@ -248,6 +324,24 @@ pub fn hgvsp_inframe_indel(
     ref_peptide: Option<&[u8]>,
     strand: Strand,
 ) -> Option<String> {
+    hgvsp_inframe_indel_with_context(
+        protein_id, protein_start, protein_end, ref_aas, alt_aas, ref_peptide, strand, false, None, None,
+)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_inframe_indel_with_context(
+    protein_id: &str,
+    protein_start: u64,
+    protein_end: u64,
+    ref_aas: &str,
+    alt_aas: &str,
+    ref_peptide: Option<&[u8]>,
+    strand: Strand,
+    start_lost: bool,
+    duplication_peptide: Option<&[u8]>,
+    full_reference_peptide: Option<&[u8]>,
+) -> Option<String> {
     let strip = |s: &str| -> Vec<u8> {
         if s == "-" {
             Vec::new()
@@ -256,19 +350,19 @@ pub fn hgvsp_inframe_indel(
         }
     };
     let original_ref = strip(ref_aas);
+    // VEP _get_surrounding_peptides appends original_ref when it begins
+    // with a stop, restoring the terminal residue omitted by _peptide().
+    let extended_peptide = ref_peptide
+        .filter(|_| original_ref.starts_with(b"*"))
+        .map(|peptide| [peptide.strip_suffix(b"*").unwrap_or(peptide), &original_ref].concat());
+    let ref_peptide = extended_peptide.as_deref().or(ref_peptide);
     // Nothing past a terminator the change introduces is translated, so those
     // residues are not part of the protein and must not be named. Ensembl's
     // `Amino_acids` column keeps the whole translated window - `SL/MEP*S` - but
     // its HGVSp for the same row is `p.Ser269_Leu270delinsMetGluProTer`, and
     // naming the `S` after the `Ter` would describe a residue that does not
     // exist. The terminator itself is kept: it is the last thing the protein has.
-    let original_alt = {
-        let all = strip(alt_aas);
-        match all.iter().position(|&b| b == b'*') {
-            Some(terminator) => all[..=terminator].to_vec(),
-            None => all,
-        }
-    };
+    let original_alt = strip(alt_aas);
     // A pure insertion replaces no residue, so it is written between two of
     // them - and the caller's pair names both. `protein_start` comes from the
     // genomic left edge, which is the *upper* residue on the forward strand and
@@ -288,19 +382,50 @@ pub fn hgvsp_inframe_indel(
     // followed by the first position, for example `p.SerTer22=`.
     if !original_ref.is_empty() && original_ref == original_alt {
         let lo = protein_start.min(protein_end);
+        // VEP skips clipping equal peptides, but still applies start_lost
+        // before the final synonymous-format check.
+        if start_lost {
+            return Some(format!("{}{}", prefix, uncertain_from_initiator(lo, &original_ref)));
+        }
         return Some(format!("{}{}{}=", prefix, three_letter(&original_ref), lo));
     }
 
-    let fallback = || unshifted_description(&prefix, protein_start, &original_ref, &original_alt);
-
-    // Transcript::peptide runs to cdna_coding_end, so it carries the terminator
-    // as a final `*` — and anything translated past an internal one on a
-    // mis-annotated CDS. Those residues are not part of the protein, so bound
-    // the peptide at the first terminator before shifting against it.
-    let ref_peptide = ref_peptide.map(|p| match p.iter().position(|&b| b == b'*') {
-        Some(terminator) => &p[..terminator],
-        None => p,
-    });
+    // VEP sorts the translation endpoints for a delins range. Even when a
+    // terminal X is absent from the full peptide, the supplied endpoints still
+    // locate the window; the genomic-left endpoint alone is wrong in reverse.
+    let fallback = || {
+        if start_lost {
+            let (reference, _, start) = clip_residues(
+                original_ref.clone(), original_alt.clone(), protein_start.min(protein_end),
+            );
+            return (!reference.is_empty())
+                .then(|| format!("{}{}", prefix, uncertain_from_initiator(start, &reference)));
+        }
+        // A terminal stop is intentionally absent from VEP's full peptide.
+        // Clip its shrinking local window even without full-peptide support;
+        // retain the existing fallback for unrelated unavailable sequences.
+        let (reference, alternate, start) = if matches!(original_ref.last(), Some(b'*' | b'X'))
+            && original_alt.len() < original_ref.len()
+            && !(original_ref.first() == Some(&b'*') && original_alt.first() == Some(&b'*')) {
+            clip_residues(original_ref.clone(), original_alt.clone(), protein_start.min(protein_end))
+        } else {
+            (original_ref.clone(), original_alt.clone(), protein_start.min(protein_end))
+        };
+        let prefix_trim = start - protein_start.min(protein_end);
+        let suffix_trim = original_ref.len().saturating_sub(prefix_trim as usize + reference.len());
+        unshifted_description(
+            &prefix, start, protein_start.max(protein_end).saturating_sub(suffix_trim as u64),
+            &reference, &alternate,
+        )
+    };
+    if original_ref == b"*" && protein_start != protein_end {
+        return fallback();
+    }
+    // VEP `_clip_alleles` does not clip a recreated leading stop. The final
+    // delins formatter still truncates the alternate at that terminator.
+    if original_ref.first() == Some(&b'*') && original_alt.first() == Some(&b'*') {
+        return fallback();
+    }
     // Everything below is positioned relative to an anchor, so none of it is
     // safe unless the peptide corroborates that the caller's residues really sit
     // there. They do not always: for a shrinking change like `FF/F` the call
@@ -315,46 +440,49 @@ pub fn hgvsp_inframe_indel(
     // the numbers contradict each other. Over 47,013 ClinVar indels that was
     // 17,654 descriptions.
     let Some((peptide, protein_start)) = ref_peptide.and_then(|p| {
-        let end_first = anchored_at_span_end(strand, original_ref.len(), original_alt.len());
+        let end_first = protein_start >= protein_end
+            && anchored_at_span_end(strand, original_ref.len(), original_alt.len());
         anchor_candidates(protein_start, original_ref.len(), end_first)
             .into_iter()
             .flatten()
             .find(|&anchor| peptide_carries(p, anchor, &original_ref))
             .map(|anchor| (p, anchor))
+            .or_else(|| {
+                let anchor = protein_start.min(protein_end);
+                let (reference, alternate, clipped_start) =
+                    clip_residues(original_ref.clone(), original_alt.clone(), anchor);
+                // A partial X is absent from the full peptide, but clipping
+                // it can reveal an insertion. Still check duplication before
+                // requiring the two flanking residues, as VEP does.
+                (original_ref.last() == Some(&b'X')
+                    && ((!reference.is_empty() && peptide_carries(p, clipped_start, &reference))
+                        || (reference.is_empty() && !alternate.is_empty())))
+                    .then_some((p, anchor))
+            })
     }) else {
         return fallback();
     };
 
-    // Ensembl's `start_lost` (`VariationEffect.pm` release/115, l. 851): the
-    // replacement begins at the initiator and preserves the reference residues
-    // at neither end of itself. What the ribosome does then - start at a
-    // downstream ATG, or not at all - is not something the sequence tells us, so
-    // HGVS marks the consequence unknown with `?` rather than naming residues of
-    // a protein that may never be made. Evaluated on the untrimmed residues,
-    // because that is what the predicate reads: for `XP/XAKSTVGA` the shared
-    // leading `X` trims away and the description starts at residue 2, and VEP
-    // still writes `p.Pro2?`.
-    //
-    // The pure-deletion arm below has its own, older test for this and keeps it:
-    // it decides after 3'-shifting, which can move the deletion off residue 1.
-    let start_lost = protein_start == 1
-        && !original_alt.starts_with(&original_ref[..])
-        && !original_alt.ends_with(&original_ref[..]);
+    // Corroborate the allele window before dropping the final CDS terminator:
+    // a terminal S*/* deletion must still clip to S/-. VEP's surrounding
+    // reference peptide retains internal stops but omits the final one.
+    // Corroboration and clipping use the allele/consequence peptide. VEP's
+    // post-sequence lookup and displayed flanks use Transcript::_peptide,
+    // whose initiator normalization precedes source sequence edits.
+    let extended_reference = full_reference_peptide
+        .filter(|_| original_ref.starts_with(b"*"))
+        .map(|p| [p.strip_suffix(b"*").unwrap_or(p), &original_ref].concat());
+    let peptide = extended_reference.as_deref().or(full_reference_peptide).unwrap_or(peptide);
+    let peptide = if original_ref.starts_with(b"*") {
+        peptide
+    } else {
+        peptide.strip_suffix(b"*").unwrap_or(peptide)
+    };
 
     // Reduce to the minimal changed region: residues shared at either end are
     // not part of the description. Trimming the prefix moves the start right.
-    let mut reference = original_ref.clone();
-    let mut alternate = original_alt.clone();
-    let mut start = protein_start;
-    while !reference.is_empty() && !alternate.is_empty() && reference[0] == alternate[0] {
-        reference.remove(0);
-        alternate.remove(0);
-        start += 1;
-    }
-    while !reference.is_empty() && !alternate.is_empty() && reference.last() == alternate.last() {
-        reference.pop();
-        alternate.pop();
-    }
+    let (reference, alternate, start) =
+        clip_residues(original_ref.clone(), original_alt.clone(), protein_start);
 
     if reference.is_empty() && alternate.is_empty() {
         return None;
@@ -366,27 +494,67 @@ pub fn hgvsp_inframe_indel(
             return fallback();
         };
         let mut inserted = alternate;
+        // _get_hgvs_protein_type replaces the first stop with X before
+        // post-sequence shifting and duplication checks.
+        if let Some(stop) = inserted.iter_mut().find(|aa| **aa == b'*') {
+            *stop = b'X';
+        }
         // 3'-rule: slide right while the residue the insertion sits in front of
         // is the one it would place there.
-        while at < peptide.len() && peptide[at] == inserted[0] {
+        // VEP requires a residue beyond the requested post-sequence start.
+        let can_shift = at + 1 < peptide.len();
+        while can_shift && at
+            .checked_add(inserted.len())
+            .is_some_and(|end| end <= peptide.len())
+            && peptide[at] == inserted[0]
+        {
             inserted.rotate_left(1);
             at += 1;
         }
         // A duplication is an insertion whose residues repeat those immediately
         // before it.
+        // VEP _check_for_peptide_duplication translates CDS afresh, whereas
+        // surrounding residues use the cached, sequence-edited peptide.
         let preceding = at
             .checked_sub(inserted.len())
-            .and_then(|lo| peptide.get(lo..at));
-        if preceding == Some(inserted.as_slice()) {
+            .and_then(|lo| duplication_peptide.unwrap_or(peptide).get(lo..at));
+        if !inserted
+            .iter()
+            .any(|&residue| residue == b'*')
+            && preceding == Some(inserted.as_slice())
+        {
             let dup_start = (at - inserted.len() + 1) as u64;
             return Some(format!(
                 "{}{}dup",
                 prefix,
-                residue_span(dup_start, &inserted)
+                if inserted.len() == 1 {
+                    format!("{}{}", aa_one_to_three(inserted[0]), dup_start)
+                } else {
+                    format!("{}{}_{}{}", aa_one_to_three(inserted[0]), dup_start,
+                        aa_one_to_three(*inserted.last()?), dup_start + inserted.len() as u64 - 1)
+                }
             ));
         }
-        // Otherwise name the flanking pair. At a terminus there is no pair, so
-        // fall back rather than drop the annotation.
+        if start_lost {
+            // VEP checks duplication before start_lost, then obtains the
+            // flanking peptide with substr(ref, min(start,end)-1, 2).
+            // At residue zero Perl's negative offset selects the final residue.
+            if at >= peptide.len() {
+                return None;
+            }
+            let flank_start = at.checked_sub(1).unwrap_or(peptide.len() - 1);
+            let flanks = &peptide[flank_start..(flank_start + 2).min(peptide.len())];
+            return Some(format!("{}{}{}_?{}", prefix, three_letter(flanks), at + 1, at));
+        }
+        // Clipping a reference window down to an insertion before residue one
+        // gives VEP substr(peptide, -1, 2): one final residue, used for both
+        // names in the 0_1 insertion form (F1 RER1 Phe0_Phe1insLys).
+        if at == 0 && !original_ref.is_empty() {
+            let flank = hgvs_aa_one_to_three(*peptide.last()?);
+            return Some(format!("{}{flank}0_{flank}1ins{}", prefix, three_letter(through_terminator(&inserted))));
+        }
+        // Otherwise name the flanking pair. VEP emits no HGVSp at a terminus:
+        // `_get_surrounding_peptides` cannot return the required two residues.
         match (
             at.checked_sub(1).and_then(|i| peptide.get(i)),
             peptide.get(at),
@@ -394,13 +562,13 @@ pub fn hgvsp_inframe_indel(
             (Some(&before), Some(&after)) => Some(format!(
                 "{}{}{}_{}{}ins{}",
                 prefix,
-                aa_one_to_three(before),
+                hgvs_aa_one_to_three(before),
                 at,
-                aa_one_to_three(after),
+                hgvs_aa_one_to_three(after),
                 at + 1,
-                three_letter(&inserted)
+                three_letter(through_terminator(&inserted))
             )),
-            _ => fallback(),
+            _ => None,
         }
     } else if alternate.is_empty() {
         // Pure deletion of `reference` starting at `start`.
@@ -410,28 +578,34 @@ pub fn hgvsp_inframe_indel(
             let len = residues.len();
             // 3'-rule: slide right while the residue following the deleted block
             // repeats the first deleted residue.
-            loop {
-                let first = at.checked_sub(1).and_then(|i| peptide.get(i as usize));
-                let following = peptide.get(at as usize + len - 1);
+            // `_get_surrounding_peptides(end + 1)` refuses a post-sequence
+            // starting at the final residue. This is an initial bound only;
+            // once accepted, `_shift_3prime` can consume that final residue.
+            let can_read_post_sequence = at as usize + len < peptide.len();
+            let mut rotation = 0;
+            while can_read_post_sequence {
+                // VEP _shift_3prime rotates the local allele, which can differ
+                // from the full protein's normalized initiator or sequence edits.
+                let first = residues.get(rotation);
+                let following_index = at as usize + len - 1;
+                // VEP 115.2 passes the sequence after the deleted block to
+                // `_shift_3prime`, then stops when fewer than `len` residues
+                // remain in that post-sequence. Preserve that exact bound.
+                let following = following_index
+                    .checked_add(len)
+                    .filter(|&end| end <= peptide.len())
+                    .and_then(|_| peptide.get(following_index));
                 match (first, following) {
-                    (Some(a), Some(b)) if a == b => at += 1,
+                    (Some(a), Some(b)) if a == b => {
+                        at += 1;
+                        rotation = (rotation + 1) % len;
+                    }
                     _ => break,
                 }
             }
-            match at
-                .checked_sub(1)
-                .and_then(|lo| peptide.get(lo as usize..lo as usize + len))
-            {
-                Some(block) => residues = block.to_vec(),
-                None => return fallback(),
-            }
+            residues.rotate_left(rotation);
         }
-        if at == 1 {
-            // The deletion removes the initiation codon. What the ribosome does
-            // instead - start downstream, or not at all - is not something the
-            // sequence tells us, so HGVS marks the consequence unknown with `?`
-            // rather than describing a protein that may never be made. This is
-            // the form Ensembl VEP emits.
+        if start_lost {
             return Some(format!(
                 "{}{}",
                 prefix,
@@ -440,11 +614,7 @@ pub fn hgvsp_inframe_indel(
         }
         Some(format!("{}{}del", prefix, residue_span(at, &residues)))
     } else if start_lost {
-        Some(format!(
-            "{}{}",
-            prefix,
-            uncertain_from_initiator(start, &reference)
-        ))
+        Some(format!("{}{}", prefix, uncertain_from_initiator(start, &reference)))
     } else if reference.len() == 1 && alternate.len() == 1 {
         // One residue for one residue is a substitution, whatever the window it
         // came from. A change spanning two codons that alters only the second
@@ -455,13 +625,13 @@ pub fn hgvsp_inframe_indel(
         Some(match (r, a) {
             // A terminator the change removes extends the protein by an unknown
             // amount; one it introduces ends it here.
-            (b'*', _) => format!("{}{}{}ext*?", prefix, aa_one_to_three(a), start),
+            (b'*', _) => format!("{}{}{}ext*?", prefix, hgvs_aa_one_to_three(a), start),
             _ => format!(
                 "{}{}{}{}",
                 prefix,
-                aa_one_to_three(r),
+                hgvs_aa_one_to_three(r),
                 start,
-                aa_one_to_three(a)
+                hgvs_aa_one_to_three(a)
             ),
         })
     } else {
@@ -470,7 +640,7 @@ pub fn hgvsp_inframe_indel(
             "{}{}delins{}",
             prefix,
             residue_span(start, &reference),
-            three_letter(&alternate)
+            three_letter(through_terminator(&alternate))
         ))
     }
 }
@@ -530,7 +700,66 @@ pub fn hgvsp_frameshift_from_cds_with_tables(
     reference_codon_table: &CodonTable,
     alternate_codon_table: &CodonTable,
 ) -> Option<String> {
-    let (edited, first) = edited_cds(
+    hgvsp_frameshift_from_cds_with_tables_and_ref_peptide(
+        protein_id,
+        cds_and_downstream,
+        cds_start,
+        cds_end,
+        ref_allele,
+        alt_allele,
+        strand,
+        reference_codon_table,
+        alternate_codon_table,
+        None,
+        false,
+        false,
+    )
+}
+
+/// Generate VEP-compatible frameshift HGVSp using the transcript's annotated
+/// reference peptide when it is available. The existing entry points retain
+/// their signatures and fall back to translating the CDS.
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_frameshift_from_cds_with_tables_and_ref_peptide(
+    protein_id: &str,
+    cds_and_downstream: &[u8],
+    cds_start: Option<u64>,
+    cds_end: Option<u64>,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    strand: Strand,
+    reference_codon_table: &CodonTable,
+    alternate_codon_table: &CodonTable,
+    reference_peptide: Option<&[u8]>,
+    stop_lost: bool,
+    start_lost: bool,
+) -> Option<String> {
+    hgvsp_frameshift_from_cds_with_context(
+        protein_id, cds_and_downstream, cds_start, cds_end, ref_allele, alt_allele,
+        strand, reference_codon_table, alternate_codon_table, reference_peptide,
+        stop_lost, start_lost, None,
+    )
+}
+
+/// Rebuild the alternate CDS before appending its 3' UTR, using the annotated
+/// CDS length rather than inferring it from a potentially incomplete peptide.
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_frameshift_from_cds_with_context(
+    protein_id: &str,
+    cds_and_downstream: &[u8],
+    cds_start: Option<u64>,
+    cds_end: Option<u64>,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    strand: Strand,
+    reference_codon_table: &CodonTable,
+    alternate_codon_table: &CodonTable,
+    reference_peptide: Option<&[u8]>,
+    stop_lost: bool,
+    start_lost: bool,
+    reference_cds_length: Option<usize>,
+) -> Option<String> {
+    let (mut edited, first) = edited_cds(
         cds_and_downstream,
         cds_start,
         cds_end,
@@ -539,6 +768,66 @@ pub fn hgvsp_frameshift_from_cds_with_tables(
         strand,
     )?;
 
+    let removed = cds_and_downstream.len() + alt_allele.len() - edited.len();
+    // _get_alternate_cds trims a sub-codon CDS BEFORE appending the UTR.
+    // Keep the original replacement span for the local peptide window below.
+    if let Some(length) = reference_cds_length {
+        let remaining = length.checked_sub(removed)?.checked_add(alt_allele.len())?;
+        if remaining < 3 { edited.drain(..remaining); }
+    }
+    if edited.is_empty() || (reference_cds_length.is_none() && edited.len() < 3) {
+        return None;
+    }
+
+    // VEP _get_fs_peptides returns the initial clipped peptide window when
+    // the alternate translation ends before translation_start. Keep its full
+    // deletion span instead of reducing it to the first reference residue.
+    let codon_start = first / 3 * 3;
+    let translate_window = |bases: &[u8], table: &CodonTable| {
+        let mut peptide = table.translate_seq(bases);
+        if bases.len() % 3 != 0 && peptide != b"*" { peptide.push(b'X'); }
+        peptide
+    };
+    if codon_start >= edited.len() / 3 * 3 {
+        let reference_end = (first + removed).div_ceil(3) * 3;
+        let alternate_end = reference_end.checked_sub(removed)?.checked_add(alt_allele.len())?;
+        let bounded_end = reference_end.min(reference_cds_length.unwrap_or(cds_and_downstream.len()));
+        let reference = translate_window(cds_and_downstream.get(codon_start..bounded_end)?, reference_codon_table);
+        let alternate = translate_window(edited.get(codon_start..alternate_end.min(edited.len()))?, alternate_codon_table);
+        let start = first as u64 / 3 + 1;
+        // hgvs_protein skips clipping identical windows, including X/X from
+        // two incomplete terminal codons. The retained X becomes Ter ... del.
+        let (reference, _, clipped_start) = if reference == alternate {
+            (reference, alternate, start)
+        } else {
+            clip_residues(reference, alternate, start)
+        };
+        // _get_fs_peptides switches to deletion before start_lost formatting,
+        // preserving the complete local reference and its clipped end.
+        if start_lost {
+            let end = start + reference.len() as u64 - 1 + (clipped_start - start);
+            return Some(if start == end {
+                format!("{}:p.{}{}?", protein_id, three_letter(&reference), start)
+            } else {
+                format!("{}:p.{}{}_?{}", protein_id, three_letter(&reference), start, end)
+            });
+        }
+        // A codon-boundary insertion has no reference peptide. VEP's
+        // _get_del_peptides clips the two empty terminal tails to synonymy.
+        if reference.is_empty() {
+            return Some(format!("{}:p.{}=", protein_id, start));
+        }
+        let end = start + reference.len() as u64 - 1;
+        // _get_hgvs_protein_format retains both deletion endpoints when
+        // stop_lost applies, even if the first deleted residue is not a stop.
+        let extension = if stop_lost { "extTer?" } else { "" };
+        return Some(if reference.len() == 1 {
+            format!("{}:p.{}{}del{}", protein_id, hgvs_aa_one_to_three(reference[0]), start, extension)
+        } else {
+            format!("{}:p.{}{}_{}{}del{}", protein_id, hgvs_aa_one_to_three(reference[0]), start, hgvs_aa_one_to_three(*reference.last()?), end, extension)
+        });
+    }
+
     hgvsp_frameshift_with_tables(
         protein_id,
         cds_and_downstream,
@@ -546,20 +835,245 @@ pub fn hgvsp_frameshift_from_cds_with_tables(
         first / 3,
         reference_codon_table,
         alternate_codon_table,
+        reference_peptide,
+        stop_lost,
+        start_lost.then(|| {
+            let end = if *ref_allele == Allele::Deletion {
+                cds_start.into_iter().chain(cds_end).min()
+            } else {
+                cds_start.into_iter().chain(cds_end).max()
+            }.unwrap_or(1);
+            let end = end.div_ceil(3);
+            // hgvs_protein clips the local codon window before _get_fs_peptides
+            // replaces its residues. That suffix trim still determines `end`.
+            let reference_end = end as usize * 3;
+            let alternate_end = reference_end.checked_sub(removed)?.checked_add(alt_allele.len())?;
+            let bounded_end = reference_end.min(reference_cds_length.unwrap_or(cds_and_downstream.len()));
+            let reference = translate_window(cds_and_downstream.get(codon_start..bounded_end)?, reference_codon_table);
+            let alternate = translate_window(edited.get(codon_start..alternate_end.min(edited.len()))?, alternate_codon_table);
+            if reference == alternate { return Some(end); }
+            let length = reference.len();
+            let start = first as u64 / 3 + 1;
+            let (clipped, _, clipped_start) = clip_residues(reference, alternate, start);
+            Some(end.saturating_sub(length.saturating_sub(clipped.len() + (clipped_start - start) as usize) as u64))
+        }).flatten(),
     )
+}
+
+/// Rebuild an in-frame deletion whose shifted coding interval did not produce
+/// a predictor peptide window. This follows VEP 115.2's `_get_del_peptides`:
+/// translate the alternate CDS, compare both peptide tails from the shifted
+/// translation start, and let the common-prefix/suffix clipping identify the
+/// deleted residues.
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_inframe_deletion_from_cds(
+    protein_id: &str,
+    cds_and_downstream: &[u8],
+    cds_start: u64,
+    cds_end: u64,
+    ref_allele: &Allele,
+    strand: Strand,
+    codon_table: &CodonTable,
+    reference_peptide: Option<&[u8]>,
+    start_lost: bool,
+    reference_cds_length: Option<usize>,
+    full_reference_peptide: Option<&[u8]>,
+) -> Option<String> {
+    let (mut edited, _) = edited_cds(
+        cds_and_downstream,
+        Some(cds_start),
+        Some(cds_end),
+        ref_allele,
+        &Allele::Deletion,
+        strand,
+    )?;
+    let first = usize::try_from(cds_start.min(cds_end).checked_sub(1)?).ok()?;
+    let codon_start = first / 3 * 3;
+    let reference_end = usize::try_from(cds_start.max(cds_end).checked_add(2)? / 3 * 3).ok()?;
+    let removed = usize::try_from(cds_start.abs_diff(cds_end).checked_add(1)?).ok()?;
+    // VEP _trim_incomplete_codon empties a CDS shorter than one codon before
+    // appending the UTR; longer partial codons remain in the alternate window.
+    let remaining_cds = reference_cds_length.unwrap_or(cds_and_downstream.len()).checked_sub(removed)?;
+    if remaining_cds < 3 { edited.drain(..remaining_cds); }
+    let alternate_end = reference_end.checked_sub(removed)?;
+    let protein_start = codon_start as u64 / 3 + 1;
+    let bounded_end = reference_end.min(reference_cds_length.unwrap_or(cds_and_downstream.len()));
+    let window = cds_and_downstream.get(codon_start..bounded_end)?;
+    let mut reference = codon_table.translate_seq(window);
+    // VEP peptide() retains the incomplete terminal CDS codon as X, while
+    // the cached full peptide omits it. Preserve cached edits in complete codons.
+    if let Some(peptide) = reference_peptide {
+        for (offset, residue) in reference.iter_mut().enumerate() {
+            if let Some(&cached) = peptide.get(codon_start / 3 + offset) {
+                *residue = cached;
+            }
+        }
+    }
+    if window.len() % 3 != 0 && reference != b"*" {
+        reference.push(b'X');
+    }
+    let alternate_window = edited.get(codon_start..alternate_end.min(edited.len()))?;
+    let mut translated_alternate = codon_table.translate_seq(alternate_window);
+    if alternate_window.len() % 3 != 0 && translated_alternate != b"*" {
+        translated_alternate.push(b'X');
+    }
+    hgvsp_inframe_indel_with_context(
+        protein_id,
+        protein_start,
+        protein_start + reference.len() as u64 - 1,
+        std::str::from_utf8(&reference).ok()?,
+        if translated_alternate.is_empty() {
+            "-"
+        } else {
+            std::str::from_utf8(&translated_alternate).ok()?
+        },
+        reference_peptide,
+        strand,
+        start_lost, None, full_reference_peptide,
+)
+}
+
+/// Rebuild a 3'-shifted in-frame insertion from the shifted CDS position and
+/// rotated inserted sequence, matching VEP 115.2's shifted peptide window.
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_inframe_insertion_from_cds(
+    protein_id: &str,
+    cds_and_downstream: &[u8],
+    cds_start: u64,
+    cds_end: u64,
+    alt_allele: &Allele,
+    strand: Strand,
+    transcript_shift: u64,
+    codon_table: &CodonTable,
+    reference_peptide: Option<&[u8]>,
+) -> Option<String> {
+    hgvsp_inframe_insertion_from_cds_with_start_lost(
+        protein_id, cds_and_downstream, cds_start, cds_end, alt_allele, strand,
+        transcript_shift, codon_table, reference_peptide, false, None, None,
+)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_inframe_insertion_from_cds_with_start_lost(
+    protein_id: &str,
+    cds_and_downstream: &[u8],
+    cds_start: u64,
+    cds_end: u64,
+    alt_allele: &Allele,
+    strand: Strand,
+    transcript_shift: u64,
+    codon_table: &CodonTable,
+    reference_peptide: Option<&[u8]>,
+    start_lost: bool,
+    reference_cds_length: Option<usize>,
+    full_reference_peptide: Option<&[u8]>,
+) -> Option<String> {
+    let duplication_peptide = CodonTable::standard().translate_seq(cds_and_downstream);
+    let point = cds_start.min(cds_end);
+    if cds_start.max(cds_end) != point.checked_add(1)? {
+        return None;
+    }
+    let mut inserted = match alt_allele {
+        Allele::Sequence(bases) if !bases.is_empty() => match strand {
+            Strand::Forward => bases.clone(),
+            Strand::Reverse => bases.iter().rev().map(|&base| complement(base)).collect(),
+        },
+        _ => return None,
+    };
+    let rotation = usize::try_from(transcript_shift % inserted.len() as u64).ok()?;
+    // VEP's reverse shift_feature_seqs loop has a negative bound when the
+    // shift exceeds seq_length; it then leaves the inserted sequence intact.
+    if strand == Strand::Forward || transcript_shift <= inserted.len() as u64 {
+        inserted.rotate_left(rotation);
+    }
+    let point = usize::try_from(point).ok()?;
+    if point > cds_and_downstream.len() {
+        return None;
+    }
+    // VEP's codon-boundary insertion has an empty reference peptide window.
+    // Do not borrow a following codon from the UTR when the cached peptide
+    // ends here (F1 ENST00000416415: His96_Ser98dup).
+    if point % 3 == 0 && inserted.len() % 3 == 0 {
+        let alternate = codon_table.translate_seq(&inserted);
+        return hgvsp_inframe_indel_with_context(
+            protein_id, point as u64 / 3 + 1, point as u64 / 3,
+            "-", std::str::from_utf8(&alternate).ok()?, reference_peptide, strand, start_lost, Some(&duplication_peptide), full_reference_peptide,
+);
+    }
+    let mut edited = Vec::with_capacity(cds_and_downstream.len() + inserted.len());
+    edited.extend_from_slice(&cds_and_downstream[..point]);
+    edited.extend_from_slice(&inserted);
+    edited.extend_from_slice(&cds_and_downstream[point..]);
+    let codon_start = point / 3 * 3;
+    // VEP's reference codon is bounded by CDS, although its alternate
+    // window may use downstream sequence. Do not complete a partial reference
+    // codon with UTR bases (F1 KCTD21/FAM246C).
+    let reference_end = reference_cds_length.unwrap_or(cds_and_downstream.len()).min(cds_and_downstream.len());
+    let reference_window = cds_and_downstream.get(codon_start..(codon_start + 3).min(reference_end))?;
+    let reference = reference_peptide
+        .and_then(|peptide| peptide.get(codon_start / 3))
+        .copied()
+        .or_else(|| {
+            codon_table
+                .translate_seq(reference_window)
+                .first()
+                .copied()
+        })
+        .or_else(|| (!reference_window.is_empty() && reference_window.len() < 3).then_some(b'X'))?;
+    let alternate_window = edited.get(codon_start..codon_start.checked_add(3 + inserted.len())?.min(edited.len()))?;
+    let mut alternate = codon_table.translate_seq(alternate_window);
+    // VEP peptide() retains a terminal partial codon as X, except after a
+    // sole stop. A shifted insertion can complete that codon (X -> Gly).
+    if alternate_window.len() % 3 != 0 && alternate != b"*" {
+        alternate.push(b'X');
+    }
+    if reference == b'X' && alternate.len() == 1 {
+        return hgvsp(protein_id, codon_start as u64 / 3 + 1, reference, alternate[0], false);
+    }
+    hgvsp_inframe_indel_with_context(
+        protein_id,
+        codon_start as u64 / 3 + 1,
+        codon_start as u64 / 3 + 1,
+        std::str::from_utf8(&[reference]).ok()?,
+        std::str::from_utf8(&alternate).ok()?,
+        reference_peptide,
+        strand,
+        start_lost, Some(&duplication_peptide), full_reference_peptide,
+)
 }
 
 /// Generate the VEP stop-loss form and count to the next translated stop.
 ///
-/// `protein_pos` is the reference terminator position. The extension distance
-/// is the distance from that terminator to the next terminator after applying
-/// the variant; when the transcript sequence contains no later stop, HGVS uses
-/// `extTer?`.
+/// VEP 115 `_stop_loss_extra_AA` measures non-frameshift extensions relative to
+/// the full reference peptide length, even for an internal stop. Nonpositive
+/// distances and residue-one events are reported as `extTer?`.
 #[allow(clippy::too_many_arguments)]
 pub fn hgvsp_stop_lost_from_cds(
     protein_id: &str,
     protein_pos: u64,
+    reference_peptide: &str,
     alt_aa: u8,
+    cds_and_downstream: &[u8],
+    cds_start: Option<u64>,
+    cds_end: Option<u64>,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    strand: Strand,
+    codon_table: &CodonTable,
+) -> Option<String> {
+    let suffix = hgvsp_stop_lost_suffix_from_cds(
+        protein_pos, reference_peptide, cds_and_downstream, cds_start, cds_end,
+        ref_allele, alt_allele, strand, codon_table,
+    )?;
+    Some(format!("{}:p.Ter{}{}{}", protein_id, protein_pos,
+        if alt_aa == b'-' { "del" } else { hgvs_aa_one_to_three(alt_aa) }, suffix))
+}
+
+/// VEP stop-loss suffix, shared by substitutions and complete deletion spans.
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_stop_lost_suffix_from_cds(
+    protein_pos: u64,
+    reference_peptide: &str,
     cds_and_downstream: &[u8],
     cds_start: Option<u64>,
     cds_end: Option<u64>,
@@ -576,25 +1090,162 @@ pub fn hgvsp_stop_lost_from_cds(
         alt_allele,
         strand,
     )?;
+    let reference_length = reference_peptide
+        .strip_suffix('*')
+        .unwrap_or(reference_peptide)
+        .len() as u64;
     let next_stop = codon_table
         .translate_seq(&edited)
         .iter()
         .position(|&aa| aa == b'*')
-        .map(|zero_based| zero_based as u64 + 1)
-        .filter(|&position| position > protein_pos)
-        .map(|position| position - protein_pos);
+        .and_then(|zero_based| (zero_based as u64).checked_sub(reference_length))
+        .filter(|&distance| distance > 0 && protein_pos > 1);
     let distance = next_stop
         .map(|value| value.to_string())
         .unwrap_or_else(|| "?".to_string());
 
-    Some(format!(
-        "{}:p.Ter{}{}extTer{}",
-        protein_id,
-        protein_pos,
-        aa_one_to_three(alt_aa),
-        distance
-    ))
+    Some(format!("extTer{}", distance))
 }
+
+/// Recalculate a shifted in-frame insertion when HGVS normalization moves it
+/// into or beyond the reference stop codon.
+///
+/// VEP 115.2 shifts the transcript allele before `hgvs_protein`, invalidates
+/// the cached translation coordinates, and obtains new reference/alternate
+/// peptides from the shifted allele. This helper mirrors that sequence only
+/// for the narrow stop-retained case; ordinary in-frame indels continue to use
+/// the consequence engine's peptide window.
+#[allow(clippy::too_many_arguments)]
+pub fn hgvsp_shifted_stop_retained_insertion(
+    protein_id: &str,
+    cds_and_downstream: &[u8],
+    cds_start: Option<u64>,
+    cds_end: Option<u64>,
+    alt_allele: &Allele,
+    strand: Strand,
+    transcript_shift: u64,
+    codon_table: &CodonTable,
+    reference_peptide: Option<&[u8]>,
+    reference_cds_length: Option<usize>,
+    mapped_cds: Option<(Option<u64>, Option<u64>)>,
+    full_reference_peptide: Option<&[u8]>,
+) -> Option<String> {
+    if transcript_shift == 0 {
+        return None;
+    }
+    let (shifted_start, shifted_end) = mapped_cds.unwrap_or_else(|| (
+        cds_start.and_then(|value| value.checked_add(transcript_shift)),
+        cds_end.and_then(|value| value.checked_add(transcript_shift)),
+    ));
+    let mut shifted_alt = alt_allele.clone();
+    if let Allele::Sequence(bases) = &mut shifted_alt {
+        if bases.is_empty() {
+            return None;
+        }
+        // VEP `shift_feature_seqs` rotates the allele with its 3' shift.
+        let rotation = (transcript_shift % bases.len() as u64) as usize;
+        match strand {
+            Strand::Forward => bases.rotate_left(rotation),
+            Strand::Reverse if transcript_shift <= bases.len() as u64 => bases.rotate_right(rotation),
+            Strand::Reverse => {},
+        }
+    }
+    let (edited, first) = edited_cds(
+        cds_and_downstream,
+        shifted_start,
+        shifted_end,
+        &Allele::Deletion,
+        &shifted_alt,
+        strand,
+    )?;
+    // At a codon boundary the insertion is between the final residue and the
+    // stop. VEP keeps that as a pure insertion; it only recomputes a stop-codon
+    // delins when the shifted insertion point lies inside the stop codon.
+    if first % 3 == 0 {
+        let inserted = match alt_allele {
+            Allele::Sequence(bases) if bases.len() % 3 != 0 => bases.len(),
+            _ => return None,
+        };
+        let mut alternate = codon_table.translate_seq(edited.get(first..first + inserted)?);
+        if alternate != b"*" { alternate.push(b'X'); }
+        let duplication_peptide = CodonTable::standard().translate_seq(cds_and_downstream);
+        return hgvsp_inframe_indel_with_context(
+            protein_id,
+            first as u64 / 3 + 1,
+            first as u64 / 3 + 1,
+            "",
+            std::str::from_utf8(&alternate).ok()?,
+            reference_peptide,
+            strand, false, Some(&duplication_peptide), full_reference_peptide,
+);
+    }
+    let codon_start = first / 3 * 3;
+    let reference_end = reference_cds_length.unwrap_or(cds_and_downstream.len()).min(cds_and_downstream.len());
+    let reference_window = cds_and_downstream.get(codon_start..(codon_start + 3).min(reference_end))?;
+    let reference = codon_table.translate_seq(reference_window);
+    let reference = reference
+        .first()
+        .copied()
+        .or_else(|| (!reference_window.is_empty() && reference_window.len() < 3).then_some(b'X'))?;
+    // An internal stop can shift into a later ordinary codon. VEP 115
+    // `hgvs_protein` recalculates both peptides before testing synonymy.
+    let inserted = match alt_allele {
+        Allele::Sequence(bases) => bases.len(),
+        _ => return None,
+    };
+    // A whole-codon insertion immediately before the stop belongs to the
+    // preceding peptide position and may be a duplication. Only a partial
+    // codon makes the shifted allele's local peptide window begin at the stop.
+    if inserted % 3 == 0 {
+        return None;
+    }
+    // `shift_feature_seqs` translates the allele-local codon window, not the
+    // remainder of the transcript. BioPerl represents its trailing incomplete
+    // codon as X, which VEP's protein formatter subsequently spells `Ter`.
+    let alternate_end = codon_start.checked_add(3 + inserted)?.min(edited.len());
+    let alternate_window = edited.get(codon_start..alternate_end)?;
+    let mut alternate = codon_table.translate_seq(alternate_window);
+    if alternate_window.len() % 3 != 0 && alternate != b"*" {
+        alternate.push(b'X');
+    }
+    // _clip_alleles retains these windows, then _get_hgvs_protein_type
+    // reclassifies a longer alternate as delins. Formatting truncates that
+    // alternate at its leading stop; only a sole stop remains synonymous.
+    if reference == b'*' && alternate.first() == Some(&b'*') {
+        let position = codon_start as u64 / 3 + 1;
+        return if alternate.len() == 1 {
+            hgvsp(protein_id, position, b'*', b'*', false)
+        } else {
+            Some(format!("{}:p.Ter{}delinsTer", protein_id, position))
+        };
+    }
+    if reference == b'X' && alternate.len() == 1 {
+        return hgvsp(
+            protein_id,
+            codon_start as u64 / 3 + 1,
+            reference,
+            alternate[0],
+            false,
+        );
+    }
+    let alternate = std::str::from_utf8(&alternate).ok()?;
+    hgvsp_inframe_indel_with_context(
+        protein_id,
+        codon_start as u64 / 3 + 1,
+        codon_start as u64 / 3 + 1,
+        std::str::from_utf8(&[reference]).ok()?,
+        alternate,
+        reference_peptide,
+        strand,
+        false,
+        None,
+        full_reference_peptide,
+    )
+}
+
+/// Transcript-oriented insertion offset, retaining Mapper::map_insert's
+/// coding endpoint when the other endpoint is an intronic gap.
+pub use fastvep_genome::insertion_point as cds_insertion_point;
 
 fn edited_cds(
     cds_and_downstream: &[u8],
@@ -611,22 +1262,16 @@ fn edited_cds(
         // it still abuts the exonic base, on whichever side the strand puts the
         // intron. `cds_start` comes from the genomic left edge and `cds_end`
         // from the right, so the surviving one says which.
-        let point = match (cds_start, cds_end) {
-            (Some(s), Some(e)) if s.max(e) == s.min(e) + 1 => s.min(e),
-            (Some(s), None) if strand == Strand::Reverse => s,
-            (Some(s), None) => s.checked_sub(1)?,
-            (None, Some(e)) if strand == Strand::Forward => e,
-            (None, Some(e)) => e.checked_sub(1)?,
-            _ => return None,
-        };
+        let point = cds_insertion_point(cds_start, cds_end, strand)?;
         (point as usize, 0usize)
     } else {
         let (s, e) = (cds_start?, cds_end?);
         let (lo, hi) = (s.min(e), s.max(e));
-        let ref_len = ref_allele.len();
-        if lo < 1 || hi - lo + 1 != ref_len as u64 {
-            return None; // not contiguous in CDS space; no single edit describes it
+        if lo < 1 || hi - lo + 1 > ref_allele.len() as u64 {
+            return None;
         }
+        // VEP _get_alternate_cds splices the mapped span, excluding introns.
+        let ref_len = usize::try_from(hi - lo + 1).ok()?;
         ((lo - 1) as usize, ref_len)
     };
     if first + ref_len > cds_and_downstream.len() {
@@ -670,6 +1315,9 @@ fn complement(base: u8) -> u8 {
 /// `codon_table` lets the caller select the genetic code to translate with —
 /// pass the vertebrate mitochondrial table (NCBI table 2) for MT transcripts
 /// so AGA/AGG/ATA/TGA are read correctly instead of with the standard code.
+/// A determinable stop distance is retained when the first changed residue is
+/// 1. VEP 115.2 instead passes residue index 0 to a helper that rejects zero,
+/// producing `fsTer?`; AnnoCAT records that behavior as a reviewed divergence.
 pub fn hgvsp_frameshift(
     protein_id: &str,
     ref_translateable: &[u8],
@@ -684,6 +1332,9 @@ pub fn hgvsp_frameshift(
         affected_codon_start,
         codon_table,
         codon_table,
+        None,
+        false,
+        None,
     )
 }
 
@@ -694,29 +1345,58 @@ fn hgvsp_frameshift_with_tables(
     affected_codon_start: usize,
     reference_codon_table: &CodonTable,
     alternate_codon_table: &CodonTable,
+    reference_peptide: Option<&[u8]>,
+    stop_lost: bool,
+    start_lost_end: Option<u64>,
 ) -> Option<String> {
     let prefix = format!("{}:p.", protein_id);
 
     // Translate both sequences from the affected codon onwards
     let ref_start = affected_codon_start * 3;
-    if ref_start + 3 > ref_translateable.len() {
+    // VEP appends a reference stop to the annotated peptide, including a
+    // partial terminal codon. It can report deletion of that final residue.
+    if ref_start + 3 > ref_translateable.len() && reference_peptide.is_none() {
         return None;
     }
     if ref_start > alt_translateable.len() {
         return None;
     }
 
-    let ref_peptide: Vec<u8> = ref_translateable[ref_start..]
-        .chunks(3)
-        .filter(|c| c.len() == 3)
-        .map(|c| reference_codon_table.translate(&[c[0], c[1], c[2]]))
-        .collect();
+    let mut ref_peptide: Vec<u8> = match reference_peptide {
+        Some(peptide) => {
+            let mut annotated = peptide.get(affected_codon_start..)?.to_vec();
+            if !annotated.contains(&b'*') {
+                annotated.push(b'*');
+            }
+            annotated
+        }
+        None => ref_translateable[ref_start..]
+            .chunks(3)
+            .filter(|c| c.len() == 3)
+            .map(|c| reference_codon_table.translate(&[c[0], c[1], c[2]]))
+            .collect(),
+    };
+    if affected_codon_start == 0 {
+        reference_codon_table.normalize_reference_initiator(&mut ref_peptide, ref_translateable);
+    }
 
     let alt_peptide: Vec<u8> = alt_translateable[ref_start..]
         .chunks(3)
         .filter(|c| c.len() == 3)
         .map(|c| alternate_codon_table.translate(&[c[0], c[1], c[2]]))
         .collect();
+    // VEP 115.2's `_stop_loss_extra_AA` searches the complete alternate
+    // translation and uses its first terminator, even when that terminator is
+    // upstream of the frameshift. This matters for annotated selenoproteins:
+    // their reference peptide contains U, while BioPerl translates the same
+    // TGA as `*` in the alternate CDS. The resulting non-positive distance is
+    // rendered `fsTer?` by VEP.
+    let first_vep_stop = alt_translateable
+        .chunks(3)
+        .filter(|codon| codon.len() == 3)
+        .map(|codon| alternate_codon_table.translate(&[codon[0], codon[1], codon[2]]))
+        .position(|residue| residue == b'*')
+        .map(|zero_based| zero_based + 1);
 
     // Find the first position where amino acids differ
     let mut first_changed_offset = 0;
@@ -744,14 +1424,59 @@ fn hgvsp_frameshift_with_tables(
     } else {
         b'X'
     };
+
+    // VEP applies start_lost after selecting the first changed full-peptide residue.
+    if let Some(end) = start_lost_end {
+        let reference = hgvs_aa_one_to_three(ref_aa);
+        return Some(if first_changed_pos as u64 == end {
+            format!("{}{}{}?", prefix, reference, first_changed_pos)
+        } else {
+            format!("{}{}{}_?{}", prefix, reference, first_changed_pos, end)
+        });
+    }
+
+    // VEP's _get_fs_peptides changes the event to a deletion when the altered
+    // translation ends before its starting residue. Its ordinary protein
+    // formatter then turns deletion of the reference stop into delextTer?.
+    if first_changed_offset >= alt_peptide.len() {
+        // When the alternate translation contains the starting residue but
+        // ends after a shared suffix, VEP's loop increments the position and
+        // retains the last equal peptide pair. The `fs` type is unchanged, so
+        // the formatter emits that pair at the incremented position with an
+        // unknown stop distance.
+        if let (Some(&reference), Some(&alternate)) = (
+            ref_peptide.get(first_changed_offset.saturating_sub(1)),
+            alt_peptide.last(),
+        ) {
+            if first_changed_offset > 0 && reference == alternate {
+                return Some(format!(
+                    "{}{}{}{}fsTer?",
+                    prefix,
+                    hgvs_aa_one_to_three(reference),
+                    first_changed_pos,
+                    hgvs_aa_one_to_three(alternate)
+                ));
+            }
+        }
+        return if ref_aa == b'*' && stop_lost {
+            Some(format!("{}Ter{}delextTer?", prefix, first_changed_pos))
+        } else {
+            Some(format!(
+                "{}{}{}del",
+                prefix,
+                hgvs_aa_one_to_three(ref_aa),
+                first_changed_pos
+            ))
+        };
+    }
     let alt_aa = if first_changed_offset < alt_peptide.len() {
         alt_peptide[first_changed_offset]
     } else {
         b'X'
     };
 
-    let ref_aa3 = aa_one_to_three(ref_aa);
-    let alt_aa3 = aa_one_to_three(alt_aa);
+    let ref_aa3 = hgvs_aa_one_to_three(ref_aa);
+    let alt_aa3 = hgvs_aa_one_to_three(alt_aa);
 
     if ref_aa == b'*' && alt_aa == b'*' {
         return Some(format!("{}Ter{}=", prefix, first_changed_pos));
@@ -766,43 +1491,18 @@ fn hgvsp_frameshift_with_tables(
         return Some(format!("{}{}{}Ter", prefix, ref_aa3, first_changed_pos));
     }
 
-    // Find the new stop codon position in the alt sequence.
-    // If the sequence contains unresolved (X) amino acids, use Ter? to indicate uncertainty.
-    let mut stop_dist = None;
-    let mut hit_unresolved = false;
-    let unresolved_count = alt_peptide[first_changed_offset..]
-        .iter()
-        .take(10)
-        .filter(|&&aa| aa == b'X')
-        .count();
-    let mostly_unresolved = unresolved_count > 5;
-    if !mostly_unresolved {
-        for (offset, &aa) in alt_peptide.iter().enumerate().skip(first_changed_offset) {
-            if aa == b'*' {
-                stop_dist = Some(offset - first_changed_offset + 1);
-                break;
-            }
-            if aa == b'X' {
-                hit_unresolved = true;
-            }
-        }
-    } else {
-        hit_unresolved = true;
-    }
+    let stop_dist = first_vep_stop
+        .filter(|&stop| stop >= first_changed_pos)
+        .map(|stop| stop - first_changed_pos + 1);
 
     if let Some(d) = stop_dist {
         Some(format!(
             "{}{}{}{}fsTer{}",
             prefix, ref_aa3, first_changed_pos, alt_aa3, d
         ))
-    } else if hit_unresolved || mostly_unresolved {
-        // Sequence has unresolved regions - can't determine stop position
-        Some(format!(
-            "{}{}{}{}fsTer?",
-            prefix, ref_aa3, first_changed_pos, alt_aa3
-        ))
     } else {
-        // No stop found and sequence is clean - true extension
+        // VEP uses `?` when no positive distance can be calculated, including
+        // no stop, an upstream stop, or an immediate stop handled above.
         Some(format!(
             "{}{}{}{}fsTer?",
             prefix, ref_aa3, first_changed_pos, alt_aa3
@@ -813,7 +1513,279 @@ fn hgvsp_frameshift_with_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depleted_cds_keeps_short_utr_and_partial_reference_windows_distinct() {
+        let table = CodonTable::standard();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            for (sequence, cds_length, lo, reference, peptide, expected) in [
+                (b"ATGCGCTAACG".as_slice(), 9, 3, "GCGCTAA", b"MR*".as_slice(), "P:p.MetArgTer1_?3"),
+                (b"ATGGCCGGTGAAATAA".as_slice(), 7, 1, "ATGGCCG", b"MA".as_slice(), "P:p.Met1_?2"),
+            ] {
+                let reference = Allele::Sequence(if strand == Strand::Reverse {
+                    fastvep_genome::codon::reverse_complement(reference.as_bytes())
+                } else { reference.as_bytes().to_vec() });
+                assert_eq!(hgvsp_frameshift_from_cds_with_context(
+                    "P", sequence, Some(lo), Some(cds_length), &reference,
+                    &Allele::Deletion, strand, &table, &table, Some(peptide),
+                    true, true, Some(cds_length as usize),
+                ).as_deref(), Some(expected), "{strand:?}, CDS length {cds_length}");
+            }
+        }
+    }
+
+    #[test]
+    fn depleted_cds_is_trimmed_before_utr_translation() {
+        let table = CodonTable::standard();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let reference = Allele::from_str(if strand == Strand::Forward { "TGCGCTAA" } else { "TTAGCGCA" });
+            assert_eq!(hgvsp_frameshift_from_cds_with_context(
+                "P", b"ATGCGCTAATGCCAACTGA", Some(2), Some(9), &reference,
+                &Allele::Deletion, strand, &table, &table, Some(b"MR*"),
+                true, true, Some(9),
+            ).as_deref(), Some("P:p.Met1_?3"));
+        }
+    }
+
+    #[test]
+    fn start_loss_keeps_the_clipped_partial_codon_window() {
+        let table = CodonTable::standard();
+        let cds = b"ATGGCCCACCGGA";
+        assert_eq!(hgvsp_inframe_deletion_from_cds(
+            "P", cds, 2, 13, &Allele::from_str("TGGCCCACCGGA"), Strand::Forward,
+            &table, Some(b"MAHR"), true, Some(13), Some(b"MAHR"),
+        ).as_deref(), Some("P:p.MetAlaHisArgTer1_?5"));
+        assert_eq!(hgvsp_frameshift_from_cds_with_tables_and_ref_peptide(
+            "P", cds, Some(3), Some(13), &Allele::from_str("GGCCCACCGGA"),
+            &Allele::from_str("CCGGGTGGCCTT"), Strand::Forward,
+            &table, &table, Some(b"MAHR"), false, true,
+        ).as_deref(), Some("P:p.Met1_?4"));
+    }
+
+    #[test]
+    fn insertion_clips_raw_peptide_but_names_full_reference_flanks() {
+        assert_eq!(hgvsp_inframe_indel_with_context(
+            "P", 1, 1, "L", "LGL", Some(b"LTQQ"), Strand::Forward,
+            false, Some(b"LTQQ"), Some(b"MTQQ"),
+        ), Some("P:p.Met1_Thr2insGlyLeu".into()));
+    }
+
+    #[test]
+    fn deletion_rotates_local_residues_without_replacing_the_initiator() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            for (reference, local, full, expected) in [
+                ("L", b"LTQQ".as_slice(), b"MTQQ".as_slice(), "P:p.Leu1del"),
+                ("L", b"LLLQ".as_slice(), b"MLLQ".as_slice(), "P:p.Leu3del"),
+                ("LM", b"LMLMQR".as_slice(), b"MMLMQR".as_slice(), "P:p.Leu3_Met4del"),
+            ] {
+                assert_eq!(hgvsp_inframe_indel_with_context(
+                    "P", 1, reference.len() as u64, reference, "-", Some(local),
+                    strand, false, None, Some(full),
+                ).as_deref(), Some(expected));
+            }
+        }
+    }
     use fastvep_genome::mitochondrial_codon_table;
+
+    #[test]
+    fn reference_terminal_codon_does_not_borrow_utr_bases() {
+        let table = CodonTable::standard();
+        assert_eq!(hgvsp_inframe_insertion_from_cds_with_start_lost(
+            "P", b"ATGGAG", 4, 5, &Allele::from_str("C"), Strand::Reverse,
+            1, &table, Some(b"M"), false, Some(5), None,
+), None);
+        assert_eq!(hgvsp_inframe_insertion_from_cds_with_start_lost(
+            "P", b"ATGGAG", 4, 5, &Allele::from_str("GCGGGGACT"), Strand::Forward,
+            10, &table, Some(b"M"), false, Some(5), None,
+).as_deref(), Some("P:p.Ter2delinsAlaGlyThrGlu"));
+    }
+
+    #[test]
+    fn stop_insertion_can_duplicate_a_partial_reference_residue() {
+        assert_eq!(hgvsp_inframe_indel_with_context(
+            "P", 2, 2, "W", "*W", Some(b"XW"), Strand::Forward,
+            false, Some(b"XW"), None,
+).as_deref(), Some("P:p.Xaa1dup"));
+    }
+
+    #[test]
+    fn initiation_edits_do_not_replace_the_duplication_reference() {
+        assert_eq!(hgvsp_inframe_indel_with_context(
+            "P", 4, 4, "A", "AVESA", Some(b"MESAIA"), Strand::Forward,
+            false, Some(b"VESAIA"), None,
+).as_deref(), Some("P:p.Val1_Ala4dup"));
+        assert_eq!(hgvsp_inframe_insertion_from_cds_with_start_lost(
+            "P", b"GTGGAGAGTGCGATT", 4, 5, &Allele::from_str("CCC"), Strand::Reverse,
+            2, &CodonTable::standard(), Some(b"MESAI"), true, None, None,
+).as_deref(), Some("P:p.MetGlu2_?1"));
+    }
+
+    #[test]
+    fn terminal_insertion_post_sequence_requires_a_following_residue() {
+        assert_eq!(hgvsp_inframe_indel("P", 2, 2, "L", "LP", Some(b"MLP"), Strand::Forward).as_deref(), Some("P:p.Leu2_Pro3insPro"));
+        assert_eq!(hgvsp_inframe_indel("P", 2, 2, "L", "LL", Some(b"MLL"), Strand::Forward).as_deref(), Some("P:p.Leu2dup"));
+    }
+
+    #[test]
+    fn explicit_peptide_range_keeps_its_start_in_a_reverse_repeat() {
+        assert_eq!(hgvsp_inframe_indel("P", 3, 4, "PP", "P", Some(b"MPPP"), Strand::Reverse).as_deref(), Some("P:p.Pro4del"));
+    }
+
+    #[test]
+    fn terminal_windows_follow_vep_clipping_and_stop_loss_formatting() {
+        let table = CodonTable::standard();
+        assert_eq!(hgvsp_frameshift_from_cds_with_tables_and_ref_peptide(
+            "P", b"ATGATTTAA", Some(6), Some(7), &Allele::from_str("TT"),
+            &Allele::Deletion, Strand::Forward, &table, &table, Some(b"MI*"), true, false,
+        ).as_deref(), Some("P:p.Ile3IlefsTer?"));
+        assert_eq!(hgvsp_inframe_deletion_from_cds(
+            "P", b"ATGAGTAGT", 6, 8, &Allele::from_str("TAG"), Strand::Forward,
+            &table, Some(b"MS"), false, Some(8), None,
+).as_deref(), Some("P:p.Ter3del"));
+        assert_eq!(hgvsp_inframe_indel("P", 2, 3, "L*", "L", Some(b"ML"), Strand::Forward).as_deref(), Some("P:p.Ter3del"));
+        assert_eq!(hgvsp_inframe_indel("P", 2, 3, "LX", "X", Some(b"ML"), Strand::Forward).as_deref(), Some("P:p.Leu2del"));
+        assert_eq!(hgvsp_inframe_insertion_from_cds(
+            "P", b"ATGCTTTGA", 7, 8, &Allele::from_str("AAA"), Strand::Reverse,
+            1, &table, Some(b"ML*"),
+        ).as_deref(), Some("P:p.Leu2_Ter3insPhe"));
+        assert_eq!(hgvsp_frameshift_from_cds_with_tables_and_ref_peptide(
+            "P", b"ATGATTTAA", Some(6), Some(9), &Allele::from_str("TTAA"),
+            &Allele::Deletion, Strand::Forward, &table, &table, Some(b"MI*"), true, false,
+        ).as_deref(), Some("P:p.Ile2_Ter3delextTer?"));
+    }
+
+    #[test]
+    fn partial_stop_window_keeps_both_translation_endpoints() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            assert_eq!(
+                hgvsp_inframe_indel("P", 331, 332, "*", "CX", Some(b"M"), strand).as_deref(),
+                Some("P:p.Ter331_Ter332delinsCysTer")
+            );
+        }
+    }
+
+    #[test]
+    fn recreated_stop_keeps_the_original_window_before_clipping() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            assert_eq!(
+                hgvsp_inframe_indel("P", 2, 3, "A*", "A*X", Some(b"MA*"), strand).as_deref(),
+                Some("P:p.Ala2_Ter3delinsAlaTer")
+            );
+        }
+    }
+
+    #[test]
+    fn shifted_insertion_completes_a_partial_terminal_codon() {
+        for (strand, inserted) in [(Strand::Forward, "G"), (Strand::Reverse, "C")] {
+            assert_eq!(
+                hgvsp_inframe_insertion_from_cds(
+                    "P", b"ATGGC", 4, 5, &Allele::from_str(inserted), strand,
+                    1, &CodonTable::standard(), Some(b"M"),
+                ).as_deref(),
+                Some("P:p.Ter2Gly")
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_shift_does_not_start_at_the_final_reference_residue() {
+        for (strand, start, end) in [(Strand::Forward, 3, 4), (Strand::Reverse, 4, 3)] {
+            assert_eq!(
+                hgvsp_inframe_indel("P", start, end, "RR", "R", Some(b"MARRR"), strand).as_deref(),
+                Some("P:p.Arg4del")
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_frameshift_keeps_the_initial_clipped_window() {
+        let table = CodonTable::standard();
+        for (cds, start, end, reference, alternate, peptide, expected) in [
+            ("ATGAAGCAGTATTTCT", 6, 16, "GCAGTATTTCT", "-", "MKQYF", "P:p.Lys2_Phe5del"),
+            ("ATGTTTTTTG", 10, 9, "-", "T", "MFF", "P:p.4="),
+            ("ATGCAAAG", 7, 7, "A", "-", "MQ", "P:p.Ter3del"),
+        ] {
+            assert_eq!(hgvsp_frameshift_from_cds_with_tables_and_ref_peptide(
+                "P", cds.as_bytes(), Some(start), Some(end),
+                &Allele::from_str(reference), &Allele::from_str(alternate),
+                Strand::Forward, &table, &table, Some(peptide.as_bytes()), false, false,
+            ).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn terminal_frameshift_deletion_uses_the_shifted_start() {
+        let table = CodonTable::standard();
+        for (cds, peptide, expected) in [
+            (b"ATGAGTAGT".as_slice(), b"MSS".as_slice(), "P:p.Ser3del"),
+            (b"ATGAGTC".as_slice(), b"MS".as_slice(), "P:p.Ter3del"),
+        ] {
+            assert_eq!(
+                hgvsp_frameshift_from_cds_with_tables_and_ref_peptide(
+                    "P",
+                    cds,
+                    Some(7),
+                    Some(7),
+                    &Allele::from_str("A"),
+                    &Allele::Deletion,
+                    Strand::Forward,
+                    &table,
+                    &table,
+                    Some(peptide),
+                    false,
+        false,
+    )
+                .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn residue_one_frameshift_keeps_a_determinable_stop_distance() {
+        let result = hgvsp_frameshift(
+            "ENSP1",
+            b"CGTCGTCGT",
+            b"CCCTGATAA",
+            0,
+            &CodonTable::standard(),
+        );
+        assert_eq!(result, Some("ENSP1:p.Arg1ProfsTer2".to_string()));
+    }
+
+    #[test]
+    fn vep_uses_an_upstream_alternate_stop_for_frameshift_distance() {
+        let table = CodonTable::standard();
+        let result = hgvsp_frameshift_with_tables(
+            "ENSP1",
+            b"ATGTGAAAAAAATAA", // annotated peptide M U K K *
+            b"ATGTGAAAACCTTAA", // BioPerl-style translation M * K P *
+            3,
+            &table,
+            &table,
+            Some(b"MUKK*"),
+            false,
+        None,
+    );
+        assert_eq!(result, Some("ENSP1:p.Lys4ProfsTer?".to_string()));
+    }
+
+    #[test]
+    fn vep_retains_the_last_equal_residue_when_the_alternate_translation_ends() {
+        let table = CodonTable::standard();
+        let result = hgvsp_frameshift_with_tables(
+            "ENSP1",
+            b"ATGAAAAAA", // M K K
+            b"ATGAAA",    // M K
+            1,
+            &table,
+            &table,
+            Some(b"MKK"),
+            false,
+        None,
+    );
+        assert_eq!(result, Some("ENSP1:p.Lys3LysfsTer?".to_string()));
+    }
 
     #[test]
     fn test_hgvsp_frameshift_mitochondrial_table_differs() {
@@ -853,8 +1825,207 @@ mod tests {
             0,
             &mitochondrial,
             &standard,
-        );
+            None,
+            false,
+        None,
+    );
         assert_eq!(mixed_result, Some("ENSP1:p.Ter1ThrfsTer2".to_string()));
+    }
+
+    #[test]
+    fn frameshift_uses_annotated_reference_peptide_and_vep_terminal_deletions() {
+        let table = CodonTable::standard();
+
+        assert_eq!(
+            hgvsp_frameshift_with_tables(
+                "ENSP1",
+                b"CTGAAAAAA",
+                b"CCCTGATAA",
+                0,
+                &table,
+                &table,
+                Some(b"MKK"),
+                false,
+        None,
+    ),
+            Some("ENSP1:p.Met1ProfsTer2".to_string())
+        );
+        assert_eq!(
+            hgvsp_frameshift_with_tables(
+                "ENSP1",
+                b"GGT",
+                b"",
+                0,
+                &table,
+                &table,
+                Some(b"G"),
+                false,
+        None,
+    ),
+            Some("ENSP1:p.Gly1del".to_string())
+        );
+        assert_eq!(
+            hgvsp_frameshift_with_tables("ENSP1", b"TAA", b"", 0, &table, &table, Some(b"*"), true,
+        None,
+    ),
+            Some("ENSP1:p.Ter1delextTer?".to_string())
+        );
+    }
+
+    #[test]
+    fn shifted_insertion_recomputes_the_terminal_codon_window() {
+        assert_eq!(hgvsp_shifted_stop_retained_insertion(
+            "P", b"ATGTAAAAATGA", Some(4), Some(3), &Allele::from_str("AAAAA"),
+            Strand::Forward, 1, &CodonTable::standard(), Some(b"M*"),
+         None,  None, None,
+), Some("P:p.Ter2delinsTer".into()));
+        assert_eq!(
+            hgvsp_shifted_stop_retained_insertion(
+                "P",
+                b"TAAGCT",
+                Some(1),
+                Some(2),
+                &Allele::Sequence(b"A".to_vec()),
+                Strand::Forward,
+                1,
+                &CodonTable::standard(),
+                Some(b"*A"),
+             None,  None, None,
+),
+            Some("P:p.Ter1=".to_string()),
+        );
+        for (strand, inserted) in [
+            (Strand::Forward, b"AGAGTTAGAT".as_slice()),
+            (Strand::Reverse, b"ATCTAACTCT".as_slice()),
+        ] {
+            assert_eq!(
+                hgvsp_shifted_stop_retained_insertion(
+                    "P",
+                    b"GAACGT",
+                    Some(1),
+                    Some(2),
+                    &Allele::Sequence(inserted.to_vec()),
+                    strand,
+                    1,
+                    &CodonTable::standard(),
+                    Some(b"ER"),
+                 None,  None, None,
+),
+                Some("P:p.Glu1_Arg2insSerTer".to_string()),
+                "the peptide window uses the rotated insertion on both strands"
+            );
+        }
+        assert_eq!(
+            hgvsp_shifted_stop_retained_insertion(
+                "P",
+                b"TGATCT",
+                Some(2),
+                Some(3),
+                &Allele::Sequence(b"A".to_vec()),
+                Strand::Forward,
+                1,
+                &CodonTable::standard(),
+                Some(b"*S"),
+             None,  None, None,
+),
+            Some("P:p.Ter1_Ser2insTer".to_string()),
+        );
+        assert_eq!(
+            hgvsp_shifted_stop_retained_insertion(
+                "P",
+                b"TGAAAACAT",
+                Some(2),
+                Some(3),
+                &Allele::Sequence(b"A".to_vec()),
+                Strand::Forward,
+                3,
+                &CodonTable::standard(),
+                Some(b"*KH"),
+             None,  None, None,
+),
+            Some("P:p.Lys2_His3insTer".to_string()),
+        );
+        assert_eq!(
+            hgvsp_shifted_stop_retained_insertion(
+                "P",
+                b"TGAAGA",
+                Some(2),
+                Some(3),
+                &Allele::Sequence(b"A".to_vec()),
+                Strand::Forward,
+                2,
+                &CodonTable::standard(),
+                None,
+             None,  None, None,
+),
+            Some("P:p.Arg2delinsLysTer".to_string()),
+            "HGVS shifts beyond an internal stop before comparing peptides"
+        );
+        let mut cds = vec![b'G'; 138];
+        cds.extend_from_slice(b"TAGCTA");
+        assert_eq!(
+            hgvsp_shifted_stop_retained_insertion(
+                "ENSP1",
+                &cds,
+                Some(138),
+                Some(137),
+                &Allele::Sequence(b"T".to_vec()),
+                Strand::Forward,
+                2,
+                &CodonTable::standard(),
+                None,
+             None,  None, None,
+),
+            Some("ENSP1:p.Ter47delinsLeuTer".to_string())
+        );
+        assert_eq!(
+            hgvsp_shifted_stop_retained_insertion(
+                "ENSP1",
+                &cds,
+                Some(135),
+                Some(136),
+                &Allele::Sequence(b"TAG".to_vec()),
+                Strand::Forward,
+                3,
+                &CodonTable::standard(),
+                None,
+             None,  None, None,
+),
+            None,
+            "a whole-codon insertion before the stop remains eligible for duplication"
+        );
+        assert_eq!(
+            hgvsp_shifted_stop_retained_insertion(
+                "ENSP1",
+                b"GGGTAG",
+                Some(2),
+                Some(3),
+                &Allele::Sequence(b"T".to_vec()),
+                Strand::Forward,
+                1,
+                &CodonTable::standard(),
+                None,
+             None,  None, None,
+),
+            None,
+            "an insertion between the last residue and stop remains a pure insertion"
+        );
+        assert_eq!(
+            hgvsp_shifted_stop_retained_insertion(
+                "ENSP1",
+                b"GGGGG",
+                Some(2),
+                Some(3),
+                &Allele::Sequence(b"G".to_vec()),
+                Strand::Forward,
+                2,
+                &CodonTable::standard(),
+                None,
+             None,  None, None,
+),
+            Some("ENSP1:p.Ter2Gly".to_string()),
+            "VEP spells a completed cds_end_NF codon as a Ter substitution"
+        );
     }
 
     #[test]
@@ -886,6 +2057,32 @@ mod tests {
     }
 
     #[test]
+    fn test_hgvsp_uses_vep_ter_spelling_for_x() {
+        let result = hgvsp("ENSP00000001", 326, b'X', b'V', false);
+        assert_eq!(result, Some("ENSP00000001:p.Ter326Val".to_string()));
+        assert_eq!(hgvsp("P", 3, b'X', b'*', false), Some("P:p.Ter3=".into()));
+        for strand in [Strand::Forward, Strand::Reverse] {
+            assert_eq!(hgvsp_inframe_indel("P", 3, 3, "X", "IX", Some(b"MY"), strand), None);
+            assert_eq!(hgvsp_inframe_indel("P", 3, 3, "X", "VX", Some(b"MV"), strand), Some("P:p.Val2dup".into()));
+        }
+    }
+
+    #[test]
+    fn shifted_frameshift_start_loss_uses_the_changed_full_peptide_residue() {
+        let table = CodonTable::standard();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let reference = Allele::from_str(if strand == Strand::Forward { "G" } else { "C" });
+            assert_eq!(
+                hgvsp_frameshift_from_cds_with_tables_and_ref_peptide(
+                    "P", b"ATGGAAAAATAA", Some(4), Some(4), &reference,
+                    &Allele::Deletion, strand, &table, &table, Some(b"MEK*"), false, true,
+                ),
+                Some("P:p.Glu2?".into()),
+            );
+        }
+    }
+
+    #[test]
     fn test_hgvsp_inframe_deletion_single() {
         // single-residue in-frame deletion
         let r = hgvsp_inframe_indel("ENSP00000001", 157, 157, "F", "-", None, Strand::Forward);
@@ -906,6 +2103,105 @@ mod tests {
         assert_eq!(
             r,
             Some("ENSP00000001:p.Asn2173_Leu2174delinsLys".to_string())
+        );
+    }
+
+    #[test]
+    fn protein_terminator_is_trimmed_after_clipping_like_vep() {
+        let peptide = b"MVWQ";
+        assert_eq!(
+            hgvsp_inframe_indel(
+                "ENSP00000001",
+                3,
+                3,
+                "W",
+                "*W",
+                Some(peptide),
+                Strand::Forward,
+            ),
+            Some("ENSP00000001:p.Val2_Trp3insTer".to_string())
+        );
+
+        let peptide = b"MAYQ";
+        assert_eq!(
+            hgvsp_inframe_indel(
+                "ENSP00000001",
+                3,
+                3,
+                "Y",
+                "*H",
+                Some(peptide),
+                Strand::Forward,
+            ),
+            Some("ENSP00000001:p.Tyr3delinsTer".to_string())
+        );
+
+        let peptide = b"MALA";
+        assert_eq!(
+            hgvsp_inframe_indel(
+                "ENSP00000001",
+                3,
+                3,
+                "L",
+                "LF*Q",
+                Some(peptide),
+                Strand::Forward,
+            ),
+            Some("ENSP00000001:p.Leu3_Ala4insPheTer".to_string())
+        );
+    }
+
+    #[test]
+    fn shifted_inframe_deletion_is_clipped_from_translated_peptide_tails() {
+        let cds = b"ATGGGTGGTGGTGCTGCTTAA";
+        assert_eq!(
+            hgvsp_inframe_deletion_from_cds(
+                "ENSP1",
+                cds,
+                5,
+                10,
+                &Allele::Sequence(b"GTGGTG".to_vec()),
+                Strand::Forward,
+                &CodonTable::standard(),
+                Some(b"MGGGAA*"),
+                false,
+             None, None,
+),
+            Some("ENSP1:p.Gly3_Gly4del".to_string())
+        );
+    }
+
+    #[test]
+    fn shifted_inframe_insertion_rotates_before_translating_the_peptide_tail() {
+        for (inserted, expected) in [("AAA", "Phe0_Phe1insLys"), ("ATG", "Met1dup")] {
+            assert_eq!(hgvsp_inframe_insertion_from_cds(
+                "ENSP1", b"ATGTCTTTC", 2, 1, &Allele::from_str(inserted),
+                Strand::Forward, 1, &CodonTable::standard(), Some(b"MSF"),
+            ), Some(format!("ENSP1:p.{expected}")));
+        }
+        assert_eq!(hgvsp_inframe_insertion_from_cds(
+            "ENSP1", b"ATGGTCAAATAA", 7, 6, &Allele::Sequence(b"GAC".to_vec()),
+            Strand::Reverse, 7, &CodonTable::standard(), Some(b"MVK*"),
+        ), Some("ENSP1:p.Val2dup".into()));
+        for sequence in [b"ATGCATGGAAGTAGCTAA".as_slice(), b"ATGCATGGAAGT"] {
+            assert_eq!(hgvsp_inframe_insertion_from_cds(
+                "ENSP1", sequence, 12, 13, &Allele::Sequence(b"CATGGAAGT".to_vec()),
+                Strand::Forward, 9, &CodonTable::standard(), Some(b"MHGS"),
+            ), Some("ENSP1:p.His2_Ser4dup".into()));
+        }
+        assert_eq!(
+            hgvsp_inframe_insertion_from_cds(
+                "ENSP1",
+                b"TGGTGTAAATAA", // W C K *
+                3,
+                4,
+                &Allele::Sequence(b"TTCTGGTCT".to_vec()),
+                Strand::Forward,
+                6,
+                &CodonTable::standard(),
+                Some(b"WCK*"),
+            ),
+            Some("ENSP1:p.Trp1_Cys2insSerPheTrp".to_string())
         );
     }
 
@@ -986,20 +2282,23 @@ mod tests {
     }
 
     #[test]
-    fn test_hgvsp_inframe_deletion_shifts_onto_the_final_residue() {
-        // The 3'-rule runs to the end of the protein, not to one residue short
-        // of it. Ensembl VEP stops `n - 1` residues early for an n-residue
-        // change, so this pins our answer against a future attempt to reproduce
-        // that off-by-one in the name of compatibility. Real case: NT5C2
-        // c.1674_1679del is p.Glu560_Glu561del on a 561-residue protein, which
-        // VEP reports as p.Glu559_Glu560del.
+    fn test_hgvsp_inframe_deletion_uses_vep_115_terminal_shift_bound() {
+        // VEP 115.2's `_shift_3prime` leaves a two-residue deletion one residue
+        // before the end because it requires a full two-residue comparison
+        // window after the original deletion. Real case: NT5C2 c.1674_1679del.
         let pep: Vec<u8> = "MKEEEEE*".bytes().collect();
         let r = hgvsp_inframe_indel("ENSP00000001", 3, 3, "EE", "-", Some(&pep), Strand::Forward);
-        assert_eq!(r, Some("ENSP00000001:p.Glu6_Glu7del".to_string()));
+        assert_eq!(r, Some("ENSP00000001:p.Glu5_Glu6del".to_string()));
     }
 
     #[test]
     fn test_hgvsp_inframe_indel_without_peptide_stays_valid() {
+        for (start, end, strand) in [(2, 3, Strand::Forward), (3, 2, Strand::Reverse)] {
+            assert_eq!(
+                hgvsp_inframe_indel("P", start, end, "YX", "*", Some(b"MY"), strand),
+                Some("P:p.Tyr2_Ter3delinsTer".into()),
+            );
+        }
         // No sequence context: emit an unshifted but well-formed description
         // rather than nothing, and never a substitution shape.
         let r = hgvsp_inframe_indel("ENSP00000001", 185, 185, "W", "WR", None, Strand::Forward);
@@ -1017,6 +2316,18 @@ mod tests {
 
     #[test]
     fn test_hgvsp_inframe_indel_survives_unusable_peptides() {
+        assert_eq!(
+            hgvsp_inframe_indel("P", 2, 3, "S*", "*", Some(b"MS*"), Strand::Forward),
+            Some("P:p.Ser2del".to_string()),
+        );
+        assert_eq!(
+            hgvsp_inframe_indel("P", 3, 2, "P*", "R", Some(b"MP*"), Strand::Reverse),
+            Some("P:p.Pro2_Ter3delinsArg".to_string()),
+        );
+        assert_eq!(
+            hgvsp_inframe_indel("P", 2, 2, "*", "*CKX", Some(b"M*"), Strand::Forward),
+            Some("P:p.Ter2delinsTer".to_string()),
+        );
         let short: Vec<u8> = "MAAAGK".bytes().collect();
         let cases: Vec<UnusablePeptideCase<'_>> = vec![
             // Deleted block overruns the peptide end.
@@ -1026,7 +2337,7 @@ mod tests {
                 "KX",
                 "-",
                 &short,
-                Some("ENSP00000001:p.Lys6_Xaa7del"),
+                Some("ENSP00000001:p.Lys6_Ter7del"),
             ),
             // protein_start past the peptide entirely.
             (
@@ -1095,18 +2406,12 @@ mod tests {
         assert_eq!(deletion, Some("ENSP00000001:p.Lys3del".to_string()));
 
         // An insertion immediately before the terminator has no residue on its
-        // 3' side once the stop is excluded, so it falls back rather than
-        // emitting a Ter-flanked range.
+        // 3' side once the stop is excluded, so VEP emits no HGVSp rather than
+        // a Ter-flanked range.
         let insertion =
             hgvsp_inframe_indel("ENSP00000001", 4, 4, "G", "GS", Some(&pep), Strand::Forward);
-        assert_eq!(
-            insertion,
-            Some("ENSP00000001:p.Gly4delinsGlySer".to_string())
-        );
-        for out in [deletion, insertion] {
-            let out = out.unwrap();
-            assert!(!out.contains("Ter"), "terminator named as a residue: {out}");
-        }
+        assert_eq!(insertion, None);
+        assert!(!deletion.unwrap().contains("Ter"));
     }
 
     #[test]
@@ -1164,6 +2469,33 @@ mod tests {
     }
 
     #[test]
+    fn start_loss_uses_vep_peptide_preparation_and_explicit_predicate() {
+        assert_eq!(
+            hgvsp_start_lost("P", 1, "L", "L", Some(b"LKGN")),
+            Some("P:p.Leu1?".into())
+        );
+        assert_eq!(
+            hgvsp_start_lost("P", 1, "M", "NM", Some(b"MKGN")),
+            Some("P:p.Asn1_?0".into())
+        );
+        assert_eq!(
+            hgvsp_start_lost("P", 1, "M", "MM", Some(b"MKGN")),
+            Some("P:p.Met1dup".into())
+        );
+        for start_lost in [false, true] {
+            assert_eq!(
+                hgvsp_inframe_deletion_from_cds(
+                    "P", b"ATGGCCGGGGCCATCAAATAA", 3, 14,
+                    &Allele::Sequence(b"GGCCGGGGCCAT".to_vec()), Strand::Forward,
+                    &CodonTable::standard(), Some(b"MAGAIK*"), start_lost,
+                 None, None,
+),
+                Some(if start_lost { "P:p.MetAlaGlyAla1_?4" } else { "P:p.Met1_Ala4del" }.into())
+            );
+        }
+    }
+
+    #[test]
     fn a_deletion_of_the_initiation_codon_is_described_as_unresolvable() {
         // Removing the start codon leaves the protein's fate undetermined: the
         // ribosome may initiate downstream, or not at all, and the sequence does
@@ -1172,31 +2504,13 @@ mod tests {
         //
         // Both shapes come from real ClinVar rows checked against Ensembl VEP:
         // KCNA2 `MNII/I` at residues 1-4, and POLE `EA/A` at 1-2.
-        let kcna2: Vec<u8> = "MNIIDIVAIIPY".bytes().collect();
         assert_eq!(
-            hgvsp_inframe_indel(
-                "ENSP00000491354",
-                1,
-                1,
-                "MNII",
-                "I",
-                Some(&kcna2),
-                Strand::Forward
-            ),
+            hgvsp_start_lost("ENSP00000491354", 1, "MNII", "I", None),
             Some("ENSP00000491354:p.MetAsnIle1_?3".to_string())
         );
 
-        let pole: Vec<u8> = "EAKRQ".bytes().collect();
         assert_eq!(
-            hgvsp_inframe_indel(
-                "ENSP00000500921",
-                1,
-                1,
-                "EA",
-                "A",
-                Some(&pole),
-                Strand::Forward
-            ),
+            hgvsp_start_lost("ENSP00000500921", 1, "EA", "A", None),
             Some("ENSP00000500921:p.Glu1?".to_string())
         );
     }
@@ -1219,8 +2533,16 @@ mod tests {
         // VEP 115.1. Naming the replacement instead described a protein that may
         // never be made.
         assert_eq!(
-            hgvsp_inframe_indel("ENSP00000001", 1, 1, "MK", "W", Some(&pep), Strand::Forward),
+            hgvsp_start_lost("ENSP00000001", 1, "MK", "W", None),
             Some("ENSP00000001:p.MetLys1_?2".to_string())
+        );
+
+        // VEP's start_lost formatter does not require the cached reference
+        // peptide to corroborate residues already supplied by the consequence
+        // calculation.
+        assert_eq!(
+            hgvsp_start_lost("ENSP00000001", 1, "MA", "IP", None),
+            Some("ENSP00000001:p.MetAla1_?2".to_string())
         );
 
         // A replacement that keeps the reference residues at one end of itself
@@ -1557,29 +2879,25 @@ mod tests {
     }
 
     #[test]
-    fn test_hgvsp_inframe_indel_never_drops_a_terminal_insertion() {
-        // An insertion with no flanking pair still has to produce something —
-        // returning None would be a regression against the pre-normalisation
-        // behaviour, which always emitted a (wrong) substitution.
-        let pep: Vec<u8> = "MKKRSTV".bytes().collect();
-        for start in [1u64, 8] {
-            // Both strands: an insertion is anchored at `protein_start` whichever
-            // way the transcript runs, so the strand must make no difference here.
+    fn test_hgvsp_inframe_indel_matches_vep_terminal_insertion_suppression() {
+        for peptide in [b"MKE".as_slice(), b"MKE*".as_slice()] {
             for strand in [Strand::Forward, Strand::Reverse] {
-                let got = hgvsp_inframe_indel(
-                    "ENSP00000001",
-                    start,
-                    start,
-                    "G",
-                    "GG",
-                    Some(&pep),
-                    strand,
-                );
-                assert!(
-                    got.is_some(),
-                    "dropped annotation at protein_start {start} on {strand:?}"
+                assert_eq!(
+                    hgvsp_inframe_indel("P", 4, 4, "*", "F*", Some(peptide), strand),
+                    Some("P:p.Glu3_Ter4insPhe".into())
                 );
             }
+        }
+        // VEP requires both surrounding reference residues for an insertion.
+        // At the protein terminus the second one does not exist, so HGVSp is
+        // absent rather than an invented delins.
+        let pep: Vec<u8> = "MKKRSTV".bytes().collect();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            assert_eq!(
+                hgvsp_inframe_indel("ENSP00000001", 7, 7, "V", "VX", Some(&pep), strand,),
+                None,
+                "terminal insertion on {strand:?}"
+            );
         }
     }
 
@@ -1854,6 +3172,7 @@ mod window_tests {
         let forward = hgvsp_stop_lost_from_cds(
             "P",
             3,
+            "MK*",
             b'Q',
             cds,
             Some(7),
@@ -1866,6 +3185,7 @@ mod window_tests {
         let reverse = hgvsp_stop_lost_from_cds(
             "P",
             3,
+            "MK*",
             b'Q',
             cds,
             Some(7),
@@ -1878,10 +3198,33 @@ mod window_tests {
 
         assert_eq!(forward, Some("P:p.Ter3GlnextTer2".to_string()));
         assert_eq!(reverse, forward);
+        assert_eq!(hgvsp_stop_lost_from_cds(
+            "P", 3, "MK*", b'-', cds, Some(7), Some(9),
+            &Allele::Sequence(b"TAA".to_vec()), &Allele::Deletion,
+            Strand::Forward, &table,
+        ), Some("P:p.Ter3delextTer1".into()));
+
+        // VEP measures a non-frameshift extension from the full reference
+        // peptide length, even when the affected stop is internal.
+        let internal_stop = hgvsp_stop_lost_from_cds(
+            "P",
+            3,
+            "MK*Q*",
+            b'Q',
+            cds,
+            Some(7),
+            Some(7),
+            &Allele::Sequence(b"T".to_vec()),
+            &Allele::Sequence(b"C".to_vec()),
+            Strand::Forward,
+            &table,
+        );
+        assert_eq!(internal_stop, Some("P:p.Ter3GlnextTer?".to_string()));
 
         let no_later_stop = hgvsp_stop_lost_from_cds(
             "P",
             3,
+            "MK*",
             b'Q',
             b"ATGAAATAACAA",
             Some(7),

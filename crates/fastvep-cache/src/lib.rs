@@ -1,4 +1,6 @@
+pub mod annocat_cache;
 pub mod annotation;
+pub mod ensembl_core;
 pub mod fasta;
 pub mod gff;
 pub mod info;
@@ -6,4 +8,5 @@ pub mod normalize;
 pub mod providers;
 pub mod regulatory;
 pub mod transcript_cache;
+mod transcript_wire;
 pub mod variation;

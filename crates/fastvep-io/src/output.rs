@@ -160,6 +160,9 @@ fn format_csq_entry_into(
     fields: &[CsqField],
     buf: &mut String,
 ) {
+    let intergenic_placeholder = tv.transcript_id.as_ref() == "-"
+        && tv.gene_id.as_ref() == "-"
+        && aa.consequences == [Consequence::IntergenicVariant];
     for (i, field) in fields.iter().enumerate() {
         if i > 0 {
             buf.push('|');
@@ -167,6 +170,7 @@ fn format_csq_entry_into(
         // Write each field value directly into buf via escape_csq_str, avoiding
         // temporary String allocations for most fields.
         match *field {
+            CsqField::Allele if vf.minimised => escape_csq_str(&aa.allele.to_string(), buf),
             CsqField::Allele => escape_csq_str(
                 &normalized_csq_allele(&vf.ref_allele, &aa.allele, vf.alt_alleles.len()),
                 buf,
@@ -181,18 +185,30 @@ fn format_csq_entry_into(
             }
             CsqField::Impact => buf.push_str(aa.impact.as_str()),
             CsqField::Symbol => escape_csq_str(tv.gene_symbol.as_deref().unwrap_or_default(), buf),
-            CsqField::Gene => escape_csq_str(&tv.gene_id, buf),
-            CsqField::FeatureType => buf.push_str("Transcript"),
-            CsqField::Feature => escape_csq_str(&tv.transcript_id, buf),
-            CsqField::Biotype => escape_csq_str(&tv.biotype, buf),
+            CsqField::Gene if !intergenic_placeholder => escape_csq_str(&tv.gene_id, buf),
+            CsqField::Gene => {}
+            CsqField::FeatureType if !intergenic_placeholder => buf.push_str("Transcript"),
+            CsqField::FeatureType => {}
+            CsqField::Feature if !intergenic_placeholder => escape_csq_str(&tv.transcript_id, buf),
+            CsqField::Feature => {}
+            CsqField::Biotype if !intergenic_placeholder => escape_csq_str(&tv.biotype, buf),
+            CsqField::Biotype => {}
             CsqField::Exon => {
-                if let Some((n, t)) = aa.exon {
-                    let _ = write!(buf, "{}/{}", n, t);
+                if let Some((first, last, total)) = aa.exon {
+                    let _ = write!(buf, "{}", first);
+                    if first != last {
+                        let _ = write!(buf, "-{}", last);
+                    }
+                    let _ = write!(buf, "/{}", total);
                 }
             }
             CsqField::Intron => {
-                if let Some((n, t)) = aa.intron {
-                    let _ = write!(buf, "{}/{}", n, t);
+                if let Some((first, last, total)) = aa.intron {
+                    let _ = write!(buf, "{}", first);
+                    if first != last {
+                        let _ = write!(buf, "-{}", last);
+                    }
+                    let _ = write!(buf, "/{}", total);
                 }
             }
             CsqField::Hgvsg => escape_csq_str(aa.hgvsg.as_deref().unwrap_or_default(), buf),
@@ -225,12 +241,23 @@ fn format_csq_entry_into(
                     escape_csq_str(ev, buf);
                 }
             }
-            CsqField::RefAllele => escape_csq_str(&vf.ref_allele.to_string(), buf),
+            CsqField::RefAllele if vf.minimised => escape_csq_str(&vf.ref_allele.to_string(), buf),
+            CsqField::RefAllele => escape_csq_str(
+                &normalized_csq_ref_allele(&vf.ref_allele, &aa.allele, vf.alt_alleles.len()),
+                buf,
+            ),
             CsqField::UploadedAllele => {
                 if let Some(ref vcf) = vf.vcf_fields {
+                    let start = buf.len();
                     escape_csq_str(&vcf.ref_allele, buf);
                     buf.push('/');
                     escape_csq_str(&vcf.alt, buf);
+                    // VEP preserves original_allele_string for indels. For
+                    // substitutions it falls back to the validated uppercase
+                    // allele string; preserve our established delimiter form.
+                    if vcf.alt.split(',').all(|alt| alt.len() == vcf.ref_allele.len()) {
+                        buf[start..].make_ascii_uppercase();
+                    }
                 } else {
                     escape_csq_str(&vf.ref_allele.to_string(), buf);
                     buf.push('/');
@@ -242,9 +269,10 @@ fn format_csq_entry_into(
                     let _ = write!(buf, "{}", d);
                 }
             }
-            CsqField::Strand => {
+            CsqField::Strand if !intergenic_placeholder => {
                 let _ = write!(buf, "{}", tv.strand.as_int());
             }
+            CsqField::Strand => {}
             CsqField::Flags => {
                 for (j, f) in tv.flags.iter().enumerate() {
                     if j > 0 {
@@ -1657,22 +1685,22 @@ fn normalized_csq_allele(
         return alt_allele.to_string();
     }
 
+    let mut prefix = 0;
+    while prefix < reference.len()
+        && prefix < alternate.len()
+        && reference[prefix].eq_ignore_ascii_case(&alternate[prefix])
+    {
+        prefix += 1;
+    }
+
     let mut ref_end = reference.len();
     let mut alt_end = alternate.len();
-    while ref_end > 0
-        && alt_end > 0
+    while ref_end > prefix
+        && alt_end > prefix
         && reference[ref_end - 1].eq_ignore_ascii_case(&alternate[alt_end - 1])
     {
         ref_end -= 1;
         alt_end -= 1;
-    }
-
-    let mut prefix = 0;
-    while prefix < ref_end
-        && prefix < alt_end
-        && reference[prefix].eq_ignore_ascii_case(&alternate[prefix])
-    {
-        prefix += 1;
     }
 
     if prefix == alt_end {
@@ -1680,6 +1708,47 @@ fn normalized_csq_allele(
     } else {
         String::from_utf8_lossy(&alternate[prefix..alt_end]).into_owned()
     }
+}
+
+/// VEP 115 minimizes a single REF/ALT pair from the left before the right when
+/// populating `REF_ALLELE`. This order matters in repeats even when both
+/// representations describe the same variant.
+fn normalized_csq_ref_allele(
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    alternate_count: usize,
+) -> String {
+    if alternate_count > 1 {
+        return ref_allele.to_string();
+    }
+
+    let (Allele::Sequence(reference), Allele::Sequence(alternate)) = (ref_allele, alt_allele)
+    else {
+        return ref_allele.to_string();
+    };
+    if reference.len() == alternate.len() {
+        return ref_allele.to_string();
+    }
+
+    let mut prefix = 0;
+    while prefix < reference.len()
+        && prefix < alternate.len()
+        && reference[prefix].eq_ignore_ascii_case(&alternate[prefix])
+    {
+        prefix += 1;
+    }
+
+    let mut ref_end = reference.len();
+    let mut alt_end = alternate.len();
+    while ref_end > prefix
+        && alt_end > prefix
+        && reference[ref_end - 1].eq_ignore_ascii_case(&alternate[alt_end - 1])
+    {
+        ref_end -= 1;
+        alt_end -= 1;
+    }
+
+    String::from_utf8_lossy(&reference[prefix..ref_end]).into_owned()
 }
 
 fn supplementary_alleles(vf: &VariationFeature) -> Vec<serde_json::Value> {
@@ -1886,16 +1955,24 @@ pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
                         serde_json::Value::String(format!("{}/{}", cdns.0, cdns.1)),
                     );
                 }
-                if let Some((n, t)) = aa.exon {
+                if let Some((first, last, total)) = aa.exon {
                     tc.insert(
                         "exon".into(),
-                        serde_json::Value::String(format!("{}/{}", n, t)),
+                        serde_json::Value::String(if first == last {
+                            format!("{}/{}", first, total)
+                        } else {
+                            format!("{}-{}/{}", first, last, total)
+                        }),
                     );
                 }
-                if let Some((n, t)) = aa.intron {
+                if let Some((first, last, total)) = aa.intron {
                     tc.insert(
                         "intron".into(),
-                        serde_json::Value::String(format!("{}/{}", n, t)),
+                        serde_json::Value::String(if first == last {
+                            format!("{}/{}", first, total)
+                        } else {
+                            format!("{}-{}/{}", first, last, total)
+                        }),
                     );
                 }
                 if let Some(ref h) = aa.hgvsg {
@@ -2208,6 +2285,58 @@ mod tests {
     }
 
     #[test]
+    fn csq_allele_uses_vep_left_first_minimization_in_repeats() {
+        assert_eq!(
+            normalized_csq_allele(
+                &Allele::from_str("GAT"),
+                &Allele::from_str("GATATATGTAT"),
+                1,
+            ),
+            "ATATGTAT"
+        );
+        assert_eq!(
+            normalized_csq_allele(
+                &Allele::from_str("GCACACACACA"),
+                &Allele::from_str("GCGCACACACACACACACA"),
+                1,
+            ),
+            "GCACACAC"
+        );
+        assert_eq!(
+            normalized_csq_allele(
+                &Allele::from_str("TCTCCTGTAGCATCTTTCCCTGTAGTTGTGTCCATTCCCCCTCCCTGACTTCTCCTC"),
+                &Allele::from_str("TCTCCTCCTGTAGCATCTTTCCCTGTAGTTGTGTCCATTCCCCCTCCCTGACTTCTCCTC"),
+                1,
+            ),
+            "CCT"
+        );
+    }
+
+    #[test]
+    fn csq_ref_allele_uses_vep_left_first_minimization() {
+        assert_eq!(
+            normalized_csq_ref_allele(&Allele::from_str("TT"), &Allele::from_str("T"), 1),
+            "T"
+        );
+        assert_eq!(
+            normalized_csq_ref_allele(&Allele::from_str("AAA"), &Allele::from_str("AAAA"), 1),
+            ""
+        );
+    }
+
+    #[test]
+    fn csq_ref_allele_preserves_multi_alt_and_equal_length_values() {
+        assert_eq!(
+            normalized_csq_ref_allele(&Allele::from_str("TT"), &Allele::from_str("T"), 2),
+            "TT"
+        );
+        assert_eq!(
+            normalized_csq_ref_allele(&Allele::from_str("AC"), &Allele::from_str("AG"), 1),
+            "AC"
+        );
+    }
+
+    #[test]
     fn test_csq_header() {
         let header = csq_header_line(&["Allele", "Consequence"]);
         assert!(header.contains("Format: Allele|Consequence"));
@@ -2232,6 +2361,37 @@ mod tests {
             "?-200"
         );
         assert_eq!(format_position_range(PositionRange::default()), "");
+    }
+
+    #[test]
+    fn uploaded_allele_preserves_indel_case_but_uppercases_substitutions() {
+        let template = projection_test_variant();
+        let tv = &template.transcript_variations[0];
+        let aa = &tv.allele_annotations[0];
+        for (reference, alternate, expected) in [
+            ("a", "g", "A/G"), ("ac", "gt", "AC/GT"),
+            ("a", "at", "a/at"), ("a", "g,t", "A/G&T"),
+            ("a", "g,at", "a/g&at"),
+        ] {
+            let vf = crate::vcf::parse_vcf_line(&format!(
+                "1\t100\t.\t{reference}\t{alternate}\t.\tPASS\t."
+            )).unwrap();
+            let mut output = String::new();
+            format_csq_entry_into(&vf, tv, aa, &[CsqField::UploadedAllele], &mut output);
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn parsed_csq_alleles_are_not_minimized_again_after_case_conversion() {
+        let template = projection_test_variant();
+        let tv = &template.transcript_variations[0];
+        let mut aa = tv.allele_annotations[0].clone();
+        let vf = crate::vcf::parse_vcf_line("1\t100\t.\ta\tAT\t.\tPASS\t.").unwrap();
+        aa.allele = vf.alt_alleles[0].clone();
+        let mut output = String::new();
+        format_csq_entry_into(&vf, tv, &aa, &[CsqField::Allele, CsqField::RefAllele], &mut output);
+        assert_eq!(output, "AT|A");
     }
 
     fn projection_test_variant() -> VariationFeature {
@@ -2350,6 +2510,42 @@ mod tests {
         assert_eq!(consequence["cds_end"], 90);
         assert_eq!(consequence["protein_start"], 30);
         assert_eq!(consequence["protein_end"], 30);
+    }
+
+    #[test]
+    fn intergenic_vcf_uses_vep_empty_feature_identity_without_changing_json() {
+        let mut vf = projection_test_variant();
+        let transcript = &mut vf.transcript_variations[0];
+        transcript.transcript_id = Arc::from("-");
+        transcript.gene_id = Arc::from("-");
+        transcript.gene_symbol = None;
+        transcript.biotype = Arc::from("-");
+        transcript.allele_annotations[0].consequences = vec![Consequence::IntergenicVariant];
+        transcript.allele_annotations[0].impact = Impact::Modifier;
+        vf.most_severe_consequence = Some(Consequence::IntergenicVariant);
+
+        assert_eq!(
+            format_csq(
+                &vf,
+                &[
+                    "Allele",
+                    "Consequence",
+                    "IMPACT",
+                    "SYMBOL",
+                    "Gene",
+                    "Feature_type",
+                    "Feature",
+                    "BIOTYPE",
+                    "STRAND",
+                ],
+            ),
+            "G|intergenic_variant|MODIFIER||||||"
+        );
+
+        let json = format_json(&vf, false);
+        assert_eq!(json["transcript_consequences"][0]["transcript_id"], "-");
+        assert_eq!(json["transcript_consequences"][0]["gene_id"], "-");
+        assert_eq!(json["transcript_consequences"][0]["biotype"], "-");
     }
 
     #[test]

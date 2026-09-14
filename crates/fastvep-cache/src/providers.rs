@@ -27,6 +27,30 @@ pub trait SequenceProvider: Send + Sync {
     }
 }
 
+/// Reuse the reference window already fetched for a variant's prediction.
+/// Requests outside that window retain the underlying provider's behavior.
+pub struct PrefetchedSequenceProvider<'a> {
+    pub inner: &'a dyn SequenceProvider,
+    pub chrom: &'a str,
+    pub start: u64,
+    pub bases: Option<&'a [u8]>,
+}
+
+impl SequenceProvider for PrefetchedSequenceProvider<'_> {
+    fn fetch_sequence(&self, chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+        if chrom == self.chrom && start >= self.start && end >= start {
+            if let Some(bases) = usize::try_from(start - self.start).ok()
+                .zip(end.checked_sub(self.start).and_then(|n| n.checked_add(1))
+                    .and_then(|n| usize::try_from(n).ok()))
+                .and_then(|(lo, hi)| self.bases.and_then(|bases| bases.get(lo..hi)))
+            {
+                return Ok(bases.to_vec());
+            }
+        }
+        self.inner.fetch_sequence(chrom, start, end)
+    }
+}
+
 /// In-memory transcript provider backed by a Vec<Transcript>.
 pub struct MemoryTranscriptProvider {
     transcripts: Vec<Transcript>,
@@ -61,18 +85,18 @@ impl TranscriptProvider for MemoryTranscriptProvider {
 }
 
 /// High-performance transcript provider using per-chromosome sorted arrays,
-/// binary search, and suffix-max-end for O(log n + k) lookups with early termination.
+/// binary search, and prefix-max-end for backward scans with early termination.
 ///
 /// Each chromosome's transcripts are sorted by start position. A parallel
-/// `suffix_max_end` array stores the maximum `end` value from index `i` to the
-/// end of the array, enabling early termination when scanning backwards:
-/// if `suffix_max_end[i] < query_start`, no transcript at index <= i can overlap.
+/// `prefix_max_end` array stores the maximum `end` value from the beginning through
+/// index `i`, enabling early termination when scanning backwards:
+/// if `prefix_max_end[i] < query_start`, no transcript at index <= i can overlap.
 pub struct IndexedTranscriptProvider {
     /// Transcripts grouped by chromosome, sorted by start position within each group.
     by_chrom: HashMap<Arc<str>, Vec<Transcript>>,
-    /// Suffix-max-end arrays: `suffix_max_end[chrom][i]` = max(end) for transcripts[i..].
+    /// Prefix-max-end arrays: `prefix_max_end[chrom][i]` = max(end) for transcripts[..=i].
     /// Enables early termination in backward scan.
-    suffix_max_end: HashMap<Arc<str>, Vec<u64>>,
+    prefix_max_end: HashMap<Arc<str>, Vec<u64>>,
 }
 
 impl IndexedTranscriptProvider {
@@ -88,22 +112,22 @@ impl IndexedTranscriptProvider {
         for trs in by_chrom.values_mut() {
             trs.sort_by_key(|t| t.start);
         }
-        // Build suffix-max-end arrays for early termination
-        let mut suffix_max_end = HashMap::new();
+        // Build prefix-max-end arrays for early termination
+        let mut prefix_max_end = HashMap::new();
         for (chrom, trs) in &by_chrom {
-            let n = trs.len();
-            let mut sme = vec![0u64; n];
-            if n > 0 {
-                sme[n - 1] = trs[n - 1].end;
-                for i in (0..n - 1).rev() {
-                    sme[i] = trs[i].end.max(sme[i + 1]);
-                }
-            }
-            suffix_max_end.insert(Arc::clone(chrom), sme);
+            let mut max_end = 0;
+            let ends = trs
+                .iter()
+                .map(|tr| {
+                    max_end = max_end.max(tr.end);
+                    max_end
+                })
+                .collect();
+            prefix_max_end.insert(Arc::clone(chrom), ends);
         }
         Self {
             by_chrom,
-            suffix_max_end,
+            prefix_max_end,
         }
     }
 
@@ -133,18 +157,18 @@ impl TranscriptProvider for IndexedTranscriptProvider {
             None => return Ok(Vec::new()),
         };
         let trs = &self.by_chrom[key];
-        let sme = &self.suffix_max_end[key];
+        let pme = &self.prefix_max_end[key];
 
         // Binary search: find the first transcript whose start > end (query end).
         // All transcripts that could overlap must have start <= end, so they're in [0..upper).
         let upper = trs.partition_point(|t| t.start <= end);
 
         // From [0..upper), filter those whose end >= start (query start).
-        // Use suffix_max_end for early termination: if the max end from index i
-        // onwards is less than query start, no transcript at i or earlier can overlap.
+        // Use prefix_max_end for early termination: if the max end through index i
+        // is less than query start, no transcript at i or earlier can overlap.
         let mut results = Vec::new();
         for i in (0..upper).rev() {
-            if sme[i] < start {
+            if pme[i] < start {
                 break; // No transcript from [0..=i] can reach query start
             }
             if trs[i].end >= start {
@@ -357,6 +381,23 @@ impl VariationProvider for TabixVariationProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefetched_reference_reuses_only_the_matching_complete_interval() {
+        struct Underlying;
+        impl super::SequenceProvider for Underlying {
+            fn fetch_sequence(&self, _: &str, _: u64, _: u64) -> anyhow::Result<Vec<u8>> {
+                Ok(b"fallback".to_vec())
+            }
+        }
+        let provider = super::PrefetchedSequenceProvider {
+            inner: &Underlying, chrom: "chr1", start: 10, bases: Some(b"ACGT"),
+        };
+        assert_eq!(provider.fetch_sequence("chr1", 11, 13).unwrap(), b"CGT");
+        for (chrom, lo, hi) in [("chr2", 10, 11), ("chr1", 9, 10),
+            ("chr1", 13, 14), ("chr1", 12, 11), ("chr1", 10, u64::MAX)] {
+            assert_eq!(provider.fetch_sequence(chrom, lo, hi).unwrap(), b"fallback");
+        }
+    }
     use super::*;
     use fastvep_core::Strand;
     use fastvep_genome::{Exon, Gene};
@@ -414,6 +455,7 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
     }
 
@@ -483,6 +525,84 @@ mod tests {
 
         // Transcript count
         assert_eq!(provider.transcript_count(), 3);
+    }
+
+    #[test]
+    fn test_indexed_provider_matches_linear_scan_for_nested_intervals() {
+        // A later short transcript must not hide an earlier long transcript.
+        let mut transcripts = vec![make_transcript("chr1", 1, 30)];
+        for start in 2..=12 {
+            for end in start..=12 {
+                transcripts.push(make_transcript("chr1", start, end));
+            }
+        }
+        transcripts.reverse(); // Construction must not depend on input order.
+        let linear = MemoryTranscriptProvider::new(transcripts.clone());
+        let indexed = IndexedTranscriptProvider::new(transcripts);
+        for start in 1..=32 {
+            for end in start..=32 {
+                let mut expected: Vec<_> = linear
+                    .get_transcripts("chr1", start, end)
+                    .unwrap()
+                    .iter()
+                    .map(|t| (t.start, t.end))
+                    .collect();
+                expected.sort_unstable();
+                for chrom in ["chr1", "1"] {
+                    let mut actual: Vec<_> = indexed
+                        .get_transcripts(chrom, start, end)
+                        .unwrap()
+                        .iter()
+                        .map(|t| (t.start, t.end))
+                        .collect();
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected, "{chrom}:{start}-{end}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires FASTVEP_INDEX_TEST_CACHE; exhaustive real-cache overlap audit"]
+    fn test_indexed_provider_real_cache_boundaries() {
+        let path = std::env::var("FASTVEP_INDEX_TEST_CACHE").expect("set FASTVEP_INDEX_TEST_CACHE");
+        let transcripts = crate::transcript_cache::load_cache(std::path::Path::new(&path)).unwrap();
+        let provider = IndexedTranscriptProvider::new(transcripts);
+        let mut queries = 0usize;
+        for (chrom, transcripts) in &provider.by_chrom {
+            let mut points = Vec::new();
+            for t in transcripts {
+                for boundary in [t.start, t.end] {
+                    points.extend([
+                        boundary.saturating_sub(1),
+                        boundary,
+                        boundary.saturating_add(1),
+                    ]);
+                }
+            }
+            points.sort_unstable();
+            points.dedup();
+            for point in points {
+                let expected: Vec<_> = transcripts
+                    .iter()
+                    .filter(|t| t.start <= point && t.end >= point)
+                    .map(|t| t as *const Transcript)
+                    .collect();
+                let actual: Vec<_> = provider
+                    .get_transcripts(chrom, point, point)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t as *const Transcript)
+                    .collect();
+                assert_eq!(actual, expected, "{chrom}:{point}");
+                queries += 1;
+            }
+        }
+        eprintln!(
+            "Verified {queries} boundary queries over {} transcripts on {} contigs",
+            provider.transcript_count(),
+            provider.by_chrom.len()
+        );
     }
 
     #[test]

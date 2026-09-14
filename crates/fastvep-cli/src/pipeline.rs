@@ -7,7 +7,7 @@ use fastvep_cache::gff::parse_gff3_with_source;
 use fastvep_cache::info::CacheInfo;
 use fastvep_cache::providers::{
     FastaSequenceProvider, IndexedTranscriptProvider, MatchedVariant, SequenceProvider,
-    TabixVariationProvider, TranscriptProvider, VariationProvider,
+    TabixVariationProvider, TranscriptProvider, VariationProvider, PrefetchedSequenceProvider,
 };
 use fastvep_consequence::ConsequencePredictor;
 use fastvep_hgvs;
@@ -355,6 +355,16 @@ pub fn run_annotate_with_exclusions(
     config: AnnotateConfig,
     exclude_transcripts: Option<String>,
 ) -> Result<()> {
+    run_annotate_with_mature_mirna_ranges(config, exclude_transcripts, HashMap::new())
+}
+
+/// Replay prevalidated transcript-relative mature-miRNA ranges through the
+/// ordinary pipeline. No external overlay is loaded by the production CLI.
+pub fn run_annotate_with_mature_mirna_ranges(
+    config: AnnotateConfig,
+    exclude_transcripts: Option<String>,
+    mut mature_mirna_ranges: HashMap<String, Vec<(u64, u64)>>,
+) -> Result<()> {
     eprintln!("Annotating: {} -> {}", config.input, config.output);
     let mut performance = config
         .profile_output
@@ -465,8 +475,22 @@ pub fn run_annotate_with_exclusions(
                             .unwrap_or(true)
                     };
                     if is_fresh {
-                        match fastvep_cache::transcript_cache::load_cache(cp) {
-                            Ok(mut trs) => {
+                        match fastvep_cache::annocat_cache::load(cp) {
+                            Ok(loaded) => {
+                                let mut trs = loaded.transcripts;
+                                for tr in &trs {
+                                    let key = format!("{}:{}", tr.chromosome, tr.stable_id);
+                                    if let Some(data) = loaded.enrichment.get(&key) {
+                                        if !data.mature_mirna_ranges.is_empty() {
+                                            anyhow::ensure!(!mature_mirna_ranges.contains_key(tr.stable_id.as_ref()),
+                                                "External mature-miRNA ranges cannot override cache data");
+                                            mature_mirna_ranges.insert(
+                                                tr.stable_id.to_string(),
+                                                data.mature_mirna_ranges.clone(),
+                                            );
+                                        }
+                                    }
+                                }
                                 // Re-stamp only in sidecar-cache + single-GFF3
                                 // mode. For explicit --transcript-cache we
                                 // preserve the on-disk labels so a merged
@@ -854,7 +878,8 @@ pub fn run_annotate_with_exclusions(
     }
 
     // Create consequence predictor
-    let predictor = ConsequencePredictor::new(config.distance, config.distance);
+    let predictor = ConsequencePredictor::new(config.distance, config.distance)
+        .with_mature_mirna_ranges(mature_mirna_ranges);
 
     // Open input VCF (supports plain text or gzipped VCF)
     let input_reader = open_vcf_input_reader(&config.input)?;
@@ -1069,12 +1094,15 @@ pub fn run_annotate_with_exclusions(
                 annotate_sa_only_scaffold(vf);
             } else {
                 let chrom = &vf.position.chromosome;
-                let query_start = if vf.position.start > config.distance {
-                    vf.position.start - config.distance
-                } else {
-                    1
-                };
-                let query_end = vf.position.end + config.distance;
+                // VEP AnnotationType::Transcript selects overlap after parser
+                // minimization, before creating transcript/allele annotations.
+                let query_position = vf.alt_alleles.first().map(|alternate| {
+                    fastvep_consequence::vep_input_position(
+                        &vf.position, &vf.ref_allele, alternate, vf.minimised || vf.alt_alleles.len() > 1,
+                    )
+                }).unwrap_or_else(|| vf.position.clone());
+                let query_start = query_position.start.saturating_sub(config.distance).max(1);
+                let query_end = query_position.end.saturating_add(config.distance);
                 let overlapping = transcript_provider
                     .get_transcripts(chrom, query_start, query_end)
                     .unwrap_or_default();
@@ -1096,6 +1124,9 @@ pub fn run_annotate_with_exclusions(
                     let ref_seq = seq_provider
                         .as_ref()
                         .and_then(|sp| sp.fetch_sequence(chrom, query_start, query_end).ok());
+                    let hgvs_provider = seq_provider.as_deref().map(|inner| PrefetchedSequenceProvider {
+                        inner, chrom, start: query_start, bases: ref_seq.as_deref(),
+                    });
 
                     // Run consequence prediction — dispatch SVs to SV predictor
                     let transcript_consequences = if vf.variant_type.is_structural() {
@@ -1110,12 +1141,13 @@ pub fn run_annotate_with_exclusions(
                             config.distance,
                         )
                     } else {
-                        let result = predictor.predict(
+                        let result = predictor.predict_with_parsed_input(
                             &vf.position,
                             &vf.ref_allele,
                             &vf.alt_alleles,
                             &overlapping,
                             ref_seq.as_deref(),
+                            vf.minimised,
                         );
                         result.transcript_consequences
                     };
@@ -1138,7 +1170,7 @@ pub fn run_annotate_with_exclusions(
                             .iter()
                             .map(|ac| {
                                 let (cdna_position, cds_position, protein_position) = transcript
-                                    .map(|tr| fastvep_annotate::vep_position_ranges(tr, ac))
+                                    .map(|tr| fastvep_annotate::vep_position_ranges(tr, ac, vf))
                                     .unwrap_or_else(|| {
                                         (
                                             fastvep_annotate::zip_positions(
@@ -1184,6 +1216,21 @@ pub fn run_annotate_with_exclusions(
                                     acmg_classification: None,
                                 };
 
+                                if let Some(change) = transcript
+                                    .filter(|_| ac.amino_acids.is_some() || ac.codons.is_some())
+                                    .and_then(|tr| {
+                                        predictor.display_coding_change(
+                                            &vf.position,
+                                            &vf.ref_allele,
+                                            &ac.allele,
+                                            tr,
+                                            vf.minimised || vf.alt_alleles.len() > 1,
+                                        )
+                                    })
+                                {
+                                    ann.amino_acids = change.amino_acids;
+                                    ann.codons = change.codons;
+                                }
                                 // Generate HGVS if requested
                                 if config.hgvs {
                                     ann.hgvsg = Some(fastvep_hgvs::hgvsg(
@@ -1200,26 +1247,27 @@ pub fn run_annotate_with_exclusions(
                                             None => tc.transcript_id.to_string(),
                                         };
 
-                                        ann.hgvsc = hgvsc_for_allele(
-                                            seq_provider
-                                                .as_deref()
+                                        ann.hgvsc = hgvsc_for_variation_allele(
+                                            hgvs_provider
+                                                .as_ref()
                                                 .map(|sp| sp as &dyn SequenceProvider),
                                             chrom,
                                             tr,
                                             &versioned_tid,
+                                            vf,
                                             ac,
                                         );
-                                        if ann.hgvsc.is_some() {
-                                            ann.hgvs_offset =
-                                                fastvep_annotate::hgvs_offset_for_allele(
-                                                    seq_provider
-                                                        .as_deref()
-                                                        .map(|sp| sp as &dyn SequenceProvider),
-                                                    chrom,
-                                                    tr,
-                                                    ac,
-                                                );
-                                        }
+                                        // Calculate the shift before protein HGVS so both
+                                        // notations use the same transcript-relative normalization.
+                                        ann.hgvs_offset = fastvep_annotate::hgvs_offset_for_allele(
+                                            hgvs_provider
+                                                .as_ref()
+                                                .map(|sp| sp as &dyn SequenceProvider),
+                                            chrom,
+                                            tr,
+                                            vf,
+                                            ac,
+                                        );
                                     }
 
                                     if let Some(tr) = transcript {
@@ -1235,17 +1283,25 @@ pub fn run_annotate_with_exclusions(
                                                 }
                                                 None => pid.clone(),
                                             };
-                                            ann.hgvsp = fastvep_annotate::hgvsp_for_allele(
-                                                seq_provider
-                                                    .as_deref()
-                                                    .map(|sp| sp as &dyn SequenceProvider),
-                                                chrom,
-                                                tr,
-                                                &versioned_pid,
-                                                ac,
-                                                &vf.ref_allele,
-                                                ann.hgvsc.as_deref(),
-                                            );
+                                            ann.hgvsp =
+                                                fastvep_annotate::hgvsp_for_variation_allele_with_offset(
+                                                    hgvs_provider
+                                                        .as_ref()
+                                                        .map(|sp| sp as &dyn SequenceProvider),
+                                                    chrom,
+                                                    tr,
+                                                    &versioned_pid,
+                                                    ac,
+                                                    vf,
+                                                    ann.hgvsc.as_deref(),
+                                                    ann.hgvs_offset,
+                                                );
+                                        }
+                                        // HGVS_OFFSET describes a shift applied to a reported
+                                        // transcript or protein HGVS notation. Do not expose an
+                                        // otherwise internal shift when neither notation rendered.
+                                        if ann.hgvsc.is_none() && ann.hgvsp.is_none() {
+                                            ann.hgvs_offset = None;
                                         }
                                     }
                                 }
@@ -1303,7 +1359,7 @@ pub fn run_annotate_with_exclusions(
         let sa_queries_by_variant: Vec<Vec<(String, u64, String, String)>> = batch
             .iter()
             .map(|(vf, _)| {
-                let sa_queries = supplementary_query_alleles(vf);
+                let sa_queries = vf.supplementary_query_alleles();
                 let mut seen = std::collections::HashSet::new();
                 let mut queries = Vec::new();
                 for tv in &vf.transcript_variations {
@@ -1501,7 +1557,7 @@ pub fn run_annotate_with_exclusions(
                                 aa.amino_acids.as_ref(),
                                 aa.protein_position.first_known(),
                                 aa.hgvsc.as_deref(),
-                                aa.exon,
+                                aa.exon.map(|(first, _, total)| (first, total)),
                                 &aa.supplementary,
                                 &gene_anns,
                                 &vf.supplementary_annotations,
@@ -1665,8 +1721,8 @@ pub fn run_annotate_with_exclusions(
 
 // Shared annotation utilities from fastvep-annotate (used by batch pipeline).
 use fastvep_annotate::{
-    annotate_intergenic, annotate_sa_only_scaffold, hgvsc_for_allele, load_gene_providers,
-    load_sa_providers,
+    annotate_intergenic, annotate_sa_only_scaffold, hgvsc_for_variation_allele,
+    load_gene_providers, load_sa_providers,
 };
 
 /// Index of the best transcript variation under VEP's default `--pick_order`
@@ -1977,7 +2033,7 @@ fn enrich_compound_het_batch(
                 aa.amino_acids.as_ref(),
                 aa.protein_position.first_known(),
                 aa.hgvsc.as_deref(),
-                aa.exon,
+                aa.exon.map(|(first, _, total)| (first, total)),
                 &aa.supplementary,
                 &gene_anns,
                 &vf.supplementary_annotations,
@@ -1994,41 +2050,6 @@ fn enrich_compound_het_batch(
     }
 }
 
-fn supplementary_query_alleles(vf: &VariationFeature) -> Vec<(String, u64, String, String)> {
-    if let Some(vcf) = &vf.vcf_fields {
-        let uploaded_alts: Vec<&str> = vcf.alt.split(',').collect();
-        return vf
-            .alt_alleles
-            .iter()
-            .enumerate()
-            .map(|(idx, allele)| {
-                let allele_string = allele.to_string();
-                (
-                    allele_string.clone(),
-                    vcf.pos,
-                    vcf.ref_allele.clone(),
-                    uploaded_alts
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(&allele_string)
-                        .to_string(),
-                )
-            })
-            .collect();
-    }
-
-    vf.alt_alleles
-        .iter()
-        .map(|allele| {
-            (
-                allele.to_string(),
-                vf.position.start,
-                vf.ref_allele.to_string(),
-                allele.to_string(),
-            )
-        })
-        .collect()
-}
 
 fn write_vcf_line(
     writer: &mut impl Write,
@@ -2411,7 +2432,7 @@ pub fn run_cache_build(
     Ok(())
 }
 
-fn acquire_cache_build_lock(output_path: &str) -> Result<File> {
+pub fn acquire_cache_build_lock(output_path: &str) -> Result<File> {
     let lock_path = Path::new(output_path).with_extension("cache.build.lock");
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
@@ -5971,6 +5992,7 @@ mod custom_source_tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         };
         let trs = vec![
             make("Ensembl", "ENST00000001", "ENSG00000001"),

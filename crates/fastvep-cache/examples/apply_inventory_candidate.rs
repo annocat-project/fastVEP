@@ -230,6 +230,7 @@ fn added_transcript(value: Value, prefixed: bool) -> Result<Transcript> {
         gencode_primary: record.metadata.gencode_primary,
         flags: record.metadata.flags,
         codon_table_start_phase: record.coding.start_phase.unwrap_or(0),
+        reference_peptide: None,
     })
 }
 

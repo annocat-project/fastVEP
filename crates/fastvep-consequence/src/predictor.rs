@@ -1,5 +1,6 @@
 use fastvep_core::{Allele, Consequence, GenomicPosition, Impact, Strand};
 use fastvep_genome::{is_mitochondrial, mitochondrial_codon_table, CodonTable, Transcript};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::splice;
@@ -28,6 +29,9 @@ pub struct AlleleConsequenceResult {
     pub normalized_ref_allele: Allele,
     pub normalized_alt_allele: Allele,
     pub consequences: Vec<Consequence>,
+    /// Coding frameshift predicate before genomic allele-shape output gates.
+    /// VEP calls this predicate directly when selecting the HGVSp path.
+    pub frameshift: bool,
     pub impact: Impact,
     /// Transcript-relative coordinate pairs, in *strand order*: `start` is the
     /// position of the genomically leftmost affected base and `end` the
@@ -61,8 +65,8 @@ pub struct AlleleConsequenceResult {
     /// scalar. See `fastvep_hgvs::protein` and issue #89.
     pub amino_acids: Option<(String, String)>,
     pub codons: Option<(String, String)>,
-    pub exon: Option<(u32, u32)>,
-    pub intron: Option<(u32, u32)>,
+    pub exon: Option<(u32, u32, u32)>,
+    pub intron: Option<(u32, u32, u32)>,
     pub distance: Option<i64>,
 }
 
@@ -86,10 +90,8 @@ fn start_codon_known(transcript: &Transcript) -> bool {
 /// limited to those two source annotations; other peptide/translation
 /// disagreements require their own causal replay before they may affect output.
 ///
-/// This describes the *reference* protein, so it must never be applied to an alt
-/// residue that the variant changed - doing so would rewrite a genuine
-/// `stop_gained` into the reference residue. Callers pass alt residues through
-/// only for codons the variant leaves untouched.
+/// VEP applies these edits only to the reference allele, including when an
+/// alternate window contains an unchanged copy of the edited codon.
 fn resolve_annotated_residue(transcript: &Transcript, codon_index: usize, translated: u8) -> u8 {
     let annotated = transcript
         .peptide
@@ -196,6 +198,9 @@ struct CodonWindow {
     /// `_get_peptide_alleles` maps its `-` to `''` before any predicate sees it.
     ref_aas: String,
     alt_aas: String,
+    /// Ambiguous input alleles have undefined peptides, unlike translated X residues.
+    peptides_defined: bool,
+    alt_dna_unambiguous: bool,
     ref_window: Vec<u8>,
     alt_window: Vec<u8>,
     /// Rendered with the replaced span uppercase; `-` for an empty side.
@@ -237,6 +242,7 @@ pub struct ConsequencePredictor {
     /// the mitochondrial chromosome (see [`is_mitochondrial`]). Built once
     /// up front so per-allele translation doesn't reconstruct the table.
     mt_codon_table: CodonTable,
+    mature_mirna_ranges: Arc<HashMap<String, Vec<(u64, u64)>>>,
 }
 
 impl ConsequencePredictor {
@@ -246,7 +252,43 @@ impl ConsequencePredictor {
             downstream_distance,
             codon_table: CodonTable::standard(),
             mt_codon_table: mitochondrial_codon_table(),
+            mature_mirna_ranges: Arc::new(HashMap::new()),
         }
+    }
+
+    pub fn with_mature_mirna_ranges(mut self, ranges: HashMap<String, Vec<(u64, u64)>>) -> Self {
+        self.mature_mirna_ranges = Arc::new(ranges);
+        self
+    }
+
+    /// Output-only codon window for a non-minimal biallelic replacement.
+    /// Do not feed this window back into consequence or HGVS construction.
+    pub fn display_coding_change(
+        &self,
+        position: &GenomicPosition,
+        reference: &Allele,
+        alternate: &Allele,
+        transcript: &Transcript,
+        preserve_input: bool,
+    ) -> Option<CodingChange> {
+        if reference.len() <= 1 || alternate.len() <= 1 {
+            return None;
+        }
+        let (pos, r, a) = vep_input_variant(position, reference, alternate, preserve_input);
+        if r == *reference && a == *alternate {
+            return None;
+        }
+        let start = transcript.genomic_to_cdna(pos.start);
+        let end = transcript.genomic_to_cdna(pos.end);
+        self.predict_coding_consequence(
+            &r,
+            &a,
+            transcript,
+            start.and_then(|p| transcript.cdna_to_cds(p)),
+            end.and_then(|p| transcript.cdna_to_cds(p)),
+            start,
+            end,
+        )
     }
 
     /// Select the codon table to use for a given transcript: the vertebrate
@@ -271,11 +313,25 @@ impl ConsequencePredictor {
         transcripts: &[&Transcript],
         ref_seq: Option<&[u8]>,
     ) -> PredictionResult {
+        self.predict_with_parsed_input(position, ref_allele, alt_alleles, transcripts, ref_seq, false)
+    }
+
+    /// Preserve input coordinates when a parser has already completed its
+    /// minimization pass. Repeating it after case conversion is not idempotent.
+    pub fn predict_with_parsed_input(
+        &self,
+        position: &GenomicPosition,
+        ref_allele: &Allele,
+        alt_alleles: &[Allele],
+        transcripts: &[&Transcript],
+        ref_seq: Option<&[u8]>,
+        input_parsed: bool,
+    ) -> PredictionResult {
         let mut transcript_consequences = Vec::new();
 
         for transcript in transcripts {
             let tc =
-                self.predict_transcript(position, ref_allele, alt_alleles, transcript, ref_seq);
+                self.predict_transcript(position, ref_allele, alt_alleles, transcript, ref_seq, input_parsed);
             transcript_consequences.push(tc);
         }
 
@@ -303,10 +359,22 @@ impl ConsequencePredictor {
         alt_alleles: &[Allele],
         transcript: &Transcript,
         ref_seq: Option<&[u8]>,
+        input_parsed: bool,
     ) -> TranscriptConsequence {
         let allele_consequences: Vec<AlleleConsequenceResult> = alt_alleles
             .iter()
-            .map(|alt| self.predict_allele(position, ref_allele, alt, transcript, ref_seq))
+            // VEP discards repeated REF after parsing; retain raw ALT count for normalization.
+            .filter(|alt| *alt != ref_allele)
+            .map(|alt| {
+                self.predict_allele(
+                    position,
+                    ref_allele,
+                    alt,
+                    input_parsed || alt_alleles.len() > 1,
+                    transcript,
+                    ref_seq,
+                )
+            })
             .collect();
 
         TranscriptConsequence {
@@ -325,6 +393,7 @@ impl ConsequencePredictor {
         position: &GenomicPosition,
         ref_allele: &Allele,
         alt_allele: &Allele,
+        preserve_input: bool,
         transcript: &Transcript,
         _ref_seq: Option<&[u8]>,
     ) -> AlleleConsequenceResult {
@@ -341,6 +410,7 @@ impl ConsequencePredictor {
                 normalized_ref_allele: ref_allele.clone(),
                 normalized_alt_allele: alt_allele.clone(),
                 consequences: Vec::new(),
+                frameshift: false,
                 impact: Impact::Modifier,
                 cdna_start: None,
                 cdna_end: None,
@@ -361,6 +431,15 @@ impl ConsequencePredictor {
             minimize_allele(position, ref_allele, alt_allele);
         let var_start = position.start;
         let var_end = position.end;
+        // VEP 115 minimises a biallelic non-minimal indel before it compares
+        // the variant with transcript and splice boundaries. Keep FastVEP's
+        // established consequence/HGVS coordinates below, but use the VEP
+        // parser's left-first representation for location predicates and
+        // displayed positions.
+        let (predicate_position, predicate_ref, predicate_alt) =
+            vep_input_variant(position, ref_allele, alt_allele, preserve_input);
+        let distance_start = predicate_position.start;
+        let distance_end = predicate_position.end;
         let tr_start = transcript.start;
         let tr_end = transcript.end;
 
@@ -370,29 +449,30 @@ impl ConsequencePredictor {
         let mut protein_start = None;
         let mut protein_end = None;
         let mut amino_acids = None;
+        let mut frameshift = false;
         let mut codons = None;
         let mut distance = None;
 
         // 1. Check if variant overlaps the transcript at all
-        let overlaps = var_start <= tr_end && var_end >= tr_start;
+        let overlaps = distance_start <= tr_end && distance_end >= tr_start;
 
         if !overlaps {
             // Check upstream/downstream
-            let dist = self.distance_to_transcript(var_start, var_end, transcript);
+            let dist = self.distance_to_transcript(distance_start, distance_end, transcript);
             if let Some(d) = dist {
                 distance = Some(d);
                 let abs_dist = d.unsigned_abs();
                 if abs_dist <= self.upstream_distance {
                     match transcript.strand {
                         Strand::Forward => {
-                            if var_end < tr_start {
+                            if distance_end < tr_start {
                                 consequences.push(Consequence::UpstreamGeneVariant);
                             } else {
                                 consequences.push(Consequence::DownstreamGeneVariant);
                             }
                         }
                         Strand::Reverse => {
-                            if var_start > tr_end {
+                            if distance_start > tr_end {
                                 consequences.push(Consequence::UpstreamGeneVariant);
                             } else {
                                 consequences.push(Consequence::DownstreamGeneVariant);
@@ -413,6 +493,7 @@ impl ConsequencePredictor {
                 normalized_ref_allele,
                 normalized_alt_allele,
                 consequences,
+                frameshift: false,
                 impact,
                 cdna_start: None,
                 cdna_end: None,
@@ -437,37 +518,48 @@ impl ConsequencePredictor {
         // only when both flanking bases belong to that same region. Treating
         // the flanks as an inclusive range made exon-boundary insertions both
         // exonic and intronic, unlike VEP.
+        let predicate_start = predicate_position.start;
+        let predicate_end = predicate_position.end;
         let is_insertion = var_end.checked_add(1) == Some(var_start);
         // Coding prediction still needs the adjacent exon at a boundary even
         // though VEP leaves the insertion's EXON field blank.
+        // Use VEP's input coordinates for exon overlap, just as for introns
+        // and splice predicates; padding can straddle an exon boundary.
         let reaches_exon = transcript
-            .exon_at(var_start)
-            .or_else(|| transcript.exon_overlapping(var_start, var_end));
+            .exon_at(predicate_start)
+            .or_else(|| transcript.exon_overlapping(predicate_start, predicate_end));
         let exon_info = if is_insertion {
-            match (transcript.exon_at(var_end), transcript.exon_at(var_start)) {
-                (Some(left), Some(right)) if left == right => Some(left),
+            match (transcript.exon_at(predicate_end), transcript.exon_at(predicate_start)) {
+                (Some((rank, total)), Some(right)) if (rank, total) == right => Some((rank, rank, total)),
                 _ => None,
             }
         } else {
-            reaches_exon
+            // VEP exon_number reports the full range in transcript order.
+            transcript.exon_range_overlapping(predicate_start, predicate_end)
         }
-        .map(|(i, t)| (i as u32 + 1, t as u32));
+        .map(|(first, last, t)| (first as u32 + 1, last as u32 + 1, t as u32));
         let intron_info = if is_insertion {
             match (
-                transcript.intron_at(var_end),
-                transcript.intron_at(var_start),
+                transcript.intron_at(predicate_end),
+                transcript.intron_at(predicate_start),
             ) {
-                (Some(left), Some(right)) if left == right => Some(left),
+                (Some((i, total)), Some(right)) if (i, total) == right => Some((i, i, total)),
                 _ => None,
             }
         } else {
-            transcript
-                .intron_at(var_start)
-                .or_else(|| transcript.intron_overlapping(var_start, var_end))
+            // VEP BaseTranscriptVariation::intron_number reports every
+            // overlapped intron, sorted in transcript order.
+            transcript.intron_overlapping(predicate_start, predicate_end)
         }
-        .map(|(i, t)| (i as u32 + 1, t as u32));
+        .map(|(first, last, t)| (first as u32 + 1, last as u32 + 1, t as u32));
 
-        let in_exon = exon_info.is_some();
+        let preclassified_exon = splice::overlaps_exon_for_consequence_predicates(
+            transcript,
+            predicate_start,
+            predicate_end,
+        );
+        let within_frameshift_intron =
+            splice::within_frameshift_intron(transcript, predicate_start, predicate_end);
 
         // 4. Check splice sites (always check regardless of coding status)
         //
@@ -479,7 +571,14 @@ impl ConsequencePredictor {
         //
         // Measured over a 6,600-variant ClinVar sample against real VEP 115.1,
         // this took the splice-term error from 1,503 rows of 150,725 to none.
-        let splice = splice::splice_effects(transcript, var_start, var_end, ref_allele, alt_allele);
+        let splice = splice::splice_effects_preclassified(
+            transcript,
+            predicate_start,
+            predicate_end,
+            &predicate_ref,
+            &predicate_alt,
+            preclassified_exon,
+        );
         if splice.donor {
             consequences.push(Consequence::SpliceDonorVariant);
         }
@@ -529,12 +628,13 @@ impl ConsequencePredictor {
             // `3_prime_UTR_variant` alone, MODIFIER where VEP says HIGH, and
             // the mirror case on the forward strand lost `start_lost` the same
             // way (#100). Each region is now its own additive test.
-            let hits_coding = reaches_exon.is_some()
+            let reaches_coding_exon = reaches_exon.is_some() || within_frameshift_intron;
+            let hits_coding = reaches_coding_exon
                 && self.is_in_coding_region(var_start, var_end, coding_start, coding_end);
             let hits_5_utr =
-                reaches_exon.is_some() && self.overlaps_5_utr(var_start, var_end, transcript);
+                reaches_coding_exon && self.overlaps_5_utr(var_start, var_end, transcript);
             let hits_3_utr =
-                reaches_exon.is_some() && self.overlaps_3_utr(var_start, var_end, transcript);
+                reaches_coding_exon && self.overlaps_3_utr(var_start, var_end, transcript);
 
             if hits_5_utr {
                 consequences.push(Consequence::FivePrimeUtrVariant);
@@ -548,8 +648,25 @@ impl ConsequencePredictor {
                     ref_allele, alt_allele, transcript, cds_start, cds_end, cdna_start, cdna_end,
                 );
                 if let Some(change) = coding_conseq {
-                    consequences.push(change.consequence);
-                    consequences.extend(change.additional);
+                    // Constants.pm filters output terms by genomic allele
+                    // shape; predicates called by other predicates still use
+                    // mapped CDS lengths, which exclude intervening introns.
+                    let genomic_ref_len = ref_allele.len();
+                    let genomic_alt_len = alt_allele.len();
+                    frameshift = change.consequence == Consequence::FrameshiftVariant
+                        || change.additional.contains(&Consequence::FrameshiftVariant);
+                    consequences.extend(std::iter::once(change.consequence)
+                        .chain(change.additional)
+                        .filter(|term| match term {
+                            Consequence::FrameshiftVariant => genomic_ref_len != genomic_alt_len,
+                            Consequence::InframeInsertion => genomic_alt_len > genomic_ref_len,
+                            Consequence::InframeDeletion => genomic_alt_len < genomic_ref_len,
+                            Consequence::MissenseVariant => genomic_alt_len == genomic_ref_len,
+                            // A resolved coding window can fire no predicate.
+                            // Apply VEP's default only after splice/NMD terms.
+                            Consequence::IntergenicVariant => false,
+                            _ => true,
+                        }));
                     amino_acids = change.amino_acids;
                     codons = change.codons;
                 } else {
@@ -567,7 +684,11 @@ impl ConsequencePredictor {
             }
         } else {
             // Non-coding transcript
-            if in_exon {
+            if self.overlaps_mature_mirna(transcript, predicate_start, predicate_end) {
+                consequences.push(Consequence::MatureMirnaVariant);
+            // VEP non_coding_exon_variant rechecks actual exon overlap;
+            // frameshift-intron preclassification alone is insufficient.
+            } else if exon_info.is_some() {
                 consequences.push(Consequence::NonCodingTranscriptExonVariant);
             } else {
                 consequences.push(Consequence::NonCodingTranscriptVariant);
@@ -577,18 +698,49 @@ impl ConsequencePredictor {
             }
         }
 
-        // If still no consequences, add catch-all
-        if consequences.is_empty() {
-            if transcript.is_coding() {
-                consequences.push(Consequence::CodingTranscriptVariant);
-            } else {
-                consequences.push(Consequence::NonCodingTranscriptVariant);
-            }
-        }
-
         // Add NMD_transcript_variant modifier for nonsense_mediated_decay transcripts
         if &*transcript.biotype == "nonsense_mediated_decay" {
             consequences.push(Consequence::NmdTranscriptVariant);
+        }
+
+        // VEP feature_ablation and feature_amplification are tier 1: whole
+        // transcript losses or exact tandem gains exclude lower consequence
+        // tiers. Keep independently calculated position fields.
+        if predicate_start <= tr_start && predicate_end >= tr_end {
+            if predicate_alt.len() < predicate_ref.len() {
+                consequences.clear();
+                consequences.push(Consequence::TranscriptAblation);
+            } else if !predicate_ref.is_empty()
+                && predicate_alt.len() > predicate_ref.len()
+                && predicate_alt.len() % predicate_ref.len() == 0
+                && predicate_alt.as_bytes().chunks(predicate_ref.len())
+                    .all(|copy| copy == predicate_ref.as_bytes())
+            {
+                // VariationEffect::feature_amplification -> tandem_repeat.
+                consequences.clear();
+                consequences.push(Consequence::TranscriptAmplification);
+            } else {
+                // coding_unknown and non_coding_exon_variant both reject
+                // complete overlap, independently of genomic allele shape.
+                consequences.retain(|term| !matches!(term,
+                    Consequence::CodingSequenceVariant | Consequence::NonCodingTranscriptExonVariant));
+                if transcript.is_coding() {
+                    if &*transcript.biotype == "protein_coding" {
+                        consequences.push(Consequence::CodingTranscriptVariant);
+                    } else {
+                        consequences.retain(|term| *term != Consequence::CodingTranscriptVariant);
+                    }
+                } else if !consequences.contains(&Consequence::MatureMirnaVariant) {
+                    consequences.push(Consequence::NonCodingTranscriptVariant);
+                }
+            }
+        }
+
+        // BaseVariationFeatureOverlapAllele::get_all_OverlapConsequences uses
+        // DEFAULT_OVERLAP_CONSEQUENCE only after every predicate, including NMD.
+        // Even a transcript-overlapping variant can have no applicable term.
+        if consequences.is_empty() {
+            consequences.push(Consequence::IntergenicVariant);
         }
 
         // Deduplicate
@@ -596,6 +748,13 @@ impl ConsequencePredictor {
         consequences.dedup();
 
         let impact = Consequence::worst_impact(&consequences).unwrap_or(Impact::Modifier);
+        // VEP exposes cDNA/CDS/protein position columns from the input
+        // parser's left-first coordinates, independently of the later
+        // transcript-most-3' HGVS normalization. Keep the local values above
+        // for consequence and HGVSp prediction, then project cDNA for the
+        // output-layer position calculation.
+        let reported_cdna_start = transcript.genomic_to_cdna(distance_start);
+        let reported_cdna_end = transcript.genomic_to_cdna(distance_end);
 
         AlleleConsequenceResult {
             allele: uploaded_allele,
@@ -603,9 +762,10 @@ impl ConsequencePredictor {
             normalized_ref_allele,
             normalized_alt_allele,
             consequences,
+            frameshift,
             impact,
-            cdna_start,
-            cdna_end,
+            cdna_start: reported_cdna_start,
+            cdna_end: reported_cdna_end,
             cds_start,
             cds_end,
             protein_start,
@@ -616,6 +776,56 @@ impl ConsequencePredictor {
             intron: intron_info,
             distance,
         }
+    }
+
+    /// Match VEP's `within_mature_miRNA`: stored ranges are transcript-relative
+    /// cDNA coordinates and may cross exon boundaries, so compare each mapped
+    /// exon segment rather than treating the complete range as genomic.
+    fn overlaps_mature_mirna(
+        &self,
+        transcript: &Transcript,
+        variant_start: u64,
+        variant_end: u64,
+    ) -> bool {
+        if transcript.biotype.as_ref() != "miRNA" {
+            return false;
+        }
+        let Some(ranges) = self.mature_mirna_ranges.get(transcript.stable_id.as_ref()) else {
+            return false;
+        };
+
+        let mut exons = transcript.exons.iter().collect::<Vec<_>>();
+        match transcript.strand {
+            Strand::Forward => exons.sort_by_key(|exon| exon.start),
+            Strand::Reverse => exons.sort_by(|left, right| right.start.cmp(&left.start)),
+        }
+        let mut exon_cdna_start = 1;
+        for exon in exons {
+            let exon_length = exon.end - exon.start + 1;
+            let exon_cdna_end = exon_cdna_start + exon_length - 1;
+            for &(range_start, range_end) in ranges {
+                let segment_start = range_start.max(exon_cdna_start);
+                let segment_end = range_end.min(exon_cdna_end);
+                if segment_start > segment_end {
+                    continue;
+                }
+                let (genomic_start, genomic_end) = match transcript.strand {
+                    Strand::Forward => (
+                        exon.start + segment_start - exon_cdna_start,
+                        exon.start + segment_end - exon_cdna_start,
+                    ),
+                    Strand::Reverse => (
+                        exon.end - (segment_end - exon_cdna_start),
+                        exon.end - (segment_start - exon_cdna_start),
+                    ),
+                };
+                if variant_start <= genomic_end && variant_end >= genomic_start {
+                    return true;
+                }
+            }
+            exon_cdna_start = exon_cdna_end + 1;
+        }
+        false
     }
 
     /// Predict the coding consequence (missense, synonymous, frameshift, etc.)
@@ -656,10 +866,44 @@ impl ConsequencePredictor {
             }
             _ => false,
         };
+        // TranscriptMapper preserves a leading intronic gap, so VEP's
+        // translation_start is undefined there. A UTR endpoint still has
+        // cDNA coordinates and is handled within its mapped exon instead.
+        let mapped_translation_start = match transcript.strand {
+            Strand::Forward => cdna_start,
+            Strand::Reverse => cdna_end,
+        }.and_then(|cdna| transcript.cdna_to_cds(cdna));
+        let partial_codon = mapped_translation_start.is_some() && transcript
+            .translateable_seq
+            .as_deref()
+            .zip(cds_start.into_iter().chain(cds_end).min())
+            .is_some_and(|(seq, cds_s)| {
+                // VEP `partial_codon` uses transcript-order translation
+                // start, including a sole mapped reverse-strand endpoint.
+                let codon_start = (cds_s.saturating_sub(1) as usize / 3) * 3;
+                codon_start < seq.len() && codon_start + 3 > seq.len()
+            });
         if reaches_past_cds {
-            return self.predict_cds_boundary_consequence(
+            let mut change = self.predict_cds_boundary_consequence(
                 ref_allele, alt_allele, transcript, cdna_start, cdna_end,
             );
+            // VEP partial_codon is independent of the UTR boundary predicate.
+            if partial_codon {
+                // stop_retained rejects partial_codon before its CDS/UTR
+                // fallback; stop_lost remains an independent predicate.
+                if let Some(change) = &mut change {
+                    if change.consequence == Consequence::StopRetainedVariant {
+                        change.consequence = Consequence::CodingSequenceVariant;
+                    }
+                }
+                change
+                    .get_or_insert_with(|| {
+                        CodingChange::single(Consequence::CodingSequenceVariant, None, None)
+                    })
+                    .additional
+                    .push(Consequence::IncompleteTerminalCodonVariant);
+            }
+            return change;
         }
         // One codon window answers every shape. A CDS-internal change is a
         // codon edit whatever its allele string looks like: an SNV, a
@@ -677,14 +921,6 @@ impl ConsequencePredictor {
             // `coding_sequence_variant`. Anything else that has no window - a
             // change not contiguous in CDS space - is `coding_sequence_variant`
             // alone, which is what `None` gives the caller.
-            let partial_codon = transcript
-                .translateable_seq
-                .as_deref()
-                .zip(cds_start)
-                .is_some_and(|(seq, cds_s)| {
-                    let first = cds_s.saturating_sub(1) as usize;
-                    (first / 3) * 3 + 3 > seq.len()
-                });
             return partial_codon.then_some(CodingChange {
                 consequence: Consequence::CodingSequenceVariant,
                 additional: vec![Consequence::IncompleteTerminalCodonVariant],
@@ -704,45 +940,64 @@ impl ConsequencePredictor {
         // insertion is the exception both ways round: it is the zero-length
         // interval `end = start - 1`, and keeping it inverted is what makes an
         // insertion count only where it sits *inside* the initiator.
-        let overlaps_initiator = start_codon_known(transcript)
-            && match (cds_start, cds_end) {
-                (Some(s), Some(e)) => {
-                    let (lo, hi) = (s.min(e), s.max(e));
-                    let (s, e) = if *ref_allele == Allele::Deletion {
-                        (hi, lo)
-                    } else {
-                        (lo, hi)
-                    };
-                    s <= 3 && e >= 1
-                }
-                _ => false,
-            };
+        // The window already resolves Mapper::map_insert's surviving exon
+        // endpoint. Requiring two directly mapped endpoints loses split starts.
+        let overlaps_initiator =
+            start_codon_known(transcript) && window.tl_start == 1 && window.tl_end >= 1;
 
         // Ensembl's `_peptide` is the protein without its terminator; ours
         // carries it, because that is what the annotation's own translation
         // ends with.
-        let peptide = transcript.peptide.as_deref();
-        let previous_cdna_base = transcript
-            .cdna_coding_start
-            .and_then(|start| start.checked_sub(2))
-            .and_then(|index| {
-                transcript
-                    .spliced_seq
-                    .as_deref()?
-                    .as_bytes()
-                    .get(index as usize)
-            });
-        let c1_deletion_retains_cds = window.tl_start == 1
-            && window.ref_len == 1
-            && window.alt_len == 0
-            && previous_cdna_base
-                .zip(window.ref_window.first())
-                .is_some_and(|(previous, first)| previous.eq_ignore_ascii_case(first));
+        let peptide = transcript.reference_peptide.as_deref().or(transcript.peptide.as_deref());
+        // Retained-reference deletions can preserve the full CDS suffix too.
+        // Reuse the UTR + CDS edit used by VEP's boundary predicates instead
+        // of restricting this check to an empty alternate allele.
+        let start_deletion_retains_cds = overlaps_initiator
+            && window.alt_len < window.ref_len
+            && self.predict_cds_boundary_consequence(
+                ref_allele, alt_allele, transcript, cdna_start, cdna_end,
+            ).is_some_and(|change| change.consequence == Consequence::StartRetainedVariant
+                || change.additional.contains(&Consequence::StartRetainedVariant));
+        // VEP tests the edited 5' UTR + CDS before declaring a shorter CDS
+        // altered. A following G can replace deleted c.3 while preserving ATG.
+        let utr_start_retained = overlaps_initiator
+            && window.ref_len != window.alt_len
+            && transcript
+                .cdna_coding_start
+                .filter(|&start| start > 1)
+                .zip(if *ref_allele == Allele::Deletion {
+                    fastvep_genome::insertion_point(cdna_start, cdna_end, transcript.strand)
+                        .and_then(|point| Some((point.checked_add(1)?, point)))
+                } else {
+                    cdna_start.zip(cdna_end).map(|(a, b)| (a.min(b), a.max(b)))
+                })
+                .is_some_and(|(start, (lo, hi))| {
+                    lo >= start
+                        && transcript.cdna_coding_end.is_some_and(|end| {
+                            i128::from(end) + alt_allele.len() as i128
+                                - (i128::from(hi) - i128::from(lo) + 1)
+                                >= i128::from(start) + 2
+                        })
+                        && self.edited_codon(transcript, lo, hi, alt_allele, start) == Some(*b"ATG")
+                });
+        // _get_peptide_alleles returns neither peptide if either is undefined.
+        // stop_lost/stop_retained then use the independent edited-DNA helper.
+        let stop_fallback = (!window.peptides_defined && window.alt_dna_unambiguous)
+            .then(|| self.predict_cds_boundary_consequence(
+                ref_allele, alt_allele, transcript, cdna_start, cdna_end,
+            ))
+            .flatten()
+            .and_then(|change| std::iter::once(change.consequence).chain(change.additional)
+                .find(|term| matches!(term, Consequence::StopLost | Consequence::StopRetainedVariant)));
         Some(self.terms_for_window(
             &window,
             overlaps_initiator,
             peptide,
-            c1_deletion_retains_cds,
+            start_deletion_retains_cds,
+            utr_start_retained,
+            transcript.spliced_seq.is_some()
+                && transcript.cdna_coding_start.is_some_and(|start| start > 1),
+            stop_fallback,
         ))
     }
 
@@ -764,14 +1019,18 @@ impl ConsequencePredictor {
         w: &CodonWindow,
         overlaps_initiator: bool,
         peptide: Option<&str>,
-        c1_deletion_retains_cds: bool,
+        start_deletion_retains_cds: bool,
+        utr_start_retained: bool,
+        has_five_prime_utr: bool,
+        stop_fallback: Option<Consequence>,
     ) -> CodingChange {
         let (ref_pep, alt_pep) = (w.ref_aas.as_str(), w.alt_aas.as_str());
         let extends = |pep: &str| pep.starts_with(ref_pep) || pep.ends_with(ref_pep);
 
         // `stop_lost` and `stop_retained` are asked first because everything
         // below defers to one or the other.
-        let stop_lost = ref_pep.contains('*') && !alt_pep.contains('*');
+        let stop_lost = (w.peptides_defined && ref_pep.contains('*') && !alt_pep.contains('*'))
+            || stop_fallback == Some(Consequence::StopLost);
         // `ref_eq_alt_sequence` (l. 1321). It matters because `frameshift` and
         // `stop_gained` both defer to `stop_retained`: an insertion that leaves
         // the terminator where it was is an `inframe_insertion` to Ensembl
@@ -823,25 +1082,32 @@ impl ConsequencePredictor {
                     .eq(reference.iter())
         };
         // `stop_retained` also declines on an incomplete terminal codon.
-        let stop_retained = !stop_lost
-            && !w.partial_codon
+        let stop_retained = !stop_lost && !w.partial_codon
+            && (stop_fallback == Some(Consequence::StopRetainedVariant) || (w.peptides_defined
             && !alt_pep.is_empty()
             && (ref_matches_alt_start_with_stop
+                // VEP ref_eq_alt_sequence accepts a leading inserted stop
+                // after the full peptide, even with more than two new residues.
+                || (alt_pep.starts_with('*') && peptide.is_some_and(|sequence| {
+                    w.tl_start > sequence.strip_suffix('*').unwrap_or(sequence).len()
+                }))
                 || (ref_pep.contains('*') && ref_pep.find('*') == alt_pep.find('*'))
-                || peptide.is_some_and(preserves_reference_with_short_tail));
+                || peptide.is_some_and(preserves_reference_with_short_tail))));
 
         // `frameshift` and `inframe_deletion` both decline when the codon the
         // change starts in is incomplete; `protein_altering_variant` does not.
         let frameshift =
             !stop_retained && !w.partial_codon && !w.alt_len.abs_diff(w.ref_len).is_multiple_of(3);
-        let stop_gained = !stop_retained && alt_pep.contains('*') && !ref_pep.contains('*');
+        let stop_gained = w.peptides_defined && !stop_retained && alt_pep.contains('*') && !ref_pep.contains('*');
 
         // Ensembl withholds the codon strings from a frameshift
         // (`_get_codon_alleles` returns nothing for one), so neither in-frame
         // term can hold there.
         let (mut inframe_insertion, inframe_deletion) = if frameshift {
             (false, false)
-        } else if w.alt_window.len() > w.ref_window.len() {
+        } else if w.alt_len > w.ref_len && w.alt_window.len() > w.ref_window.len() {
+            // Constants.pm also requires the DNA-level insertion predicate:
+            // UTR extension can enlarge a partial codon after a deletion.
             // `inframe_insertion` cuts the alternate peptide back to its first
             // terminator before the prefix/suffix test, so an insertion that
             // also introduces a stop is still an insertion.
@@ -849,7 +1115,7 @@ impl ConsequencePredictor {
                 Some(i) => &alt_pep[..=i],
                 None => alt_pep,
             };
-            (extends(alt_to_stop), false)
+            (w.peptides_defined && extends(alt_to_stop), false)
         } else if w.alt_window.len() < w.ref_window.len() {
             // `inframe_deletion` tests the codon strings rather than the
             // peptides: the replacement counts as a deletion only when it
@@ -868,44 +1134,40 @@ impl ConsequencePredictor {
             (false, false)
         };
 
-        // `_ins_del_start_altered` (l. 1028) edits the transcript and asks
-        // whether the initiator survived. Inside a window that starts at the CDS
-        // start, that is the same question as whether the edited window still
-        // opens on a start codon - unless the edit made the sequence shorter, in
-        // which case Ensembl answers "altered" without looking.
-        let start_altered = w.alt_len < w.ref_len
-            || match w.alt_window.get(..3) {
-                Some([a, b, c]) => !CodonTable::is_start(&[*a, *b, *c]),
-                _ => true,
-            };
+        // VEP _ins_del_start_altered first accepts an unchanged UTR and ATG.
+        // Without that shortcut it compares the complete CDS-length suffix;
+        // retaining ATG alone does not preserve an inserted transcript's CDS.
+        let start_altered = !utr_start_retained
+            && (w.alt_len < w.ref_len || !w.alt_window.ends_with(&w.ref_window));
         let length_changed = w.ref_len != w.alt_len;
         // `start_retained_variant` is independent of `start_lost`: an insertion
         // can displace the active initiator while preserving the original `ATG`
         // at one end of the enlarged window, and Ensembl reports both terms.
         // VEP 115 also reports both for `c.1del` when the preceding UTR base
         // repeats CDS base one, so its CDS-length suffix remains unchanged.
+        // Unlike VEP's negated ambiguity guard, these comparisons positively
+        // establish an unchanged ATG or CDS suffix, even with N elsewhere.
         let start_retained = overlaps_initiator
-            && length_changed
-            && ((w.alt_len > w.ref_len
-                && (w.alt_window.starts_with(&w.ref_window)
-                    || w.alt_window.ends_with(&w.ref_window)))
-                || c1_deletion_retains_cds);
+            // VEP's pre-predicate `snp` means equal allele lengths, including MNVs.
+            && ((!length_changed && w.alt_window.starts_with(b"ATG"))
+                || (length_changed && ((w.alt_len > w.ref_len
+                && w.alt_window.ends_with(&w.ref_window))
+                || start_deletion_retains_cds
+                || utr_start_retained)));
         // Ensembl does not call an insertion before the retained start codon an
         // in-frame insertion; the inserted bases are translated before it.
         if start_retained && alt_pep.ends_with(ref_pep) {
             inframe_insertion = false;
         }
-        let start_lost = overlaps_initiator
-            && if length_changed {
-                start_altered && !(inframe_insertion || inframe_deletion)
-            } else {
-                // The peptide test, which Ensembl skips when either side is
-                // missing or the alternate is the frameshift placeholder.
-                !ref_pep.is_empty() && !alt_pep.is_empty() && alt_pep != "X" && !extends(alt_pep)
-            };
+        let start_lost = w.alt_dna_unambiguous && overlaps_initiator
+            && ((length_changed && start_altered && !(inframe_insertion || inframe_deletion))
+                // VEP continues to the inversion and peptide predicates even
+                // when the earlier indel predicate did not establish start loss.
+                || (has_five_prime_utr && !utr_start_retained && !w.alt_window.starts_with(b"ATG"))
+                || (w.peptides_defined && !ref_pep.is_empty() && !alt_pep.is_empty() && alt_pep != "X" && !extends(alt_pep)));
         inframe_insertion &= !start_lost;
 
-        let protein_altering = ref_pep.len() != alt_pep.len()
+        let protein_altering = w.peptides_defined && ref_pep.len() != alt_pep.len()
             && !ref_pep.starts_with('*')
             && !alt_pep.starts_with('*')
             && !extends(alt_pep)
@@ -932,13 +1194,19 @@ impl ConsequencePredictor {
         // protein or it did not. Ensembl evaluates `missense_variant` and
         // `coding_unknown` independently: `FX/LX` is both missense (F became L)
         // and unresolved coding (the other residue is X).
-        let unresolved = ref_pep.contains('X') || alt_pep.contains('X');
-        if terms.is_empty() && !length_changed {
-            if ref_pep != alt_pep {
+        let unresolved = !w.peptides_defined || ref_pep.contains('X') || alt_pep.contains('X');
+        if w.peptides_defined && terms.is_empty() && !length_changed {
+            if ref_pep != alt_pep && !w.partial_codon {
                 terms.push(Consequence::MissenseVariant);
             } else if !unresolved {
                 terms.push(Consequence::SynonymousVariant);
             }
+        }
+        // Synonymous is independent of start_lost (e.g. CTG to CTC).
+        if ref_pep == alt_pep && !unresolved && !stop_retained && !start_retained
+            && !terms.contains(&Consequence::SynonymousVariant)
+        {
+            terms.push(Consequence::SynonymousVariant);
         }
         // VEP's `coding_unknown` deliberately does not defer to an in-frame
         // insertion or a missense term, so those can carry this term too.
@@ -971,12 +1239,13 @@ impl ConsequencePredictor {
                 pep.to_string()
             }
         };
-        let amino_acids = Some((shown(&w.ref_aas), shown(&w.alt_aas)));
+        let amino_acids = w.peptides_defined.then(|| (shown(&w.ref_aas), shown(&w.alt_aas)));
         let codons = Some((w.ref_codons.clone(), w.alt_codons.clone()));
         if terms.is_empty() {
-            // Nothing held: a length change whose peptides Ensembl cannot
-            // classify is `coding_sequence_variant`, which the caller supplies.
-            return CodingChange::single(Consequence::CodingSequenceVariant, amino_acids, codons);
+            // coding_unknown requires missing/ambiguous peptides, not merely
+            // an unclassified edit. Preserve the resolved display window and
+            // defer the default term until all transcript predicates finish.
+            return CodingChange::single(Consequence::IntergenicVariant, amino_acids, codons);
         }
         let first = terms.remove(0);
         CodingChange {
@@ -996,9 +1265,8 @@ impl ConsequencePredictor {
     /// boundary, which is why VEP writes `-/HENKTKGD` for a codon-aligned
     /// insertion rather than repeating the flanking residue on both sides.
     ///
-    /// Returns `None` when no window describes the change: it is not contiguous
-    /// in the CDS (a delins across a splice junction covers fewer CDS bases than
-    /// it has reference bases), or the CDS has no sequence loaded.
+    /// VEP edits the mapped CDS span, including when the genomic reference
+    /// includes an intron. Returns `None` when coordinates or sequence are absent.
     fn build_codon_window(
         &self,
         transcript: &Transcript,
@@ -1030,20 +1298,13 @@ impl ConsequencePredictor {
             // this an insertion at an exon's first base was
             // `coding_sequence_variant` - 39 rows of a 6,600-variant ClinVar
             // sample, LOW where VEP says HIGH, every one a frameshift.
-            let point = match (cds_start, cds_end) {
-                (Some(_), Some(_)) if cds_hi == cds_lo + 1 => cds_lo,
-                (Some(s), None) if transcript.strand == Strand::Reverse => s,
-                (Some(s), None) => s.checked_sub(1)?,
-                (None, Some(e)) if transcript.strand == Strand::Forward => e,
-                (None, Some(e)) => e.checked_sub(1)?,
-                _ => return None,
-            };
+            let point = fastvep_genome::insertion_point(cds_start, cds_end, transcript.strand)?;
             (point as usize, 0usize)
         } else {
-            let ref_len = ref_allele.len();
-            if cds_lo < 1 || cds_hi - cds_lo + 1 != ref_len as u64 {
+            if cds_lo < 1 || cds_hi - cds_lo + 1 > ref_allele.len() as u64 {
                 return None;
             }
+            let ref_len = usize::try_from(cds_hi - cds_lo + 1).ok()?;
             ((cds_lo - 1) as usize, ref_len)
         };
 
@@ -1076,6 +1337,8 @@ impl ConsequencePredictor {
         // describe the change. Refusing the window instead left 3 rows per 230
         // IMPACT-changing ClinVar variants as `coding_sequence_variant` where
         // VEP says `inframe_deletion` or `frameshift_variant`.
+        let nominal_win_end = win_end;
+        let mut utr_bases = win_end.saturating_sub(seq.len());
         let win_end = win_end.min(seq.len());
         if win_start > win_end {
             return None;
@@ -1091,13 +1354,28 @@ impl ConsequencePredictor {
         alt_window.extend_from_slice(&ref_window[..lead]);
         alt_window.extend_from_slice(&alt_cds);
         alt_window.extend_from_slice(&ref_window[ref_window.len() - trail..]);
+        // VEP's _trim_incomplete_codon returns an empty CDS when the
+        // edited whole CDS is shorter than three bases, before appending UTR.
+        if seq.len().saturating_sub(ref_len) + alt_cds.len() < 3 {
+            alt_window.clear();
+            utr_bases = (nominal_win_end - win_start + alt_cds.len()).saturating_sub(ref_len);
+        }
+        // VEP _get_alternate_cds appends the 3' UTR before codon() slices
+        // the alternate window. The reference window stays CDS-only.
+        if utr_bases > 0 {
+            if let Some(utr) = transcript
+                .spliced_seq
+                .as_deref()
+                .zip(transcript.cdna_coding_end)
+                .and_then(|(spliced, end)| spliced.as_bytes().get(end as usize..))
+            {
+                alt_window.extend_from_slice(&utr[..utr_bases.min(utr.len())]);
+            }
+        }
 
         let table = self.codon_table_for(transcript);
-        // A codon the edit happens to leave byte-identical to the reference
-        // codon at the same offset keeps whatever the reference resolved to, so
-        // a selenoprotein's readthrough UGA is not re-read as a new terminator.
-        // Every other codon is translated plainly, which is what makes a
-        // genuinely introduced stop a stop.
+        // VEP peptide() applies sequence edits only inside its is_reference
+        // branch. Alternate windows always use ordinary codon translation.
         let translate = |window: &[u8], anchored: bool| -> String {
             let mut pep: String = window
                 .as_chunks::<3>()
@@ -1106,12 +1384,10 @@ impl ConsequencePredictor {
                 .enumerate()
                 .map(|(i, codon)| {
                     let index = win_start / 3 + i;
-                    let reference_codon =
-                        anchored || ref_window.get(i * 3..i * 3 + 3) == Some(&codon[..]);
                     // At residue one, an annotated mitochondrial initiator is
                     // methionine even when its ordinary table-2 translation is
                     // Ile (for example human MT-ND2 starts with ATT).
-                    let translated = if reference_codon
+                    let translated = if anchored
                         && index == 0
                         && is_mitochondrial(&transcript.chromosome)
                         && start_codon_known(transcript)
@@ -1120,7 +1396,7 @@ impl ConsequencePredictor {
                     } else {
                         table.translate(codon)
                     };
-                    if reference_codon {
+                    if anchored {
                         resolve_annotated_residue(transcript, index, translated) as char
                     } else {
                         translated as char
@@ -1163,9 +1439,13 @@ impl ConsequencePredictor {
         };
 
         Some(CodonWindow {
+            peptides_defined: ref_allele.is_unambiguous_dna() && alt_allele.is_unambiguous_dna(),
+            alt_dna_unambiguous: alt_allele.is_unambiguous_dna(),
             ref_aas: translate(&ref_window, true),
             alt_aas: translate(&alt_window, false),
-            ref_codons: render(&ref_window, ref_len),
+            // VEP display_codon uppercases feature_seq length (genomic),
+            // independently of the mapped CDS length used for reconstruction.
+            ref_codons: render(&ref_window, ref_allele.len()),
             alt_codons: render(&alt_window, alt_cds.len()),
             tl_start: win_start / 3 + 1,
             tl_end: win_end.div_ceil(3),
@@ -1204,6 +1484,12 @@ impl ConsequencePredictor {
         cdna_start: Option<u64>,
         cdna_end: Option<u64>,
     ) -> Option<CodingChange> {
+        // VEP's DNA alteration helpers also reject ambiguous alleles. Their
+        // negation-based "retained" fallback is not evidence of retention:
+        // leave this unresolved instead of asserting either loss or retention.
+        if !alt_allele.is_unambiguous_dna() {
+            return None;
+        }
         let coding_start = transcript.cdna_coding_start?;
         let coding_end = transcript.cdna_coding_end?;
         let (s, e) = (cdna_start?, cdna_end?);
@@ -1223,63 +1509,113 @@ impl ConsequencePredictor {
         let overlaps_start =
             cdna_lo <= coding_start + 2 && cdna_hi >= coding_start && start_codon_known(transcript);
 
-        // A variant that swallows the whole CDS destroys both codons; report
-        // the more severe of the two terms, which is `stop_lost`.
-        if overlaps_stop {
-            // VEP has no peptide allele for a change that crosses from CDS
-            // into UTR. Its fallback stop-codon predicate only handles a
-            // length change, so a same-length replacement remains the generic
-            // coding term even when the edited triplet would no longer stop.
-            if ref_allele.len() == alt_allele.len() {
-                return None;
-            }
-            let still_a_stop = self
-                .edited_codon(transcript, cdna_lo, cdna_hi, alt_allele, coding_end - 2)
-                .map(|codon| self.codon_table_for(transcript).translate(&codon) == b'*');
-            return Some(match still_a_stop {
-                Some(true) => CodingChange::single(Consequence::StopRetainedVariant, None, None),
-                // Either the terminator now reads as something else, or the
-                // edited transcript no longer reaches the position it sat at.
-                // Both mean the annotated stop is gone from where it was.
-                _ => CodingChange::single(Consequence::StopLost, None, None),
-            });
-        }
+        // VEP evaluates start and stop predicates independently. Its stop
+        // fallback declines to call an alteration when the leading cDNA
+        // endpoint has no CDS coordinate, even if the edit spans the CDS.
+        // An equal-length replacement declines only the stop fallback; it
+        // must still evaluate the independent start-retention predicate.
+        let stop_consequence = (overlaps_stop && ref_allele.len() != alt_allele.len()).then(|| {
+            let still_a_stop = transcript.cdna_to_cds(cdna_lo).is_none()
+                || self.edited_codon(transcript, cdna_lo, cdna_hi, alt_allele, coding_end - 2)
+                    .is_some_and(|codon| self.codon_table_for(transcript).translate(&codon) == b'*');
+            if still_a_stop { Consequence::StopRetainedVariant } else { Consequence::StopLost }
+        });
 
+        let start_change = (|| {
         if overlaps_start {
-            // The initiator is not decided by re-reading its codon, and the
-            // asymmetry with the terminator above is VEP's, not an oversight.
-            // Past the stop codon the 3' UTR simply supplies the next bases and
-            // translation runs on, so whatever now sits at that offset *is* the
-            // terminator. An initiator instead has to be the first ATG in its
-            // context, so `_ins_del_start_altered` spares a change only when it
-            // leaves the 5' UTR byte-identical *and* still finds ATG at the
-            // coding start; a length change reaching across the junction fails
-            // that by construction, and VEP calls it `start_lost`.
-            //
-            // Reading the codon alone is too permissive here. PLA2G6's coding
-            // sequence begins `ATGGATGTCA`, and a `c.-2_3delins` brings its
-            // second in-frame ATG onto the coding start: the codon still reads
-            // ATG while the CDS has lost four bases.
-            //
-            // Read the length change off the alleles, not off the cDNA span:
-            // an insertion's span is its two flanking bases while it deletes
-            // nothing, and a variant spanning an intron has more reference
-            // bases than cDNA positions. VEP's `increase_length` /
-            // `decrease_length` are likewise properties of the allele pair.
             if ref_allele.len() != alt_allele.len() {
-                return Some(CodingChange::single(Consequence::StartLost, None, None));
+                // VEP `_ins_del_start_altered` edits UTR + CDS. Repeats can
+                // preserve both the original UTR and ATG even when the edit
+                // crosses their boundary. An unchanged full CDS suffix is
+                // also retained. This allocation is confined to that rare
+                // boundary path; ordinary coding variants use codon windows.
+                let (retained, fixed_start_altered) = transcript
+                    .spliced_seq
+                    .as_deref()
+                    .zip(transcript.translateable_seq.as_deref())
+                    .and_then(|(spliced, cds)| {
+                        let utr = spliced
+                            .as_bytes()
+                            .get(..coding_start.checked_sub(1)? as usize)?;
+                        let mut edited = [utr, cds.as_bytes()].concat();
+                        let range = if *ref_allele == Allele::Deletion {
+                            cdna_lo as usize..cdna_lo as usize
+                        } else {
+                            cdna_lo.checked_sub(1)? as usize..cdna_hi as usize
+                        };
+                        let range = range.start..range.end.min(edited.len());
+                        edited.get(range.clone())?;
+                        let alt = match alt_allele {
+                            Allele::Sequence(bases) => bases.as_slice(),
+                            Allele::Deletion => &[],
+                            _ => return None,
+                        };
+                        match transcript.strand {
+                            Strand::Forward => {
+                                edited.splice(range, alt.iter().copied());
+                            }
+                            Strand::Reverse => {
+                                edited
+                                    .splice(range, alt.iter().rev().map(|&base| complement(base)));
+                            }
+                        }
+                        let atg = edited.get(utr.len()..utr.len() + 3) == Some(b"ATG");
+                        Some((
+                            (!utr.is_empty() && edited.get(..utr.len()) == Some(utr) && atg)
+                                || edited.ends_with(cds.as_bytes()),
+                            !utr.is_empty() && !atg,
+                        ))
+                    })
+                    .unwrap_or((false, false));
+                let mut change = CodingChange::single(
+                    if retained {
+                        Consequence::StartRetainedVariant
+                    } else {
+                        Consequence::StartLost
+                    },
+                    None,
+                    None,
+                );
+                // VEP start_lost also calls `_inv_start_altered` for indels.
+                // Its fixed-offset test is independent of the preserved-CDS
+                // suffix above, so both start terms can be reported.
+                if retained && fixed_start_altered {
+                    change.additional.push(Consequence::StartLost);
+                }
+                return Some(change);
             }
-            // A same-length change cannot shift the frame, so the codon it
-            // leaves at the coding start is the whole question.
-            let still_a_start = self
-                .edited_codon(transcript, cdna_lo, cdna_hi, alt_allele, coding_start)
-                .map(|codon| CodonTable::is_start(&codon));
-            if still_a_start != Some(true) {
-                return Some(CodingChange::single(Consequence::StartLost, None, None));
-            }
+            // VEP's SNP predicate reads the CDS-length suffix, while its
+            // inversion/start-loss predicate reads the fixed original offset.
+            // Across an intron, equal genomic REF/ALT lengths can still expand
+            // the edited cDNA, so these two codons need not be the same.
+            // `_inv_start_altered` requires a 5' UTR and declines edits
+            // extending past UTR + CDS. `_snp_start_altered` instead lets
+            // substr clip that removal at the CDS end before taking its suffix.
+            let fixed_start_altered = coding_start > 1 && cdna_hi <= coding_end && self.edited_codon(
+                transcript, cdna_lo, cdna_hi, alt_allele, coding_start,
+            )? != *b"ATG";
+            let suffix_start = coding_start.checked_add(alt_allele.len() as u64)?
+                .checked_sub(cdna_hi.min(coding_end) - cdna_lo + 1)?;
+            let retained = self.edited_codon(
+                transcript, cdna_lo, cdna_hi, alt_allele, suffix_start,
+            )? == *b"ATG";
+            if !fixed_start_altered && !retained { return None; }
+            let mut change = CodingChange::single(
+                if retained { Consequence::StartRetainedVariant }
+                else { Consequence::StartLost }, None, None,
+            );
+            if retained && fixed_start_altered { change.additional.push(Consequence::StartLost); }
+            return Some(change);
         }
 
         None
+        })();
+        let mut change = start_change.or_else(|| stop_consequence
+            .map(|term| CodingChange::single(term, None, None)))?;
+        if let Some(stop) = stop_consequence.filter(|term| *term != change.consequence) {
+            change.additional.push(stop);
+        }
+        Some(change)
     }
 
     /// The three bases at cDNA position `codon_start` *after* `alt_allele`
@@ -1353,17 +1689,18 @@ impl ConsequencePredictor {
         var_end: u64,
         transcript: &Transcript,
     ) -> Option<i64> {
-        // For insertions (end < start), use start for distance calculation
-        // since start represents the actual insertion position
-        let effective_start = var_start.min(var_end);
-        let effective_end = var_start.max(var_end);
-        if effective_end < transcript.start {
-            Some((transcript.start - effective_end) as i64)
-        } else if effective_start > transcript.end {
-            Some((effective_start - transcript.end) as i64)
-        } else {
-            Some(0)
-        }
+        // VEP uses the shortest absolute distance among all four variant and
+        // transcript endpoints. Do not reorder insertion coordinates: their
+        // Ensembl representation intentionally has start == end + 1.
+        [
+            var_start.abs_diff(transcript.start),
+            var_start.abs_diff(transcript.end),
+            var_end.abs_diff(transcript.start),
+            var_end.abs_diff(transcript.end),
+        ]
+        .into_iter()
+        .min()
+        .and_then(|distance| i64::try_from(distance).ok())
     }
 
     fn is_in_coding_region(
@@ -1501,6 +1838,84 @@ fn minimize_allele(
     )
 }
 
+/// Return the coordinates VEP 115's input parser uses for transcript overlap
+/// and distance calculations.
+///
+/// Ordinary biallelic VCF indels are minimised automatically, with the common
+/// prefix removed before the common suffix. VEP's rejoined multi-allelic CSQ
+/// output retains the uploaded record's shared interval for these fields, so
+/// it is intentionally left unchanged here. FastVEP keeps its existing
+/// end-first minimisation for consequence and HGVS calculation, where it is
+/// needed for transcript-most-3' representation.
+fn vep_input_variant(
+    position: &GenomicPosition,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    preserve_input: bool,
+) -> (GenomicPosition, Allele, Allele) {
+    let (Allele::Sequence(reference), Allele::Sequence(alternate)) = (ref_allele, alt_allele)
+    else {
+        return (position.clone(), ref_allele.clone(), alt_allele.clone());
+    };
+
+    if preserve_input || reference.len() == alternate.len() {
+        return (position.clone(), ref_allele.clone(), alt_allele.clone());
+    }
+
+    let mut prefix = 0;
+    while prefix < reference.len()
+        && prefix < alternate.len()
+        && reference[prefix].eq_ignore_ascii_case(&alternate[prefix])
+    {
+        prefix += 1;
+    }
+
+    let mut ref_end = reference.len();
+    let mut alt_end = alternate.len();
+    while ref_end > prefix
+        && alt_end > prefix
+        && reference[ref_end - 1].eq_ignore_ascii_case(&alternate[alt_end - 1])
+    {
+        ref_end -= 1;
+        alt_end -= 1;
+    }
+
+    if prefix == 0 && ref_end == reference.len() && alt_end == alternate.len() {
+        return (position.clone(), ref_allele.clone(), alt_allele.clone());
+    }
+
+    let position = GenomicPosition::new(
+        position.chromosome.clone(),
+        position.start + prefix as u64,
+        position
+            .end
+            .saturating_sub((reference.len() - ref_end) as u64),
+        position.strand,
+    );
+    let reference = if ref_end == prefix {
+        Allele::Deletion
+    } else {
+        Allele::Sequence(reference[prefix..ref_end].to_vec())
+    };
+    let alternate = if alt_end == prefix {
+        Allele::Deletion
+    } else {
+        Allele::Sequence(alternate[prefix..alt_end].to_vec())
+    };
+
+    (position, reference, alternate)
+}
+
+/// VEP 115 parser coordinates used for transcript lookup and location predicates.
+pub fn vep_input_position(
+    position: &GenomicPosition,
+    ref_allele: &Allele,
+    alt_allele: &Allele,
+    preserve_input: bool,
+) -> GenomicPosition {
+    vep_input_variant(position, ref_allele, alt_allele, preserve_input).0
+}
+
 impl Default for ConsequencePredictor {
     fn default() -> Self {
         Self::new(5000, 5000)
@@ -1547,6 +1962,7 @@ mod tests {
             normalized_ref_allele: Allele::from_str("C"),
             normalized_alt_allele: Allele::from_str("A"),
             consequences: vec![],
+            frameshift: false,
             impact: Impact::Modifier,
             cdna_start: None,
             cdna_end: None,
@@ -1656,6 +2072,7 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
     }
 
@@ -1723,7 +2140,128 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
+    }
+
+    #[test]
+    fn stop_retention_compares_the_full_annotated_reference_protein() {
+        let mut transcript = make_coding_transcript();
+        let reference = "CTGAGAGGCGCTGCTGGGCGTCTGGGCGGAGGACTCCTGGTTCTGG";
+        transcript.translateable_seq = Some(reference.into());
+        transcript.peptide = Some("LRGAAGRLGGGLLVL".into());
+        // Transcript::translate normalizes a CTG initiator even with cds_start_NF.
+        transcript.reference_peptide = Some("MRGAAGRLGGGLLVL".into());
+        transcript.flags = vec!["cds_start_NF".into(), "cds_end_NF".into()];
+        transcript.cdna_coding_end = Some(96);
+        transcript.coding_region_end = Some(1095);
+        let translation = transcript.translation.as_mut().unwrap();
+        translation.genomic_end = 1095;
+        translation.end_exon_rank = 1;
+        translation.end_exon_offset = 95;
+        let result = ConsequencePredictor::default().predict_with_parsed_input(
+            &GenomicPosition::new("chr1", 1050, 1095, Strand::Forward),
+            &Allele::from_str(reference), &[Allele::from_str(&format!("{reference}C"))],
+            &[&transcript], None, true,
+        );
+        let allele = &result.transcript_consequences[0].allele_consequences[0];
+        assert_eq!(allele.consequences, vec![Consequence::FrameshiftVariant]);
+        assert!(allele.frameshift);
+        assert_eq!(allele.amino_acids, Some(("LRGAAGRLGGGLLVLX".into(), "LRGAAGRLGGGLLVLX".into())));
+    }
+
+    #[test]
+    fn complete_transcript_tandem_gain_uses_unminimized_input_span() {
+        let mut transcript = make_noncoding_transcript();
+        transcript.end = transcript.start + 3;
+        transcript.exons.truncate(1);
+        transcript.exons[0].end = transcript.end;
+        let predictor = ConsequencePredictor::default();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            transcript.strand = strand;
+            transcript.exons[0].strand = strand;
+            for (alternate, parsed, expected) in [
+                ("ACGTACGT", true, true),
+                ("ACGTACGTACGT", true, true),
+                ("ACGTACG", true, false),
+                ("ACGTACGA", true, false),
+                ("ACGTACGT", false, false),
+            ] {
+                let result = predictor.predict_with_parsed_input(
+                    &GenomicPosition::new("chr1", transcript.start, transcript.end, Strand::Forward),
+                    &Allele::from_str("ACGT"), &[Allele::from_str(alternate)],
+                    &[&transcript], None, parsed,
+                );
+                let allele = &result.transcript_consequences[0].allele_consequences[0];
+                assert_eq!(allele.consequences.contains(&Consequence::TranscriptAmplification), expected,
+                    "{strand:?} {alternate} parsed={parsed}");
+                if expected {
+                    assert_eq!(allele.consequences, vec![Consequence::TranscriptAmplification]);
+                    assert_eq!(allele.impact, Impact::High);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mature_mirna_ranges_replace_the_broader_noncoding_exon_term() {
+        let mut transcript = make_noncoding_transcript();
+        transcript.stable_id = "ENST_MIRNA".into();
+        transcript.biotype = "miRNA".into();
+        let predictor = ConsequencePredictor::default()
+            .with_mature_mirna_ranges(HashMap::from([("ENST_MIRNA".to_owned(), vec![(490, 520)])]));
+        let consequences_at = |position| {
+            predictor
+                .predict(
+                    &GenomicPosition::new("chr1", position, position, Strand::Forward),
+                    &Allele::from_str("A"),
+                    &[Allele::from_str("G")],
+                    &[&transcript],
+                    None,
+                )
+                .transcript_consequences[0]
+                .allele_consequences[0]
+                .consequences
+                .clone()
+        };
+
+        // The cDNA interval crosses the intron: 490-501 maps to exon 1 and
+        // 502-520 maps to exon 2. Both exonic segments are mature miRNA.
+        for position in [10495, 11510] {
+            let consequences = consequences_at(position);
+            assert!(consequences.contains(&Consequence::MatureMirnaVariant));
+            assert!(!consequences.contains(&Consequence::NonCodingTranscriptExonVariant));
+        }
+        let consequences = consequences_at(11530);
+        assert!(!consequences.contains(&Consequence::MatureMirnaVariant));
+        assert!(consequences.contains(&Consequence::NonCodingTranscriptExonVariant));
+    }
+
+    #[test]
+    fn mature_mirna_ranges_follow_reverse_strand_cdna_order() {
+        let mut transcript = make_noncoding_transcript();
+        transcript.stable_id = "ENST_MIRNA_REVERSE".into();
+        transcript.biotype = "miRNA".into();
+        transcript.strand = Strand::Reverse;
+        transcript.gene.strand = Strand::Reverse;
+        for exon in &mut transcript.exons {
+            exon.strand = Strand::Reverse;
+        }
+        let predictor =
+            ConsequencePredictor::default().with_mature_mirna_ranges(HashMap::from([(
+                "ENST_MIRNA_REVERSE".to_owned(),
+                vec![(10, 20)],
+            )]));
+        let result = predictor.predict(
+            &GenomicPosition::new("chr1", 11985, 11985, Strand::Forward),
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&transcript],
+            None,
+        );
+        let consequences = &result.transcript_consequences[0].allele_consequences[0].consequences;
+        assert!(consequences.contains(&Consequence::MatureMirnaVariant));
+        assert!(!consequences.contains(&Consequence::NonCodingTranscriptExonVariant));
     }
 
     /// Nine predicates run over the codon window and every one that holds is a
@@ -1800,6 +2338,110 @@ mod tests {
             .consequences
             .contains(&Consequence::DownstreamGeneVariant));
         assert_eq!(ac.distance, Some(500));
+    }
+
+    #[test]
+    fn padded_downstream_indel_uses_vep_left_first_distance() {
+        let predictor = ConsequencePredictor::default();
+        let tr = make_coding_transcript();
+        // This is the post-VCF-parser form of a padded insertion. VEP removes
+        // the remaining three-base prefix, leaving insertion coordinates
+        // 5504-5503. The closest endpoint is therefore 503 bases from the
+        // transcript end, not 501 bases from the still-padded start.
+        let pos = GenomicPosition::new("chr1", 5501, 5503, Strand::Forward);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("AAA"),
+            &[Allele::from_str("AAAA")],
+            &[&tr],
+            None,
+        );
+
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+        assert!(ac
+            .consequences
+            .contains(&Consequence::DownstreamGeneVariant));
+        assert_eq!(ac.distance, Some(503));
+    }
+
+    #[test]
+    fn padded_reverse_insertion_uses_vep_coordinates_for_direction() {
+        let mut tr = make_coding_transcript();
+        tr.strand = Strand::Reverse;
+        let result = ConsequencePredictor::default().predict(
+            &GenomicPosition::new("chr1", 4999, 5002, Strand::Forward),
+            &Allele::from_str("ACAC"), &[Allele::from_str("ACACAC")], &[&tr], None,
+        );
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+        assert_eq!(ac.consequences, vec![Consequence::UpstreamGeneVariant]);
+        assert_eq!(ac.distance, Some(2));
+    }
+
+    #[test]
+    fn padded_intronic_deletion_does_not_reach_the_exon() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            for (mut tr, start) in [(make_coding_transcript(), 1200), (make_noncoding_transcript(), 10500)] {
+                tr.strand = strand;
+                let result = ConsequencePredictor::default().predict(
+                    &GenomicPosition::new("chr1", start, start + 11, Strand::Forward),
+                    &Allele::from_str("ATTTATTTATTT"), &[Allele::from_str("ATTTATTT")], &[&tr], None,
+                );
+                let ac = &result.transcript_consequences[0].allele_consequences[0];
+                assert_eq!(ac.exon, None, "{strand:?}: {:?}", ac.consequences);
+                assert!(!ac.consequences.contains(&Consequence::NonCodingTranscriptExonVariant));
+                assert!(!ac.consequences.contains(&Consequence::CodingSequenceVariant));
+                assert!(ac.amino_acids.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn padded_indel_crossing_distance_limit_is_intergenic() {
+        let predictor = ConsequencePredictor::default();
+        let tr = make_coding_transcript();
+        // The padded interval begins within 5 kb, but VEP's left-first input
+        // coordinates are 10002-10001, whose nearest endpoint is 5001 bases
+        // away. It must not be called a downstream-gene variant.
+        let pos = GenomicPosition::new("chr1", 9999, 10001, Strand::Forward);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("AAA"),
+            &[Allele::from_str("AAAA")],
+            &[&tr],
+            None,
+        );
+
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+        assert_eq!(ac.consequences, vec![Consequence::IntergenicVariant]);
+        assert_eq!(ac.distance, Some(5001));
+    }
+
+    #[test]
+    fn vep_input_position_trims_suffix_after_prefix() {
+        let pos = GenomicPosition::new("chr1", 500, 502, Strand::Forward);
+        let (got, reference, alternate) = vep_input_variant(
+            &pos,
+            &Allele::from_str("ACA"),
+            &Allele::from_str("AA"),
+            false,
+        );
+        assert_eq!((got.start, got.end), (501, 501));
+        assert_eq!(reference, Allele::from_str("C"));
+        assert_eq!(alternate, Allele::Deletion);
+    }
+
+    #[test]
+    fn vep_input_position_preserves_equal_length_and_multi_alt_intervals() {
+        let pos = GenomicPosition::new("chr1", 5500, 5501, Strand::Forward);
+        let reference = Allele::from_str("AC");
+        let alternate = Allele::from_str("AT");
+
+        let biallelic = vep_input_position(&pos, &reference, &alternate, false);
+        assert_eq!((biallelic.start, biallelic.end), (5500, 5501));
+
+        let multi_alt =
+            vep_input_position(&pos, &Allele::from_str("C"), &Allele::from_str("CAA"), true);
+        assert_eq!((multi_alt.start, multi_alt.end), (5500, 5501));
     }
 
     #[test]
@@ -1927,6 +2569,28 @@ mod tests {
     }
 
     #[test]
+    fn resolved_repeat_without_a_coding_predicate_defers_to_the_transcript_default() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_coding_transcript();
+        tr.translateable_seq.as_mut().unwrap().replace_range(3..12, "TATGAATAA");
+        for (biotype, expected) in [
+            ("protein_coding", Consequence::IntergenicVariant),
+            ("nonsense_mediated_decay", Consequence::NmdTranscriptVariant),
+        ] {
+            tr.biotype = biotype.into();
+            let result = predictor.predict(
+                &GenomicPosition::new("chr1", 1053, 1059, Strand::Forward),
+                &Allele::from_str("TATGAAT"),
+                &[Allele::from_str("ATACTTA"), Allele::from_str(&"TATGAAT".repeat(4))],
+                &[&tr], None,
+            );
+            let allele = &result.transcript_consequences[0].allele_consequences[1];
+            assert_eq!(allele.consequences, vec![expected]);
+            assert_eq!(allele.amino_acids, Some(("YE*".into(), "YEL*IMNYE*".into())));
+        }
+    }
+
+    #[test]
     fn test_synonymous_variant() {
         let predictor = ConsequencePredictor::default();
         let tr = make_coding_transcript();
@@ -1953,6 +2617,78 @@ mod tests {
             ac.consequences
         );
         assert_eq!(ac.impact, Impact::Low);
+    }
+
+    #[test]
+    fn ambiguous_coding_boundary_does_not_assert_loss_or_retention() {
+        let predictor = ConsequencePredictor::default();
+        let tr = make_coding_transcript();
+        for start in [tr.cdna_coding_start.unwrap(), tr.cdna_coding_end.unwrap()-2] {
+            assert!(predictor.predict_cds_boundary_consequence(
+                &Allele::from_str("ATG"), &Allele::from_str("N"), &tr,
+                Some(start), Some(start+2)).is_none());
+        }
+    }
+
+    #[test]
+    fn ambiguous_insertion_can_preserve_a_known_initiator() {
+        let tr = make_coding_transcript();
+        let result = ConsequencePredictor::default().predict(
+            &GenomicPosition::new("chr1", 1051, 1050, Strand::Forward),
+            &Allele::Deletion, &[Allele::from_str("NA"), Allele::from_str("NN")],
+            &[&tr], None,
+        );
+        let alleles = &result.transcript_consequences[0].allele_consequences;
+        // A[NA]TG retains the original ATG suffix; A[NN]TG cannot prove it.
+        assert!(alleles[0].consequences.contains(&Consequence::StartRetainedVariant));
+        assert!(!alleles[1].consequences.contains(&Consequence::StartRetainedVariant));
+        for allele in alleles {
+            assert!(allele.consequences.contains(&Consequence::FrameshiftVariant));
+            assert!(!allele.consequences.contains(&Consequence::StartLost));
+            assert!(allele.amino_acids.is_none());
+        }
+    }
+
+    #[test]
+    fn reference_repeated_as_an_alternate_has_no_annotation() {
+        let tr = make_coding_transcript();
+        let result = ConsequencePredictor::default().predict(
+            &GenomicPosition::new("chr1", 1053, 1053, Strand::Forward),
+            &Allele::from_str("G"), &[Allele::from_str("G"), Allele::from_str("N")],
+            &[&tr], None);
+        let alleles = &result.transcript_consequences[0].allele_consequences;
+        assert_eq!(alleles.len(), 1);
+        assert_eq!(alleles[0].allele, Allele::from_str("N"));
+        assert_eq!(alleles[0].consequences, vec![Consequence::CodingSequenceVariant]);
+    }
+
+    #[test]
+    fn parsed_input_does_not_repeat_minimization_after_case_conversion() {
+        let tr = make_coding_transcript();
+        // VEP parses raw a>AT without trimming, then validates it as A>AT.
+        let result = ConsequencePredictor::default().predict_with_parsed_input(
+            &GenomicPosition::new("chr1", 1050, 1050, Strand::Forward),
+            &Allele::from_str("A"), &[Allele::from_str("AT")], &[&tr], None, true,
+        );
+        let allele = &result.transcript_consequences[0].allele_consequences[0];
+        assert_eq!((allele.cdna_start, allele.cdna_end), (Some(51), Some(51)));
+        assert_eq!(allele.allele, Allele::from_str("AT"));
+    }
+
+    #[test]
+    fn ambiguous_alternate_has_no_peptide_but_retains_dna_consequences() {
+        let predictor = ConsequencePredictor::default();
+        let tr = make_coding_transcript();
+        let pos = GenomicPosition::new("chr1", 1053, 1053, Strand::Forward);
+        for (alternate, expected) in [("N", Consequence::CodingSequenceVariant),
+            ("NN", Consequence::FrameshiftVariant), ("NNNN", Consequence::CodingSequenceVariant)] {
+            let result = predictor.predict(&pos, &Allele::from_str("G"),
+                &[Allele::from_str(alternate)], &[&tr], None);
+            let allele = &result.transcript_consequences[0].allele_consequences[0];
+            assert_eq!(allele.consequences, vec![expected], "{alternate}");
+            assert!(allele.amino_acids.is_none(), "{alternate}");
+            assert!(allele.codons.is_some(), "DNA codons remain available");
+        }
     }
 
     #[test]
@@ -2014,6 +2750,31 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_stop_codon_in_an_alt_window_does_not_inherit_reference_edits() {
+        let predictor = ConsequencePredictor::default();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            for edited in ['U', 'X', 'W'] {
+                let mut tr = make_boundary_transcript(strand);
+                tr.translateable_seq.as_mut().unwrap().replace_range(3..6, "TGA");
+                tr.spliced_seq.as_mut().unwrap().replace_range(13..16, "TGA");
+                tr.peptide = Some(format!("M{edited}AAAAAAA*"));
+                let (start, end, alternate) = if strand == Strand::Forward {
+                    (6, 5, "A")
+                } else {
+                    (5, 6, "T")
+                };
+                let change = predictor.predict_coding_consequence(
+                    &Allele::Deletion, &Allele::from_str(alternate), &tr,
+                    Some(start), Some(end), Some(start + 10), Some(end + 10),
+                ).unwrap();
+                assert_eq!(change.amino_acids, Some((edited.to_string(), "*".into())));
+                assert!(change.consequence == Consequence::StopGained
+                    || change.additional.contains(&Consequence::StopGained));
+            }
+        }
+    }
+
+    #[test]
     fn cds_start_nf_suppresses_a_start_lost_claim() {
         let predictor = ConsequencePredictor::default();
         let mut tr = make_coding_transcript();
@@ -2038,6 +2799,8 @@ mod tests {
         let predictor = ConsequencePredictor::default();
         let change = predictor.terms_for_window(
             &CodonWindow {
+                peptides_defined: true,
+                alt_dna_unambiguous: true,
                 ref_aas: "FX".into(),
                 alt_aas: "LX".into(),
                 ref_window: b"TTCN".to_vec(),
@@ -2053,6 +2816,9 @@ mod tests {
             false,
             None,
             false,
+            false,
+            false,
+            None,
         );
 
         assert_eq!(change.consequence, Consequence::MissenseVariant);
@@ -2064,6 +2830,8 @@ mod tests {
         let predictor = ConsequencePredictor::default();
         let change = predictor.terms_for_window(
             &CodonWindow {
+                peptides_defined: true,
+                alt_dna_unambiguous: true,
                 ref_aas: "X".into(),
                 alt_aas: "XL".into(),
                 ref_window: b"N".to_vec(),
@@ -2079,6 +2847,9 @@ mod tests {
             false,
             None,
             false,
+            false,
+            false,
+            None,
         );
 
         assert_eq!(change.consequence, Consequence::InframeInsertion);
@@ -2089,6 +2860,113 @@ mod tests {
                 Consequence::CodingSequenceVariant,
             ]
         );
+    }
+
+    #[test]
+    fn partial_codon_survives_one_unmapped_endpoint_on_either_strand() {
+        let predictor = ConsequencePredictor::default();
+        for (strand, start, end) in [
+            (Strand::Forward, Some(2), None),
+            (Strand::Reverse, None, Some(2)),
+        ] {
+            let mut tr = make_coding_transcript();
+            tr.strand = strand;
+            tr.translateable_seq = Some("GC".into());
+            tr.cdna_coding_start = Some(1);
+            tr.cdna_coding_end = Some(2);
+            let change = predictor
+                .predict_coding_consequence(
+                    &Allele::from_str("CT"),
+                    &Allele::from_str("GA"),
+                    &tr,
+                    start,
+                    end,
+                    start.or(Some(3)),
+                    end.or(Some(3)),
+                )
+                .unwrap();
+            assert_eq!(change.consequence, Consequence::CodingSequenceVariant);
+            assert_eq!(
+                change.additional,
+                vec![Consequence::IncompleteTerminalCodonVariant]
+            );
+            let (gap_start, gap_end) = if strand == Strand::Forward {
+                (None, Some(2))
+            } else {
+                (Some(2), None)
+            };
+            let gap = predictor.predict_coding_consequence(
+                &Allele::from_str("CT"), &Allele::from_str("GA"), &tr,
+                gap_start, gap_end, gap_start, gap_end,
+            );
+            assert!(gap.is_none());
+        }
+    }
+
+    #[test]
+    fn alternate_partial_codon_can_read_into_the_utr() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_boundary_transcript(Strand::Forward);
+        tr.translateable_seq = Some("ATGAA".into());
+        tr.cdna_coding_end = Some(15);
+        tr.spliced_seq = Some("CCCCCCCCCCATGAAA".into());
+        let window = predictor
+            .build_codon_window(
+                &tr,
+                &Allele::from_str("A"),
+                &Allele::from_str("C"),
+                Some(4),
+                Some(4),
+            )
+            .unwrap();
+        assert_eq!(
+            (window.ref_aas.as_str(), window.alt_aas.as_str()),
+            ("X", "Q")
+        );
+        assert_eq!(
+            (window.ref_codons.as_str(), window.alt_codons.as_str()),
+            ("Aa", "Caa")
+        );
+        assert!(window.partial_codon);
+        let snv = predictor
+            .predict_coding_consequence(
+                &Allele::from_str("A"),
+                &Allele::from_str("C"),
+                &tr,
+                Some(4),
+                Some(4),
+                Some(14),
+                Some(14),
+            )
+            .unwrap();
+        assert_eq!(snv.consequence, Consequence::IncompleteTerminalCodonVariant);
+        assert!(!snv.additional.contains(&Consequence::MissenseVariant));
+        tr.translateable_seq = Some("ATGA".into());
+        tr.cdna_coding_end = Some(14);
+        tr.spliced_seq = Some("CCCCCCCCCCATGATG".into());
+        let deletion = predictor.predict_coding_consequence(
+            &Allele::from_str("A"), &Allele::Deletion, &tr,
+            Some(4), Some(4), Some(14), Some(14),
+        ).unwrap();
+        assert_eq!(deletion.consequence, Consequence::IncompleteTerminalCodonVariant);
+        assert!(!deletion.additional.contains(&Consequence::InframeInsertion));
+        tr.translateable_seq = Some("ATGAA".into());
+        tr.cdna_coding_end = Some(15);
+        tr.spliced_seq = Some("CCCCCCCCCCATGAAA".into());
+        let change = predictor
+            .predict_coding_consequence(
+                &Allele::from_str("AA"),
+                &Allele::from_str("CC"),
+                &tr,
+                Some(5),
+                None,
+                Some(15),
+                Some(16),
+            )
+            .unwrap();
+        assert!(change
+            .additional
+            .contains(&Consequence::IncompleteTerminalCodonVariant));
     }
 
     #[test]
@@ -2192,6 +3070,34 @@ mod tests {
     }
 
     #[test]
+    fn reported_cdna_positions_use_vep_left_first_input_coordinates() {
+        let predictor = ConsequencePredictor::default();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let mut tr = make_noncoding_transcript();
+            tr.strand = strand;
+            tr.gene.strand = strand;
+            for exon in &mut tr.exons {
+                exon.strand = strand;
+            }
+
+            // Post-parser form of GCA/GCACA. VEP trims the remaining CA
+            // prefix for position reporting, producing 10102-10101.
+            let pos = GenomicPosition::new("chr1", 10100, 10101, Strand::Forward);
+            let result = predictor.predict(
+                &pos,
+                &Allele::from_str("CA"),
+                &[Allele::from_str("CACA")],
+                &[&tr],
+                None,
+            );
+            let ac = &result.transcript_consequences[0].allele_consequences[0];
+
+            assert_eq!(ac.cdna_start, tr.genomic_to_cdna(10102));
+            assert_eq!(ac.cdna_end, tr.genomic_to_cdna(10101));
+        }
+    }
+
+    #[test]
     fn an_insertion_between_a_noncoding_exon_and_intron_is_not_in_either() {
         let predictor = ConsequencePredictor::default();
         for strand in [Strand::Forward, Strand::Reverse] {
@@ -2228,6 +3134,89 @@ mod tests {
     }
 
     #[test]
+    fn left_minimal_splice_predicates_remove_a_false_region_term() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_noncoding_transcript();
+        tr.strand = Strand::Reverse;
+        tr.gene.strand = Strand::Reverse;
+        for exon in &mut tr.exons {
+            exon.strand = Strand::Reverse;
+        }
+        // Intron 10501..11499. This post-parser A/AA insertion begins at +7
+        // from the genomic start, where the padded representation appears to
+        // be in splice_region on a reverse-strand transcript.
+        // VEP removes the remaining shared prefix first, placing the actual
+        // insertion at 10509..10508: still intronic and in the
+        // polypyrimidine tract, but no longer in splice_region.
+        let pos = GenomicPosition::new("chr1", 10508, 10508, Strand::Forward);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("A"),
+            &[Allele::from_str("AA")],
+            &[&tr],
+            None,
+        );
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+
+        assert!(ac
+            .consequences
+            .contains(&Consequence::SplicePolypyrimidineTractVariant));
+        assert!(ac.consequences.contains(&Consequence::IntronVariant));
+        assert!(!ac.consequences.contains(&Consequence::SpliceRegionVariant));
+    }
+
+    #[test]
+    fn a_frameshift_intron_is_preclassified_as_coding_without_an_exon_label() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_coding_transcript();
+        tr.exons[1].start = 1202; // one-base intron at 1201
+
+        let pos = GenomicPosition::new("chr1", 1201, 1201, Strand::Forward);
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("T"),
+            &[Allele::Deletion],
+            &[&tr],
+            None,
+        );
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+
+        assert_eq!(ac.consequences, vec![Consequence::CodingSequenceVariant]);
+        assert_eq!(ac.exon, None);
+        assert_eq!(ac.intron, Some((1, 1, 2)));
+
+        // The short intron also stretches the last exon for preclassification,
+        // suppressing a polypyrimidine candidate at -10. It must not make this
+        // ordinary long-intron position coding.
+        let ordinary_intron = GenomicPosition::new("chr1", 3990, 3990, Strand::Forward);
+        let result = predictor.predict(
+            &ordinary_intron,
+            &Allele::from_str("A"),
+            &[Allele::from_str("G")],
+            &[&tr],
+            None,
+        );
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+        assert_eq!(ac.consequences, vec![Consequence::IntronVariant]);
+
+        tr.translation = None;
+        tr.biotype = "unprocessed_pseudogene".into();
+        let result = predictor.predict(
+            &pos,
+            &Allele::from_str("T"),
+            &[Allele::from_str("A")],
+            &[&tr],
+            None,
+        );
+        let ac = &result.transcript_consequences[0].allele_consequences[0];
+        assert_eq!(
+            ac.consequences,
+            vec![Consequence::NonCodingTranscriptVariant]
+        );
+        assert_eq!(ac.exon, None);
+    }
+
+    #[test]
     fn test_start_lost() {
         let predictor = ConsequencePredictor::default();
         let tr = make_coding_transcript();
@@ -2251,6 +3240,86 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_predicate_result_uses_veps_default_after_nmd() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_coding_transcript();
+        tr.exons[1].start = 1202;
+        // Genomic MNV, but unequal CDS lengths across the one-base intron.
+        // VEP's genomic-shape filters reject the resulting frameshift term.
+        let position = GenomicPosition::new("chr1", 1198, 1206, Strand::Forward);
+        for (biotype, expected) in [
+            ("protein_coding", Consequence::IntergenicVariant),
+            ("nonsense_mediated_decay", Consequence::NmdTranscriptVariant),
+        ] {
+            tr.biotype = biotype.into();
+            let result = predictor.predict(&position, &Allele::from_str("AAAAAAAAA"),
+                &[Allele::from_str("TTTTTTTTT")], &[&tr], None);
+            assert_eq!(result.transcript_consequences[0].allele_consequences[0].consequences,
+                vec![expected]);
+        }
+    }
+
+    #[test]
+    fn insertion_retaining_atg_needs_a_utr_for_the_start_shortcut() {
+        let predictor = ConsequencePredictor::default();
+        for has_utr in [false, true] {
+            let mut tr = make_boundary_transcript(Strand::Forward);
+            if !has_utr {
+                tr.spliced_seq = tr.translateable_seq.clone();
+                tr.cdna_coding_start = Some(1);
+                tr.cdna_coding_end = Some(tr.translateable_seq.as_ref().unwrap().len() as u64);
+            }
+            let coding_start = tr.cdna_coding_start.unwrap();
+            let change = predictor.predict_coding_consequence(
+                &Allele::Deletion, &Allele::from_str("GGGCC"), &tr,
+                Some(3), Some(2), Some(coding_start + 2), Some(coding_start + 1),
+            ).unwrap();
+            assert_eq!(change.additional.contains(&Consequence::StartLost), !has_utr);
+            assert_eq!(change.consequence, Consequence::FrameshiftVariant);
+        }
+    }
+
+    #[test]
+    fn non_atg_start_predicates_are_independent_of_peptide_identity() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_boundary_transcript(Strand::Forward);
+        tr.translateable_seq.as_mut().unwrap().replace_range(..3, "CTG");
+        tr.spliced_seq.as_mut().unwrap().replace_range(10..13, "CTG");
+        tr.peptide = Some("L".into());
+        let synonymous = predictor.predict_coding_consequence(
+            &Allele::from_str("G"), &Allele::from_str("C"), &tr,
+            Some(3), Some(3), Some(13), Some(13),
+        ).unwrap();
+        assert_eq!(synonymous.consequence, Consequence::StartLost);
+        assert!(synonymous.additional.contains(&Consequence::SynonymousVariant));
+        let retained = predictor.predict_coding_consequence(
+            &Allele::from_str("C"), &Allele::from_str("A"), &tr,
+            Some(1), Some(1), Some(11), Some(11),
+        ).unwrap();
+        assert_eq!(retained.consequence, Consequence::StartLost);
+        assert!(retained.additional.contains(&Consequence::StartRetainedVariant));
+        let mnv = predictor.predict_coding_consequence(
+            &Allele::from_str("CT"), &Allele::from_str("CA"), &tr,
+            Some(1), Some(2), Some(11), Some(12),
+        ).unwrap();
+        assert!(!mnv.additional.contains(&Consequence::StartRetainedVariant));
+        tr.peptide = Some("M".into());
+        let expanded_start = predictor.predict_coding_consequence(
+            &Allele::Deletion, &Allele::from_str("G"), &tr,
+            Some(3), Some(2), Some(13), Some(12),
+        ).unwrap();
+        assert_eq!(expanded_start.amino_acids, Some(("M".into(), "LX".into())));
+        tr.translateable_seq.as_mut().unwrap().replace_range(..3, "GTT");
+        tr.spliced_seq.as_mut().unwrap().replace_range(10..13, "GTT");
+        tr.peptide = Some("V".into());
+        let insertion = predictor.predict_coding_consequence(
+            &Allele::Deletion, &Allele::from_str("T"), &tr,
+            Some(2), Some(1), Some(12), Some(11),
+        ).unwrap();
+        assert!(!insertion.additional.contains(&Consequence::StartRetainedVariant));
+    }
+
+    #[test]
     fn an_annotated_mitochondrial_initiator_is_the_reference_residue() {
         let mut tr = make_boundary_transcript(Strand::Forward);
         tr.chromosome = "chrM".into();
@@ -2263,6 +3332,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .replace_range(0..3, "ATT");
+        // Human mitochondrial CDSs have no 5' UTR. Keep this fixture's
+        // artificial flank out of VEP's separate fixed-offset UTR predicate.
+        tr.spliced_seq = None;
 
         // Vertebrate mitochondrial ATT initiates as Met, and ATA is also Met.
         let result = ConsequencePredictor::default().predict(
@@ -2282,6 +3354,20 @@ mod tests {
         let lost = &result.transcript_consequences[0].allele_consequences[1];
         assert!(lost.consequences.contains(&Consequence::StartLost));
         assert_eq!(lost.amino_acids, Some(("M".into(), "I".into())));
+
+        // VEP peptide() applies the annotated initial-Met edit only to the
+        // reference allele. An insertion retaining ATT at the start of its
+        // longer codon window must translate that alternate ATT as Ile.
+        let inserted = ConsequencePredictor::default().predict(
+            &GenomicPosition::new("chrM", 1011, 1010, Strand::Forward),
+            &Allele::Deletion,
+            &[Allele::from_str("TTA")],
+            &[&tr],
+            None,
+        );
+        let ac = &inserted.transcript_consequences[0].allele_consequences[0];
+        assert_eq!(ac.amino_acids, Some(("M".into(), "II".into())));
+        assert!(ac.consequences.contains(&Consequence::StartLost));
     }
 
     #[test]
@@ -2363,6 +3449,21 @@ mod tests {
     /// The `TGA` three bases into the 3' UTR is deliberate: it lands on the old
     /// terminator's offset after exactly five cDNA bases are removed, which is
     /// what separates `stop_lost` from `stop_retained_variant` below.
+    #[test]
+    fn ambiguous_reference_keeps_dna_stop_alteration_fallback() {
+        for (strand, position) in [(Strand::Forward, 1037), (Strand::Reverse, 1163)] {
+            let tr = make_boundary_transcript(strand);
+            let result = ConsequencePredictor::default().predict(
+                &GenomicPosition::new("chr1", position, position, Strand::Forward),
+                &Allele::from_str("N"), &[Allele::Deletion], &[&tr], None,
+            );
+            let allele = &result.transcript_consequences[0].allele_consequences[0];
+            assert!(allele.consequences.contains(&Consequence::StopLost), "{:?}", allele.consequences);
+            assert!(allele.consequences.contains(&Consequence::FrameshiftVariant));
+            assert!(allele.amino_acids.is_none());
+        }
+    }
+
     fn make_boundary_transcript(strand: Strand) -> Transcript {
         let five_utr = "C".repeat(10);
         let cds = format!("ATG{}TAA", "GCT".repeat(8));
@@ -2436,6 +3537,7 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
     }
 
@@ -2500,6 +3602,28 @@ mod tests {
             );
             assert_eq!(Consequence::worst_impact(&got), Some(Impact::High));
         }
+    }
+
+    #[test]
+    fn boundary_predicates_use_the_full_deleted_prefix_and_partial_codon_guard() {
+        let predictor = ConsequencePredictor::default();
+        let mut tr = make_boundary_transcript(Strand::Forward);
+        tr.spliced_seq.as_mut().unwrap().replace_range(8..10, "AT");
+        let start = predictor.predict_coding_consequence(
+            &Allele::from_str("AT"), &Allele::Deletion, &tr,
+            Some(1), Some(2), Some(11), Some(12),
+        ).unwrap();
+        assert!(start.additional.contains(&Consequence::StartRetainedVariant));
+
+        tr.cdna_coding_end = Some(41);
+        tr.spliced_seq.as_mut().unwrap().replace_range(38..43, "TAACA");
+        tr.translateable_seq = Some(tr.spliced_seq.as_ref().unwrap()[10..41].into());
+        let terminal = predictor.predict_coding_consequence(
+            &Allele::from_str("AC"), &Allele::Deletion, &tr,
+            Some(31), None, Some(41), Some(42),
+        ).unwrap();
+        assert_eq!(terminal.consequence, Consequence::CodingSequenceVariant);
+        assert_eq!(terminal.additional, vec![Consequence::IncompleteTerminalCodonVariant]);
     }
 
     #[test]
@@ -2582,27 +3706,219 @@ mod tests {
         }
     }
 
-    /// A length change across the initiator is `start_lost` even when an ATG
-    /// still happens to land on the coding start, because the reading frame
-    /// behind it has moved. PLA2G6's coding sequence begins `ATGGATGTCA`, so a
-    /// `c.-2_3delins` there leaves its second in-frame ATG at the coding start
-    /// while the CDS is four bases shorter.
     #[test]
-    fn start_lost_does_not_depend_on_the_codon_that_lands_at_the_coding_start() {
-        // Deleting cDNA 9..13 leaves cDNA 14 (`GCT`'s `T`) onward at the coding
-        // start; insert `ATG` so an initiator sits there again.
+    fn boundary_start_retention_requires_preserved_utr_and_atg() {
+        let predictor = ConsequencePredictor::default();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            for (utr, expected) in [
+                ("CA", Consequence::StartRetainedVariant),
+                ("CG", Consequence::StartLost),
+            ] {
+                let mut tr = make_boundary_transcript(strand);
+                tr.cdna_coding_start = Some(3);
+                tr.cdna_coding_end = Some(14);
+                tr.translateable_seq = Some("ATGAATGCTTAA".into());
+                tr.spliced_seq = Some(format!("{utr}ATGAATGCTTAA"));
+                let (start, end) = if strand == Strand::Forward {
+                    (2, 5)
+                } else {
+                    (5, 2)
+                };
+                let change = predictor
+                    .predict_cds_boundary_consequence(
+                        &Allele::from_str("AATG"),
+                        &Allele::Deletion,
+                        &tr,
+                        Some(start),
+                        Some(end),
+                    )
+                    .unwrap();
+                assert_eq!(change.consequence, expected, "{strand:?}, {utr}");
+            }
+        }
+    }
+
+    #[test]
+    fn depleted_cds_cannot_borrow_a_start_codon_from_three_prime_utr() {
+        let predictor = ConsequencePredictor::default();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let mut tr = make_boundary_transcript(strand);
+            tr.spliced_seq.as_mut().unwrap().replace_range(40..42, "TG");
+            let reference = &tr.translateable_seq.as_ref().unwrap().as_bytes()[1..];
+            let reference = Allele::Sequence(if strand == Strand::Reverse {
+                fastvep_genome::codon::reverse_complement(reference)
+            } else { reference.to_vec() });
+            let change = predictor.predict_coding_consequence(
+                &reference, &Allele::Deletion, &tr,
+                Some(2), Some(30), Some(12), Some(40),
+            ).unwrap();
+            assert!(change.additional.contains(&Consequence::StartLost), "{strand:?}: {:?}", change.additional);
+            assert!(!change.additional.contains(&Consequence::StartRetainedVariant), "{strand:?}: {:?}", change.additional);
+        }
+    }
+
+    #[test]
+    fn deleting_c3_can_retain_the_initiator_using_the_next_base() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let got = consequences_for(strand, 13, 13, &Allele::from_str("G"), &Allele::Deletion);
+            assert!(got.contains(&Consequence::FrameshiftVariant));
+            assert!(
+                got.contains(&Consequence::StartRetainedVariant),
+                "{strand:?}: {got:?}"
+            );
+            assert!(
+                !got.contains(&Consequence::StartLost),
+                "{strand:?}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_c3_deletion_cannot_use_the_c1_utr_repeat_exception() {
+        let predictor = ConsequencePredictor::default();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let mut tr = make_boundary_transcript(strand);
+            tr.spliced_seq.as_mut().unwrap().replace_range(9..10, "A");
+            tr.spliced_seq.as_mut().unwrap().replace_range(13..14, "C");
+            tr.translateable_seq
+                .as_mut()
+                .unwrap()
+                .replace_range(3..4, "C");
+            let reference = Allele::from_str(if strand == Strand::Forward { "G" } else { "C" });
+            let change = predictor
+                .predict_coding_consequence(
+                    &reference,
+                    &Allele::Deletion,
+                    &tr,
+                    Some(3),
+                    Some(3),
+                    Some(13),
+                    Some(13),
+                )
+                .unwrap();
+            assert!(change.additional.contains(&Consequence::StartLost));
+            assert!(!change
+                .additional
+                .contains(&Consequence::StartRetainedVariant));
+        }
+    }
+
+    #[test]
+    fn insertion_in_a_split_start_codon_uses_the_surviving_endpoint() {
+        let predictor = ConsequencePredictor::default();
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let tr = make_boundary_transcript(strand);
+            let (cds_start, cds_end, cdna_start, cdna_end, alt) = match strand {
+                Strand::Forward => (Some(3), None, Some(13), None, "C"),
+                Strand::Reverse => (None, Some(3), None, Some(13), "G"),
+            };
+            let change = predictor
+                .predict_coding_consequence(
+                    &Allele::Deletion,
+                    &Allele::from_str(alt),
+                    &tr,
+                    cds_start,
+                    cds_end,
+                    cdna_start,
+                    cdna_end,
+                )
+                .unwrap();
+            assert!(
+                change.consequence == Consequence::StartLost
+                    || change.additional.contains(&Consequence::StartLost),
+                "{strand:?}: {:?}, {:?}",
+                change.consequence,
+                change.additional
+            );
+        }
+    }
+
+    /// VEP retains the start when removing UTR bases leaves the full CDS suffix intact.
+    #[test]
+    fn boundary_edit_can_preserve_the_entire_cds_suffix() {
         for strand in [Strand::Forward, Strand::Reverse] {
             let got = consequences_for(
                 strand,
                 9,
                 13,
                 &Allele::from_str("CCATG"),
-                &Allele::from_str("ATG"),
+                &Allele::from_str(if strand == Strand::Forward {
+                    "ATG"
+                } else {
+                    "CAT"
+                }),
             );
             assert!(
-                got.contains(&Consequence::StartLost),
-                "{strand:?}: expected start_lost despite an ATG at the coding start, got {got:?}"
+                got.contains(&Consequence::StartRetainedVariant),
+                "{strand:?}: {got:?}"
             );
+            assert!(got.contains(&Consequence::StartLost));
+        }
+    }
+
+    #[test]
+    fn retained_deletion_at_start_can_preserve_the_cds_suffix() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let mut tr = make_boundary_transcript(strand);
+            tr.spliced_seq.as_mut().unwrap().replace_range(9..10, "A");
+            let (start, end) = genomic_span(strand, 11, 12);
+            let reference = Allele::from_str("AT");
+            let alternate = Allele::from_str(if strand == Strand::Forward { "T" } else { "A" });
+            let result = ConsequencePredictor::default().predict(
+                &GenomicPosition::new("chr1", start, end, Strand::Forward),
+                &reference, &[alternate, Allele::from_str("TA")], &[&tr], None,
+            );
+            let terms = &result.transcript_consequences[0].allele_consequences[0].consequences;
+            for term in [Consequence::FrameshiftVariant, Consequence::StartLost, Consequence::StartRetainedVariant] {
+                assert!(terms.contains(&term), "{strand:?}: {terms:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn equal_length_boundary_replacement_evaluates_start_independently_of_stop() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let tr = make_boundary_transcript(strand);
+            for (lo, hi, retains_start) in [(2, 40, true), (2, 41, false), (38, 41, false)] {
+                let reference = tr.spliced_seq.as_ref().unwrap().as_bytes()
+                    [(lo - 1) as usize..hi as usize].to_vec();
+                let mut alternate = reference.clone();
+                *alternate.last_mut().unwrap() = b'G';
+                let orient = |bases: Vec<u8>| Allele::Sequence(if strand == Strand::Forward {
+                    bases
+                } else { bases.into_iter().rev().map(complement).collect() });
+                let terms = consequences_for(strand, lo, hi, &orient(reference), &orient(alternate));
+                assert_eq!(terms.contains(&Consequence::StartRetainedVariant), retains_start,
+                    "{strand:?} {lo}..{hi}: {terms:?}");
+                assert!(!terms.contains(&Consequence::StopRetainedVariant), "{terms:?}");
+                assert!(!terms.contains(&Consequence::StopLost), "{terms:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn intron_spanning_replacement_tests_start_at_the_cds_suffix() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let tr = make_boundary_transcript(strand);
+            // The 21 genomic bases map to five cDNA bases after removing the
+            // intron. Keeping genomic REF/ALT lengths equal does not keep the
+            // edited cDNA length unchanged.
+            for (text, retained) in [
+                (format!("CCATG{}", "G".repeat(16)), false),
+                (format!("CCCCC{}ATG", "G".repeat(13)), true),
+            ] {
+                let bases = if strand == Strand::Forward { text.into_bytes() }
+                    else { text.bytes().rev().map(complement).collect() };
+                let change = ConsequencePredictor::default().predict_cds_boundary_consequence(
+                    &Allele::Sequence(vec![b'C'; 21]), &Allele::Sequence(bases),
+                    &tr, Some(9), Some(13),
+                );
+                if retained {
+                    let change = change.unwrap();
+                    assert_eq!(change.consequence, Consequence::StartRetainedVariant);
+                    assert!(change.additional.contains(&Consequence::StartLost));
+                } else { assert!(change.is_none()); }
+            }
         }
     }
 
@@ -2871,6 +4187,32 @@ mod tests {
         result.transcript_consequences[0].allele_consequences[0].clone()
     }
 
+    #[test]
+    fn padded_repeat_deletion_displays_only_the_minimized_codon() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let tr = make_boundary_transcript(strand);
+            let (lo, hi) = genomic_span(strand, 14, 22);
+            let orient = |s: &[u8]| {
+                Allele::Sequence(if strand == Strand::Forward {
+                    s.to_vec()
+                } else {
+                    fastvep_genome::codon::reverse_complement(s)
+                })
+            };
+            let ac = ConsequencePredictor::default()
+                .display_coding_change(
+                    &GenomicPosition::new("chr1", lo, hi, Strand::Forward),
+                    &orient(b"GCTGCTGCT"),
+                    &orient(b"GCTGCT"),
+                    &tr,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(ac.codons, Some(("GCT".into(), "-".into())));
+            assert_eq!(ac.amino_acids, Some(("A".into(), "-".into())));
+        }
+    }
+
     /// A delins that replaces residues without preserving the reference ones at
     /// either end of the replacement is `protein_altering_variant`, not an
     /// in-frame indel.
@@ -2965,7 +4307,9 @@ mod tests {
     #[test]
     fn an_insertion_in_a_terminal_repeat_can_retain_the_reference_protein() {
         let predictor = ConsequencePredictor::default();
-        let window = CodonWindow {
+        let mut window = CodonWindow {
+                peptides_defined: true,
+                alt_dna_unambiguous: true,
             ref_aas: String::new(),
             alt_aas: "E".into(),
             ref_window: Vec::new(),
@@ -2979,19 +4323,48 @@ mod tests {
             partial_codon: false,
         };
 
-        let retained = predictor.terms_for_window(&window, false, Some("MEEEE*"), false);
+        let retained = predictor.terms_for_window(&window, false, Some("MEEEE*"), false, false, false, None);
         assert_eq!(retained.consequence, Consequence::InframeInsertion);
         assert_eq!(retained.additional, vec![Consequence::StopRetainedVariant]);
 
-        let displaced = predictor.terms_for_window(&window, false, Some("MEEDE*"), false);
+        let displaced = predictor.terms_for_window(&window, false, Some("MEEDE*"), false, false, false, None);
         assert_eq!(displaced.consequence, Consequence::InframeInsertion);
         assert!(displaced.additional.is_empty());
+        window.tl_start = 6;
+        window.tl_end = 5;
+        window.alt_aas = "*CX".into();
+        window.alt_window = b"TGATGTA".to_vec();
+        window.alt_codons = "TGATGTA".into();
+        window.alt_len = 7;
+        let terminal = predictor.terms_for_window(&window, false, Some("MEEEE*"), false, false, false, None);
+        assert_eq!(terminal.consequence, Consequence::InframeInsertion);
+        assert_eq!(terminal.additional, vec![Consequence::StopRetainedVariant]);
+    }
+
+    #[test]
+    fn initiator_spanning_deletion_keeps_the_later_start_loss_predicate() {
+        let window = CodonWindow {
+                peptides_defined: true,
+                alt_dna_unambiguous: true,
+            ref_aas: "MAFEV".into(), alt_aas: "M".into(),
+            ref_window: b"ATGGCTTTCGAGGTG".to_vec(), alt_window: b"ATG".to_vec(),
+            ref_codons: "aTGGCTTTCGAGGtg".into(), alt_codons: "atg".into(),
+            ref_len: 12, alt_len: 0, tl_start: 1, tl_end: 5, partial_codon: false,
+        };
+        let change = ConsequencePredictor::default().terms_for_window(
+            &window, true, None, false, true, true, None,
+        );
+        assert_eq!(change.consequence, Consequence::StartLost);
+        assert!(change.additional.contains(&Consequence::InframeDeletion));
+        assert!(change.additional.contains(&Consequence::StartRetainedVariant));
     }
 
     #[test]
     fn a_replacement_past_an_incomplete_peptide_uses_its_available_suffix() {
         let predictor = ConsequencePredictor::default();
         let window = CodonWindow {
+                peptides_defined: true,
+                alt_dna_unambiguous: true,
             ref_aas: "SX".into(),
             alt_aas: "SX".into(),
             ref_window: b"AGCN".to_vec(),
@@ -3005,7 +4378,7 @@ mod tests {
             partial_codon: false,
         };
 
-        let retained = predictor.terms_for_window(&window, false, Some("MSS"), false);
+        let retained = predictor.terms_for_window(&window, false, Some("MSS"), false, false, false, None);
         assert_eq!(retained.consequence, Consequence::StopRetainedVariant);
         assert!(retained.additional.is_empty());
     }

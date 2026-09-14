@@ -21,6 +21,7 @@ bincode = { workspace = true }
 memmap2 = { workspace = true }
 zstd = { workspace = true }
 tempfile = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }

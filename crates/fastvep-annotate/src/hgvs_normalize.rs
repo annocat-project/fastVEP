@@ -31,13 +31,20 @@ pub fn convert_ins_to_dup_range(
     let build_pos = |cdna: u64, off: i64| -> String {
         let raw = cdna as i64 - coding_start as i64 + 1;
         let cp = if raw <= 0 { raw - 1 } else { raw };
+        // VEP's `_get_cDNA_position` names an intronic offset anchored on the
+        // last coding base from `*`, including the deliberately unusual
+        // negative form `*-11` on partial reverse-strand transcripts.
+        let terminal_coding_anchor = coding_end == Some(cdna) && off != 0;
         // An offset of 0 is an exonic end, written as the anchor alone. Folding
         // it into the negative arm renders `c.21` as `c.210`.
-        let anchor = match coding_end.filter(|&ce| cp >= 0 && cdna > ce) {
+        let anchor = match coding_end.filter(|&ce| !terminal_coding_anchor && cp >= 0 && cdna > ce)
+        {
             Some(ce) => format!("*{}", cdna - ce),
-            None => format!("{}", cp),
+            None if terminal_coding_anchor => "*".to_string(),
+            None => cp.to_string(),
         };
         match off.cmp(&0) {
+            std::cmp::Ordering::Greater if terminal_coding_anchor => format!("{}{}", anchor, off),
             std::cmp::Ordering::Greater => format!("{}+{}", anchor, off),
             std::cmp::Ordering::Less => format!("{}{}", anchor, off),
             std::cmp::Ordering::Equal => anchor,
@@ -179,25 +186,30 @@ pub fn three_prime_shift_intronic(
 ) -> (u64, u64) {
     use fastvep_core::Allele;
 
+    // VEP's contig-clipped mitochondrial window affects the shift itself,
+    // not only the later check for whether HGVS fits inside the transcript.
+    if fastvep_genome::is_mitochondrial(chrom) {
+        return vep_mitochondrial_genomic_shift(
+            seq_provider, chrom, start, end, ref_allele, alt_allele, strand,
+        ).unwrap_or((start, end));
+    }
+
     match (ref_allele, alt_allele) {
-        // A deletion slides 3' while the base past its end repeats the base at
-        // its start, which leaves the deleted sequence unchanged.
-        //
-        // The two cursors sit a whole deletion apart, so they get a window each:
-        // sharing one would refetch on every step of any deletion longer than a
-        // block, which is worse than the per-base reads this replaced.
+        // TVA::perform_shift rotates the supplied deletion allele, including
+        // ambiguous bases. Reading it back from the genome changes that input.
         (Allele::Sequence(ref_bases), Allele::Deletion) if !ref_bases.is_empty() => {
+            let limit = vep_genomic_shift_steps(1000, ref_bases.len(), strand) as u64;
             let (mut s, mut e) = (start, end);
             let mut ahead = RefWindow::new(seq_provider, chrom);
-            let mut behind = RefWindow::new(seq_provider, chrom);
             match strand {
                 fastvep_core::Strand::Forward => loop {
                     let next = e + 1;
-                    if next > intron_genomic_end {
+                    if next > intron_genomic_end || s.abs_diff(start) >= limit {
                         break;
                     }
-                    match (ahead.base(next), behind.base(s)) {
-                        (Some(a), Some(b)) if a == b => {
+                    let expected = ref_bases[((s - start) % ref_bases.len() as u64) as usize].to_ascii_uppercase();
+                    match ahead.base(next) {
+                        Some(base) if base == expected => {
                             s += 1;
                             e += 1;
                         }
@@ -205,11 +217,12 @@ pub fn three_prime_shift_intronic(
                     }
                 },
                 fastvep_core::Strand::Reverse => loop {
-                    if s == 0 || s - 1 < intron_genomic_start {
+                    if s == 0 || s - 1 < intron_genomic_start || s.abs_diff(start) >= limit {
                         break;
                     }
-                    match (ahead.base(s - 1), behind.base(e)) {
-                        (Some(a), Some(b)) if a == b => {
+                    let expected = ref_bases[ref_bases.len() - 1 - ((start - s) % ref_bases.len() as u64) as usize].to_ascii_uppercase();
+                    match ahead.base(s - 1) {
+                        Some(base) if base == expected => {
                             s -= 1;
                             e -= 1;
                         }
@@ -223,12 +236,13 @@ pub fn three_prime_shift_intronic(
         // inserted sequence, which rotates the sequence by one each step.
         (Allele::Deletion, Allele::Sequence(ins_bases)) if !ins_bases.is_empty() => {
             let ins_len = ins_bases.len();
+            let limit = vep_genomic_shift_steps(1000, ins_len, strand);
             let mut pos = start;
             let mut shift = 0usize;
             let mut window = RefWindow::new(seq_provider, chrom);
             match strand {
                 fastvep_core::Strand::Forward => loop {
-                    if pos > intron_genomic_end {
+                    if pos > intron_genomic_end || shift >= limit {
                         break;
                     }
                     let expected = ins_bases[shift % ins_len].to_ascii_uppercase();
@@ -241,7 +255,7 @@ pub fn three_prime_shift_intronic(
                     }
                 },
                 fastvep_core::Strand::Reverse => loop {
-                    if pos == 0 || pos - 1 < intron_genomic_start {
+                    if pos == 0 || pos - 1 < intron_genomic_start || shift >= limit {
                         break;
                     }
                     let expected = ins_bases[ins_len - 1 - (shift % ins_len)].to_ascii_uppercase();
@@ -325,12 +339,16 @@ pub(crate) fn transient_spliced_sequence(
     transcript.spliced_seq
 }
 
-/// Whether VEP's genomic 3'-shift moves an indel past the transcript.
+/// Whether VEP's genomic 3'-shift makes transcript HGVS unavailable.
 ///
-/// VEP suppresses transcript HGVS when the shifted insertion no longer fits on
-/// the transcript slice. A transcript-sequence-only shift instead stops at the
-/// last cDNA base and can incorrectly emit a terminal duplication.
-pub(crate) fn indel_shifts_beyond_transcript(
+/// VEP maps the unshifted variation to the transcript slice, adds the genomic
+/// shift, and returns no transcript HGVS when the shifted slice end is past the
+/// transcript (`TranscriptVariationAllele.pm::hgvs_transcript`). An insertion
+/// carries the coordinate before it as its slice end, so a final insertion
+/// point one base past the genomic transcript end still fits. Treating both
+/// insertion coordinates as ordinary bases incorrectly suppresses a valid
+/// terminal duplication.
+pub(crate) fn vep_hgvs_shift_exceeds_transcript(
     seq_provider: Option<&dyn SequenceProvider>,
     chrom: &str,
     transcript: &fastvep_genome::Transcript,
@@ -339,7 +357,7 @@ pub(crate) fn indel_shifts_beyond_transcript(
     ref_allele: &fastvep_core::Allele,
     alt_allele: &fastvep_core::Allele,
 ) -> bool {
-    use fastvep_core::Allele;
+    use fastvep_core::{Allele, Strand};
 
     let Some(provider) = seq_provider else {
         return false;
@@ -356,23 +374,109 @@ pub(crate) fn indel_shifts_beyond_transcript(
         return false;
     }
 
-    // Include one base beyond the transcript so a repeat can prove that the
-    // HGVS 3'-rule would move the allele out of the transcript slice.
-    let (shifted_start, shifted_end) = three_prime_shift_intronic(
-        provider,
-        chrom,
-        start,
-        end,
-        ref_allele,
-        alt_allele,
-        transcript.strand,
-        transcript.start.saturating_sub(1).max(1),
-        transcript.end.saturating_add(1),
-    );
-    shifted_start < transcript.start
-        || shifted_start > transcript.end
-        || shifted_end < transcript.start
-        || shifted_end > transcript.end
+    // One outside base is enough to prove that the shifted representation no
+    // longer fits. It also avoids scanning a long repeat past a transcript.
+    let (shifted_start, shifted_end) = if fastvep_genome::is_mitochondrial(chrom) {
+        vep_mitochondrial_genomic_shift(
+            provider,
+            chrom,
+            start,
+            end,
+            ref_allele,
+            alt_allele,
+            transcript.strand,
+        )
+        .unwrap_or((start, end))
+    } else {
+        three_prime_shift_intronic(
+            provider,
+            chrom,
+            start,
+            end,
+            ref_allele,
+            alt_allele,
+            transcript.strand,
+            transcript.start.saturating_sub(1).max(1),
+            transcript.end.saturating_add(1),
+        )
+    };
+
+    match (is_insertion, transcript.strand) {
+        // For an insertion, `start` is the base after the insertion and `end`
+        // is the base before it. VEP checks the latter transcript-slice
+        // coordinate after adding the shift.
+        (true, Strand::Forward) => shifted_start > transcript.end.saturating_add(1),
+        (true, Strand::Reverse) => shifted_start < transcript.start,
+        (false, Strand::Forward) => shifted_end > transcript.end,
+        (false, Strand::Reverse) => shifted_start < transcript.start,
+    }
+}
+
+fn vep_genomic_shift_steps(flank: usize, motif: usize, strand: fastvep_core::Strand) -> usize {
+    // TVA perform_shift: inclusive forward loop starts at zero, reverse at
+    // one; a negative loop limit resets to the flank length on either strand.
+    match strand {
+        fastvep_core::Strand::Forward => flank.checked_sub(motif).map(|n| n + 1).unwrap_or(flank),
+        fastvep_core::Strand::Reverse => (flank + 1).checked_sub(motif).unwrap_or(flank),
+    }.min(flank)
+}
+
+/// Reproduce VEP's contig-clipped mitochondrial window. It takes the final
+/// 1,000 slice bases as post_seq even near the contig end, where that window
+/// begins before the variant. This affects whether terminal HGVS is emitted.
+fn vep_mitochondrial_genomic_shift(
+    provider: &dyn SequenceProvider,
+    chrom: &str,
+    start: u64,
+    end: u64,
+    ref_allele: &fastvep_core::Allele,
+    alt_allele: &fastvep_core::Allele,
+    strand: fastvep_core::Strand,
+) -> Option<(u64, u64)> {
+    use fastvep_core::{Allele, Strand};
+
+    let mut motif = match (ref_allele, alt_allele) {
+        (Allele::Sequence(bases), Allele::Deletion) if !bases.is_empty() => bases.clone(),
+        (Allele::Deletion, Allele::Sequence(bases)) if !bases.is_empty() => bases.clone(),
+        _ => return Some((start, end)),
+    };
+    motif.make_ascii_uppercase();
+
+    const FLANK: u64 = 1_000;
+    let slice_start = start.saturating_sub(FLANK).max(1);
+    let slice_end = end.saturating_add(FLANK).min(fastvep_genome::MT_LENGTH);
+    let sequence = provider
+        .fetch_sequence_slice(chrom, slice_start, slice_end)
+        .ok()?;
+    let flank = FLANK as usize;
+    let mut shift = 0u64;
+
+    match strand {
+        Strand::Forward => {
+            let post = &sequence[sequence.len().saturating_sub(flank)..];
+            let limit = vep_genomic_shift_steps(post.len(), motif.len(), strand);
+            for &base in post.iter().take(limit) {
+                if motif.first().copied()? != base.to_ascii_uppercase() {
+                    break;
+                }
+                motif.rotate_left(1);
+                shift += 1;
+            }
+            Some((start.saturating_add(shift), end.saturating_add(shift)))
+        }
+        Strand::Reverse => {
+            let pre = &sequence[..sequence.len().min(flank)];
+            let limit = vep_genomic_shift_steps(pre.len(), motif.len(), strand);
+            for &base in pre.iter().rev().take(limit) {
+                if motif.last().copied()? != base.to_ascii_uppercase() {
+                    break;
+                }
+                motif.rotate_right(1);
+                shift += 1;
+            }
+            Some((start.saturating_sub(shift), end.saturating_sub(shift)))
+        }
+    }
 }
 
 /// The block a 3'-shifted intronic insertion duplicates, in genomic coordinates.
@@ -446,10 +550,8 @@ pub fn intronic_dup_span(
 /// Rewrite a 3'-shifted intronic insertion as a duplication, when it is one.
 ///
 /// `hgvsc` is the insertion notation already built for the shifted position, and
-/// is returned rewritten. `None` means the insertion does not duplicate an
-/// adjacent block, or the block leaves the intron it started in - a range
-/// written across that boundary names bases in the wrong intron, so the
-/// insertion notation it already carries is the correct description.
+/// is returned rewritten. `None` means the insertion does not duplicate the
+/// adjacent block.
 ///
 /// `coding_start` is `None` for a transcript numbered from its first base, which
 /// selects `n.` numbering.
@@ -481,22 +583,11 @@ pub fn intronic_ins_as_dup(
         fastvep_core::Strand::Forward => (lo, hi),
         fastvep_core::Strand::Reverse => (hi, lo),
     };
-    let start = transcript.genomic_to_intronic_cdna(first)?;
-    let end = transcript.genomic_to_intronic_cdna(last)?;
-    // Both ends must lie in the *same* intron. Offsets count from their own
-    // exon and do not run through zero, so a block reaching into the next
-    // intron - or into an exon - cannot be written as one range: stepping back
-    // from `+1` does not arrive at `-2`, it names bases in the intron before.
-    // Writing the crossing range anyway put PVS1's offset gate at `-2` for a
-    // duplication sitting on the donor and called two ClinVar-benign MSH6 and
-    // DSP variants likely pathogenic.
-    //
-    // A span running past the intron's own midpoint is fine, and Ensembl writes
-    // it from the exon on either side: `c.5044+27_5045-47dup`. Requiring one
-    // shared anchor instead of one shared intron left 160 such rows as `ins`.
-    if transcript.intron_bounds_at(first) != transcript.intron_bounds_at(last) {
-        return None;
-    }
+    // VEP's `_genomic_shift` is not bounded by the intron containing the input.
+    // It maps each shifted endpoint afterwards, so a duplicated block may be
+    // intronic, exonic, or cross a splice boundary.
+    let start = crate::intronic_or_exonic_cdna(transcript, first)?;
+    let end = crate::intronic_or_exonic_cdna(transcript, last)?;
     match coding_start {
         Some(cs) => convert_ins_to_dup_range(hgvsc, start, end, cs, coding_end),
         None => convert_ins_to_dup_range_noncoding(hgvsc, start, end),
@@ -548,33 +639,22 @@ pub fn hgvsc_intronic_shifted(
     );
     let is_indel = is_insertion || is_deletion;
 
-    // The walk is bounded by the intron the variant sits in, and an insertion
-    // sits *between* two bases, so `var_start` alone does not always find it:
-    // one written against the last intronic base has `var_start` in the exon
-    // beyond it, and a reverse-strand transcript travels 3' back down into that
-    // intron. Reading `var_end` when `var_start` lands outside places it.
-    let start_intron = transcript.intron_bounds_at(var_start);
-    let end_intron = transcript.intron_bounds_at(var_end);
-    let bounds = if is_deletion
-        && start_intron != end_intron
-        && (start_intron.is_some() || end_intron.is_some())
-    {
-        // VEP 115 shifts a deletion on the genomic reference before mapping
-        // either endpoint to cDNA. A deletion that crosses a splice boundary
-        // may therefore move out of the intron it started in.
-        Some((transcript.start, transcript.end))
-    } else if is_deletion
-        && start_intron.is_none()
-        && end_intron.is_none()
-        && transcript.genomic_to_cdna(var_start).is_some()
-        && transcript.genomic_to_cdna(var_end).is_some()
-    {
-        // The caller also uses this renderer when a deletion starts in an exon
-        // but VEP's genomic 3'-shift moves it into an intron.
-        Some((transcript.start, transcript.end))
-    } else {
-        start_intron.or(end_intron)
+    // Decline malformed cache models whose declared transcript span extends
+    // beyond every exon and intron. Real VEP transcript slices do not have such
+    // holes, and shifting an unmapped variant into a later exon invents HGVS.
+    let maps_to_transcript = |position| {
+        transcript.genomic_to_cdna(position).is_some()
+            || transcript.intron_bounds_at(position).is_some()
     };
+    if !maps_to_transcript(var_start) && !maps_to_transcript(var_end) {
+        return None;
+    }
+
+    // VEP 115's `_genomic_shift` walks on the genomic reference before mapping
+    // the result back to the transcript. It can therefore cross splice
+    // boundaries; limiting this to the input intron changes both the final
+    // coordinate and whether an insertion is recognized as a duplication.
+    let bounds = is_indel.then_some((transcript.start, transcript.end));
     let (shifted_start, shifted_end) = match seq_provider.filter(|_| is_indel).zip(bounds) {
         Some((sp, (intron_start, intron_end))) => three_prime_shift_intronic(
             sp,
@@ -679,11 +759,26 @@ pub fn hgvsc_intronic_shifted(
             }
         }
     }
+    // VEP `_get_cDNA_position` cannot map a base past the final genomic exon.
+    // A terminal duplication can still be valid because its two coordinates
+    // describe the preceding duplicated block, handled above.
+    if anchor_pos > transcript.end || second_pos.is_some_and(|pos| pos > transcript.end) {
+        return None;
+    }
     Some(hgvsc)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deletion_shift_rotates_input_reference_including_ambiguity() {
+        use fastvep_core::{Allele, Strand};
+        let genome = StrRef("AAAAAAAAAA");
+        for strand in [Strand::Forward, Strand::Reverse] {
+            assert_eq!(three_prime_shift_intronic(&genome, "1", 5, 5,
+                &Allele::from_str("N"), &Allele::Deletion, strand, 1, 10), (5, 5));
+        }
+    }
     use super::*;
     use anyhow::{anyhow, Result};
     use fastvep_core::Strand;
@@ -716,6 +811,30 @@ mod tests {
         }
     }
 
+    struct TerminalInsertionRef;
+    impl SequenceProvider for TerminalInsertionRef {
+        fn fetch_sequence(&self, _chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+            if start < 1 || end < start || end > 1_000 {
+                return Err(anyhow!("bad range"));
+            }
+            Ok((start..=end)
+                .map(|position| if position == 100 { b'C' } else { b'G' })
+                .collect())
+        }
+    }
+
+    struct MitoBoundaryRef;
+    impl SequenceProvider for MitoBoundaryRef {
+        fn fetch_sequence(&self, _chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+            if start < 1 || end < start || end > fastvep_genome::MT_LENGTH {
+                return Err(anyhow!("bad range"));
+            }
+            Ok((start..=end)
+                .map(|position| if position == 10_059 || position == 15_954 { b'A' } else { b'G' })
+                .collect())
+        }
+    }
+
     struct SpliceBoundaryRef;
     impl SequenceProvider for SpliceBoundaryRef {
         fn fetch_sequence(&self, _chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
@@ -742,6 +861,22 @@ mod tests {
             }
             Ok((start..=end)
                 .map(|pos| if matches!(pos, 20 | 81) { b'T' } else { b'G' })
+                .collect())
+        }
+    }
+
+    struct ExonicInsertionRef;
+    impl SequenceProvider for ExonicInsertionRef {
+        fn fetch_sequence(&self, _chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+            if start < 1 || end < start || end > 1_000 {
+                return Err(anyhow!("bad range"));
+            }
+            Ok((start..=end)
+                .map(|position| match position {
+                    20 | 22 => b'T',
+                    21 => b'G',
+                    _ => b'A',
+                })
                 .collect())
         }
     }
@@ -803,6 +938,7 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
     }
 
@@ -816,53 +952,142 @@ mod tests {
     }
 
     #[test]
-    fn terminal_exonic_insertion_shift_is_detected_on_both_strands() {
-        for (strand, start, end) in [(Strand::Forward, 91, 90), (Strand::Reverse, 11, 10)] {
-            let tr = transcript(strand);
-            assert!(indel_shifts_beyond_transcript(
-                Some(&HomopolymerRef),
-                "1",
-                &tr,
-                start,
-                end,
-                &fastvep_core::Allele::Deletion,
-                &fastvep_core::Allele::from_str("C"),
-            ));
-            assert!(!indel_shifts_beyond_transcript(
-                Some(&HomopolymerRef),
-                "1",
-                &tr,
-                start,
-                end,
-                &fastvep_core::Allele::Deletion,
-                &fastvep_core::Allele::from_str("A"),
-            ));
+    fn duplication_at_a_terminal_coding_anchor_uses_vep_star_notation() {
+        assert_eq!(
+            convert_ins_to_dup_range(
+                "ENST00000000001.1:c.318-11dup",
+                (400, -11),
+                (400, -11),
+                83,
+                Some(400),
+            )
+            .as_deref(),
+            Some("ENST00000000001.1:c.*-11dup")
+        );
+    }
+
+    #[test]
+    fn vep_boundary_check_allows_a_terminal_insertion_but_not_a_shift_past_it() {
+        let tr = transcript(Strand::Forward);
+        let inserted = fastvep_core::Allele::from_str("C");
+
+        assert!(!vep_hgvs_shift_exceeds_transcript(
+            Some(&TerminalInsertionRef),
+            "1",
+            &tr,
+            100,
+            99,
+            &fastvep_core::Allele::Deletion,
+            &inserted,
+        ));
+        assert!(vep_hgvs_shift_exceeds_transcript(
+            Some(&HomopolymerRef),
+            "1",
+            &tr,
+            100,
+            99,
+            &fastvep_core::Allele::Deletion,
+            &inserted,
+        ));
+        for (inserted, expected) in [("C", Some("T:c.40dup")), ("CA", None)] {
+            let inserted = fastvep_core::Allele::from_str(inserted);
+            assert_eq!(
+                hgvsc_intronic_shifted(
+                    Some(&TerminalInsertionRef),
+                    "1",
+                    &tr,
+                    "T",
+                    100,
+                    99,
+                    &fastvep_core::Allele::Deletion,
+                    &inserted,
+                    &fastvep_core::Allele::Deletion,
+                    &inserted,
+                    Some(1),
+                    Some(40),
+                )
+                .as_deref(),
+                expected,
+            );
         }
     }
 
     #[test]
-    fn terminal_exonic_deletion_shift_is_detected_on_both_strands() {
-        for (strand, position) in [(Strand::Forward, 200), (Strand::Reverse, 101)] {
-            let mut tr = transcript(strand);
-            tr.start += 100;
-            tr.end += 100;
-            tr.gene.start += 100;
-            tr.gene.end += 100;
-            for exon in &mut tr.exons {
-                exon.start += 100;
-                exon.end += 100;
+    fn mitochondrial_shift_handles_alleles_longer_than_the_search_flank() {
+        use fastvep_core::Allele;
+        for (length, forward, reverse) in [(999, 2, 2), (1000, 1, 1), (1001, 1000, 0), (1002, 1000, 1000), (1039, 1000, 1000)] {
+            let sequence = Allele::Sequence(vec![b'G'; length]);
+            for (reference, alternate, end) in [(&sequence, &Allele::Deletion, 4000 + length as u64 - 1), (&Allele::Deletion, &sequence, 3999)] {
+                for (strand, shift) in [(Strand::Forward, forward), (Strand::Reverse, -reverse)] {
+                    assert_eq!(vep_mitochondrial_genomic_shift(
+                        &MitoBoundaryRef, "MT", 4000, end, reference, alternate, strand,
+                    ), Some((4000u64.checked_add_signed(shift).unwrap(), end.checked_add_signed(shift).unwrap())),
+                        "length={length}, strand={strand:?}");
+                    assert_eq!(three_prime_shift_intronic(
+                        &MitoBoundaryRef, "1", 4000, end, reference, alternate, strand, 1, 16000,
+                    ), (4000u64.checked_add_signed(shift).unwrap(), end.checked_add_signed(shift).unwrap()),
+                        "nuclear length={length}, strand={strand:?}");
+                }
             }
-
-            assert!(indel_shifts_beyond_transcript(
-                Some(&HomopolymerRef),
-                "1",
-                &tr,
-                position,
-                position,
-                &fastvep_core::Allele::from_str("C"),
-                &fastvep_core::Allele::Deletion,
-            ));
         }
+    }
+
+    #[test]
+    fn vep_boundary_check_matches_linear_and_clipped_mitochondrial_windows() {
+        let tr = transcript(Strand::Forward);
+        let reference = fastvep_core::Allele::from_str("C");
+
+        assert!(vep_hgvs_shift_exceeds_transcript(
+            Some(&HomopolymerRef),
+            "1",
+            &tr,
+            100,
+            100,
+            &reference,
+            &fastvep_core::Allele::Deletion,
+        ));
+
+        let mut early_mt = transcript(Strand::Forward);
+        early_mt.start = 9_991;
+        early_mt.end = 10_058;
+        early_mt.gene.start = early_mt.start;
+        early_mt.gene.end = early_mt.end;
+        early_mt.exons[0].start = early_mt.start;
+        early_mt.exons[0].end = early_mt.end;
+        let mt_reference = fastvep_core::Allele::from_str("A");
+        assert!(vep_hgvs_shift_exceeds_transcript(
+            Some(&MitoBoundaryRef),
+            "MT",
+            &early_mt,
+            early_mt.end,
+            early_mt.end,
+            &mt_reference,
+            &fastvep_core::Allele::Deletion,
+        ));
+
+        let mut late_mt = early_mt.clone();
+        late_mt.start = 15_888;
+        late_mt.end = 15_953;
+        late_mt.gene.start = late_mt.start;
+        late_mt.gene.end = late_mt.end;
+        late_mt.exons[0].start = late_mt.start;
+        late_mt.exons[0].end = late_mt.end;
+        // Immediate genomic sequence permits an A insertion shift here, but
+        // VEP's contig-clipped post window begins earlier with G.
+        assert_eq!(three_prime_shift_intronic(
+            &MitoBoundaryRef, "MT", 15_954, 15_953,
+            &fastvep_core::Allele::Deletion, &mt_reference, Strand::Forward,
+            1, fastvep_genome::MT_LENGTH,
+        ), (15_954, 15_953));
+        assert!(!vep_hgvs_shift_exceeds_transcript(
+            Some(&MitoBoundaryRef),
+            "MT",
+            &late_mt,
+            late_mt.end,
+            late_mt.end,
+            &mt_reference,
+            &fastvep_core::Allele::Deletion,
+        ));
     }
 
     #[test]
@@ -906,6 +1131,32 @@ mod tests {
     }
 
     #[test]
+    fn exonic_duplication_retains_rotation_when_the_shift_crosses_an_intron() {
+        use fastvep_core::{Allele, GenomicPosition};
+        // OAZ3 source-traced window: the genomic shift crosses a one-base
+        // intron, but both final flanks and the duplicated block are exonic.
+        let reference = StrRef("GCCTCCAGTGCTCCTGAGTCCCTAGTAGGCCTCCAGGAGGGCAAAAGCAC");
+        let length = reference.0.len();
+        let gff = format!("1\ttest\tgene\t1\t{length}\t.\t+\t.\tID=gene:G;biotype=protein_coding\n\
+1\ttest\tmRNA\t1\t{length}\t.\t+\t.\tID=transcript:T;Parent=gene:G;biotype=protein_coding\n\
+1\ttest\texon\t1\t14\t.\t+\t.\tParent=transcript:T;rank=1\n\
+1\ttest\texon\t16\t{length}\t.\t+\t.\tParent=transcript:T;rank=2\n\
+1\ttest\tCDS\t1\t14\t.\t+\t0\tParent=transcript:T;protein_id=P\n\
+1\ttest\tCDS\t16\t{length}\t.\t+\t1\tParent=transcript:T;protein_id=P\n");
+        let mut transcripts = fastvep_cache::gff::parse_gff3(gff.as_bytes()).unwrap();
+        let tr = &mut transcripts[0];
+        tr.build_sequences(|chrom, start, end| reference.fetch_sequence(chrom, start, end)
+            .map_err(|error| error.to_string())).unwrap();
+        let result = fastvep_consequence::ConsequencePredictor::default().predict(
+            &GenomicPosition::new("1", 13, 12, Strand::Forward),
+            &Allele::Deletion, &[Allele::from_str("CCTGAGTC")], &[tr], None,
+        );
+        let allele = &result.transcript_consequences[0].allele_consequences[0];
+        assert_eq!(crate::hgvsc_for_allele(Some(&reference), "1", tr, "T", allele),
+            Some("T:c.15_22dup".into()));
+    }
+
+    #[test]
     fn a_genomic_deletion_shift_does_not_jump_an_intron() {
         let tr = transcript(Strand::Forward);
         let span = exonic_deletion_cdna_span(
@@ -922,6 +1173,27 @@ mod tests {
         // therefore leaves the deletion at cDNA 20 instead of skipping the
         // intron and shifting it to the next exon.
         assert_eq!(span, Some((20, 20)));
+    }
+
+    #[test]
+    fn exonic_insertion_can_shift_to_an_intronic_duplication() {
+        let tr = transcript(Strand::Forward);
+        let out = hgvsc_intronic_shifted(
+            Some(&ExonicInsertionRef),
+            "1",
+            &tr,
+            "ENST00000000001.1",
+            20,
+            19,
+            &fastvep_core::Allele::Deletion,
+            &fastvep_core::Allele::from_str("TG"),
+            &fastvep_core::Allele::Deletion,
+            &fastvep_core::Allele::from_str("TG"),
+            Some(1),
+            Some(40),
+        );
+
+        assert_eq!(out.as_deref(), Some("ENST00000000001.1:c.20+1_20+2dup"));
     }
 
     #[test]
@@ -1076,11 +1348,10 @@ mod tests {
         assert_eq!(out.as_deref(), Some("ENST00000000001.1:c.21-2_21-1dup"));
     }
 
-    /// A block reaching out of the intron cannot be written as one offset range -
-    /// offsets count from their own exon and do not run through zero - so the
-    /// insertion notation it already carries is kept.
+    /// VEP shifts across splice boundaries and maps the resulting duplication
+    /// endpoints independently.
     #[test]
-    fn a_block_leaving_the_intron_keeps_its_insertion_notation() {
+    fn a_block_leaving_the_intron_is_mapped_as_a_duplication() {
         // Exon 2 begins with `C`s, so a `CC` insert at the intron's 3' edge
         // duplicates a block that starts inside the exon.
         let r = StrRef(TG_REPEAT);
@@ -1096,7 +1367,7 @@ mod tests {
             Some(1),
             Some(40),
         );
-        assert_eq!(out, None);
+        assert_eq!(out.as_deref(), Some("ENST00000000001.1:c.19_20dup"));
     }
 
     /// The property the whole shift exists to provide, and the one that broke:

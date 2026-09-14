@@ -56,7 +56,7 @@ fn annotation(allele: &str) -> AlleleAnnotation {
         protein_position: PositionRange::complete(30, 30),
         amino_acids: None,
         codons: None,
-        exon: Some((2, 6)),
+        exon: Some((2, 2, 6)),
         intron: None,
         distance: None,
         hgvsc: None,

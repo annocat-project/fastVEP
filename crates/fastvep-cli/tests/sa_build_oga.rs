@@ -439,6 +439,10 @@ chr1\t26011\t2.71
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
 1\t26000\t.\tGA\tG\t.\t.\t.
 1\t26010\t.\tG\tGA\t.\t.\t.
+1\t26020\t.\tGGAA\tGGAAA\t.\t.\t.
+1\t26030\t.\tGAAGC\tGAAG\t.\t.\t.
+1\t26040\t.\tA\tG,T\t.\t.\t.
+1\t26050\t.\tA\tC\t.\t.\t.
 ",
     )
     .unwrap();
@@ -464,6 +468,11 @@ chr1\t26011\t2.71
     )
     .unwrap();
 
+    let cadd_source = tmp.path().join("cadd.tsv");
+    fs::write(&cadd_source, "#Chrom\tPos\tRef\tAlt\tRawScore\tPHRED\n1\t26000\tGA\tG\t0.1\t11\n1\t26010\tG\tGA\t0.2\t22\n1\t26020\tGGAA\tGGAAA\t0.3\t33\n1\t26030\tGAAGC\tGAAG\t0.4\t34\n1\t26040\tA\tG\t0.5\t35\n1\t26040\tA\tT\t0.6\t36\n1\t26050\tA\tG\t0.7\t37\n").unwrap();
+    run_sa_build("cadd", cadd_source.to_str().unwrap(),
+        tmp.path().join("cadd").to_str().unwrap(), "GRCh38", None, &[], false).unwrap();
+
     run_annotate(AnnotateConfig {
         input: input_vcf.to_string_lossy().into_owned(),
         output: output_vcf.to_string_lossy().into_owned(),
@@ -486,7 +495,7 @@ chr1\t26011\t2.71
         gene_list: None,
         explicit_alleles: false,
         qc_rules: None,
-        structured_output: None,
+        structured_output: Some(tmp.path().join("annotated.ndjson").to_string_lossy().into_owned()),
         omit_supplementary_vcf: false,
         show_progress: false,
         profile_output: None,
@@ -510,6 +519,25 @@ chr1\t26011\t2.71
         annotated
     );
     assert!(!annotated.contains("SpliceAI=-|"), "{annotated}");
+    let structured = fs::read_to_string(tmp.path().join("annotated.ndjson")).unwrap();
+    let cli_results: Vec<serde_json::Value> = structured.lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+
+    // Both APIs must use uploaded keys after parser minimization, including
+    // padded indels and individual ALTs. A different allele must not leak in.
+    let context = fastvep_annotate::AnnotationContext::new(
+        gff3.to_str(), None, tmp.path().to_str(), 0).unwrap();
+    let api_results = context.annotate_vcf_text(&fs::read_to_string(&input_vcf).unwrap(), false).unwrap();
+    let expected = vec![vec![11.0], vec![22.0], vec![33.0], vec![34.0], vec![35.0, 36.0], vec![]];
+    for results in [&cli_results, &api_results] {
+        assert_eq!(results.len(), expected.len());
+        for (result, expected) in results.iter().zip(&expected) {
+            let mut scores: Vec<f64> = result["alleles"].as_array().into_iter().flatten()
+                .filter_map(|allele| allele["cadd"]["phred"].as_f64()).collect();
+            scores.sort_by(f64::total_cmp);
+            assert_eq!(&scores, expected, "{result}");
+        }
+    }
 }
 
 #[test]

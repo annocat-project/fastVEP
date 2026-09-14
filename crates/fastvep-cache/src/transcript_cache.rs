@@ -71,6 +71,18 @@ pub fn save_cache(transcripts: &[Transcript], path: &Path) -> Result<()> {
 /// Load transcripts from a binary cache file.
 /// Supports both zstd (v2) and legacy gzip (v1) formats.
 pub fn load_cache(path: &Path) -> Result<Vec<Transcript>> {
+    Ok(crate::annocat_cache::load(path)?.transcripts)
+}
+
+pub(crate) fn load_legacy_cache(path: &Path) -> Result<Vec<Transcript>> {
+    load_legacy_layout(path, true).or_else(|current_error| {
+        // Pristine caches predate the local CDS phase field. Each attempt must
+        // decode the complete stream; a partially decoded layout is not accepted.
+        load_legacy_layout(path, false).map_err(|_| current_error)
+    })
+}
+
+fn load_legacy_layout(path: &Path, phase_field: bool) -> Result<Vec<Transcript>> {
     let file =
         File::open(path).with_context(|| format!("Opening cache file: {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -89,31 +101,30 @@ pub fn load_cache(path: &Path) -> Result<Vec<Transcript>> {
 
     if peek[0..2] == [0x1F, 0x8B] {
         // Legacy gzip format (v1)
-        load_cache_gzip(reader)
+        load_cache_gzip(reader, phase_field)
     } else {
         // zstd format (v2, or future)
-        load_cache_zstd(reader)
+        load_cache_zstd(reader, phase_field)
     }
 }
 
-fn load_cache_zstd<R: std::io::Read>(reader: R) -> Result<Vec<Transcript>> {
+fn load_cache_zstd<R: std::io::Read>(reader: R, phase_field: bool) -> Result<Vec<Transcript>> {
     let mut zst = zstd::Decoder::new(reader)?;
 
     use std::io::Read;
     let mut magic = [0u8; 8];
     zst.read_exact(&mut magic)
         .with_context(|| "Reading cache header")?;
-    if &magic != CACHE_MAGIC_V2 {
+    if ![CACHE_MAGIC_V2, b"FSTVEP03", b"FSTVEP04", b"FSTVEP05"].contains(&&magic) {
         anyhow::bail!("Invalid cache file (wrong magic header, expected FSTVEP02)");
     }
 
-    let transcripts: Vec<Transcript> = bincode::deserialize_from(&mut zst)
-        .with_context(|| "Deserializing transcripts from cache")?;
+    let transcripts = decode_legacy_transcripts(&mut zst, phase_field)?;
     require_decompressed_eof(&mut zst)?;
     Ok(transcripts)
 }
 
-fn load_cache_gzip<R: std::io::Read>(reader: R) -> Result<Vec<Transcript>> {
+fn load_cache_gzip<R: std::io::Read>(reader: R, phase_field: bool) -> Result<Vec<Transcript>> {
     use flate2::read::GzDecoder;
 
     let mut gz = GzDecoder::new(reader);
@@ -126,10 +137,30 @@ fn load_cache_gzip<R: std::io::Read>(reader: R) -> Result<Vec<Transcript>> {
         anyhow::bail!("Invalid cache file (wrong magic header, expected FSTVEP01)");
     }
 
-    let transcripts: Vec<Transcript> = bincode::deserialize_from(&mut gz)
-        .with_context(|| "Deserializing transcripts from cache")?;
+    let transcripts = decode_legacy_transcripts(&mut gz, phase_field)?;
     require_decompressed_eof(&mut gz)?;
     Ok(transcripts)
+}
+
+fn decode_legacy_transcripts(
+    reader: &mut impl std::io::Read,
+    phase_field: bool,
+) -> Result<Vec<Transcript>> {
+    use bincode::Options;
+    // An older record layout can look like a huge string length in the newer
+    // layout. Bound decoding before attempting the alternative, never allocate
+    // from an unchecked length. This is above the qualified full-cache payload.
+    let options = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(8 * 1024 * 1024 * 1024);
+    if phase_field {
+        let stored: Vec<crate::transcript_wire::Transcript> = options.deserialize_from(reader)?;
+        Ok(stored.into_iter().map(Into::into).collect())
+    } else {
+        let stored: Vec<crate::transcript_wire::TranscriptWithoutPhase> =
+            options.deserialize_from(reader)?;
+        Ok(stored.into_iter().map(Into::into).collect())
+    }
 }
 
 fn require_decompressed_eof(reader: &mut impl std::io::Read) -> Result<()> {
@@ -155,6 +186,7 @@ pub struct TranscriptCacheVerification {
     pub coding_with_sequence_count: u64,
     pub primary_coding_missing_sequence_count: u64,
     pub non_primary_coding_missing_sequence_count: u64,
+    pub capabilities: Vec<String>,
 }
 
 /// Fully decode a transcript cache and validate the structural invariants used
@@ -233,20 +265,38 @@ pub fn verify_cache(
         coding_with_sequence_count,
         primary_coding_missing_sequence_count,
         non_primary_coding_missing_sequence_count,
+        capabilities: crate::annocat_cache::read_header(path)?
+            .map(|h| h.capabilities)
+            .unwrap_or_default(),
     })
 }
 
 fn cache_format(path: &Path) -> Result<&'static str> {
+    if crate::annocat_cache::read_header(path)?.is_some() {
+        return Ok(crate::annocat_cache::FORMAT);
+    }
     use std::io::Read;
     let mut file =
         File::open(path).with_context(|| format!("Opening cache file: {}", path.display()))?;
     let mut prefix = [0u8; 4];
     file.read_exact(&mut prefix)
         .with_context(|| "Reading cache compression header")?;
-    Ok(if prefix[0..2] == [0x1F, 0x8B] {
-        "FSTVEP01"
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader: Box<dyn std::io::Read> = if prefix[0..2] == [0x1F, 0x8B] {
+        Box::new(flate2::read::GzDecoder::new(file))
     } else {
-        "FSTVEP02"
+        Box::new(zstd::Decoder::new(file)?)
+    };
+    let mut magic = [0; 8];
+    reader.read_exact(&mut magic)?;
+    Ok(match &magic {
+        b"FSTVEP01" => "FSTVEP01",
+        b"FSTVEP02" => "FSTVEP02",
+        b"FSTVEP03" => "FSTVEP03",
+        b"FSTVEP04" => "FSTVEP04",
+        b"FSTVEP05" => "FSTVEP05",
+        _ => anyhow::bail!("Unknown transcript cache format"),
     })
 }
 
@@ -353,7 +403,89 @@ mod tests {
             gencode_primary: false,
             flags: vec![],
             codon_table_start_phase: 0,
+            reference_peptide: None,
         }
+    }
+
+    #[test]
+    fn pristine_and_patched_legacy_layouts_remain_readable() {
+        use std::io::Write;
+        let transcripts = vec![make_test_transcript(), make_test_transcript()];
+        let old: Vec<crate::transcript_wire::TranscriptWithoutPhase> =
+            serde_json::from_value(serde_json::to_value(&transcripts).unwrap()).unwrap();
+        let file = NamedTempFile::new().unwrap().into_temp_path();
+        let mut encoder = zstd::Encoder::new(File::create(&file).unwrap(), 1).unwrap();
+        encoder.write_all(b"FSTVEP02").unwrap();
+        bincode::serialize_into(&mut encoder, &old).unwrap();
+        encoder.finish().unwrap();
+        assert_eq!(
+            serde_json::to_value(load_cache(&file).unwrap()).unwrap(),
+            serde_json::to_value(&transcripts).unwrap()
+        );
+        save_cache(&transcripts, &file).unwrap();
+        assert_eq!(load_cache(&file).unwrap().len(), 2);
+        for magic in [b"FSTVEP03", b"FSTVEP04", b"FSTVEP05"] {
+            let mut encoder = zstd::Encoder::new(File::create(&file).unwrap(), 1).unwrap();
+            encoder.write_all(magic).unwrap();
+            bincode::serialize_into(&mut encoder, &transcripts).unwrap();
+            encoder.finish().unwrap();
+            assert_eq!(load_cache(&file).unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn annocat_roundtrip_preserves_ranges_and_rejects_damaged_payloads() {
+        use crate::annocat_cache::{self, Enrichment, Header};
+        use std::collections::BTreeMap;
+        let mut tr = make_test_transcript();
+        tr.biotype = Arc::from("miRNA");
+        let extra = BTreeMap::from([(
+            "1:ENST00000001".into(),
+            Enrichment {
+                mature_mirna_ranges: vec![(20, 40)],
+                ..Default::default()
+            },
+        )]);
+        let header = Header {
+            species: "homo_sapiens".into(),
+            assembly: "GRCh38".into(),
+            ensembl_release: 115,
+            vep_release: "115.2".into(),
+            capabilities: vec!["mature-mirna-ranges".into()],
+            provenance: serde_json::json!({}),
+            transcript_count: 0,
+            coding_transcript_count: 0,
+            contig_counts: BTreeMap::new(),
+            payload_bytes: 0,
+            payload_sha256: String::new(),
+            semantic_sha256: String::new(),
+        };
+        let file = NamedTempFile::new().unwrap().into_temp_path();
+        let saved = annocat_cache::save(vec![tr.clone()], extra, header, &file).unwrap();
+        let loaded = annocat_cache::load(&file).unwrap();
+        assert_eq!(
+            loaded.header.unwrap().semantic_sha256,
+            saved.semantic_sha256
+        );
+        assert_eq!(
+            loaded.enrichment["1:ENST00000001"].mature_mirna_ranges,
+            vec![(20, 40)]
+        );
+        assert_eq!(
+            serde_json::to_value(&loaded.transcripts[0]).unwrap(),
+            serde_json::to_value(tr).unwrap()
+        );
+        let bytes = std::fs::read(&file).unwrap();
+        let mut damaged = bytes.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        std::fs::write(&file, damaged).unwrap();
+        assert!(load_cache(&file).is_err());
+        std::fs::write(&file, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(load_cache(&file).is_err());
+        let mut future = bytes;
+        future[8..12].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&file, future).unwrap();
+        assert!(load_cache(&file).is_err());
     }
 
     #[test]

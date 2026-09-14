@@ -22,7 +22,8 @@ pub struct VariationFeature {
     pub transcript_variations: Vec<TranscriptVariation>,
     /// Co-located known variants (populated during annotation).
     pub existing_variants: Vec<KnownVariant>,
-    /// Whether the alleles were minimised.
+    /// Whether input minimization has completed. Multiallelic input retains
+    /// its shared interval; do not repeat the pass after allele case conversion.
     pub minimised: bool,
     /// Most severe consequence across all transcripts/alleles.
     pub most_severe_consequence: Option<Consequence>,
@@ -87,8 +88,10 @@ pub struct AlleleAnnotation {
     pub protein_position: PositionRange,
     pub amino_acids: Option<(String, String)>,
     pub codons: Option<(String, String)>,
-    pub exon: Option<(u32, u32)>,
-    pub intron: Option<(u32, u32)>,
+    /// First exon, last exon, total exons (1-based transcript order).
+    pub exon: Option<(u32, u32, u32)>,
+    /// First intron, last intron, total introns (1-based transcript order).
+    pub intron: Option<(u32, u32, u32)>,
     pub distance: Option<i64>,
     pub hgvsc: Option<String>,
     pub hgvsp: Option<String>,
@@ -184,6 +187,43 @@ pub struct KnownVariant {
 }
 
 impl VariationFeature {
+    /// Map internal alleles back to uploaded VCF keys for allele-matched sources.
+    pub fn supplementary_query_alleles(&self) -> Vec<(String, u64, String, String)> {
+        if let Some(vcf) = &self.vcf_fields {
+            let uploaded_alts: Vec<&str> = vcf.alt.split(',').collect();
+            return self
+                .alt_alleles
+                .iter()
+                .enumerate()
+                .map(|(idx, allele)| {
+                    let allele_string = allele.to_string();
+                    (
+                        allele_string.clone(),
+                        vcf.pos,
+                        vcf.ref_allele.clone(),
+                        uploaded_alts
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(&allele_string)
+                            .to_string(),
+                    )
+                })
+                .collect();
+        }
+
+        self.alt_alleles
+            .iter()
+            .map(|allele| {
+                (
+                    allele.to_string(),
+                    self.position.start,
+                    self.ref_allele.to_string(),
+                    allele.to_string(),
+                )
+            })
+            .collect()
+    }
+
     /// Compute the most severe consequence across all transcript annotations.
     pub fn compute_most_severe(&mut self) {
         let all_consequences: Vec<Consequence> = self
