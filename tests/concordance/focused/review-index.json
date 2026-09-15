@@ -1,0 +1,64 @@
+{
+  "scope": "Four focused regression groups; all-transcript comparison; no new exceptions. Prior builds are retained fork builds, not a current upstream comparison.",
+  "records": 13,
+  "currentPassed": true,
+  "currentBinarySha256": "449325c78f937788c60bb8c058253c11f7a118132ce91df59f443d7b6f02c805",
+  "cacheSha256": "93abfbf2f57e63648e52a16b0411238587f08cf91efeae208e0eb0d15d55ccc2",
+  "fastaSha256": "9cce8b926416dd96b152deea85188495b75f7ac8d634cc723a017067be8702b7",
+  "implementationCommit": "546adea80b68ebffc964ee4ab6718c755bc7d773",
+  "priorFailures": [
+    {
+      "group": "mitochondrial-initiator",
+      "priorFailureReproduced": true,
+      "mismatchesByField": {
+        "Amino_acids": 4,
+        "Consequence": 2,
+        "HGVSp": 1,
+        "IMPACT": 1
+      },
+      "examples": 4
+    },
+    {
+      "group": "recreated-stop-clipping",
+      "priorFailureReproduced": true,
+      "mismatchesByField": {
+        "HGVSp": 41
+      },
+      "examples": 41
+    },
+    {
+      "group": "inversion-before-clipping",
+      "priorFailureReproduced": true,
+      "mismatchesByField": {
+        "HGVSc": 76
+      },
+      "examples": 76
+    },
+    {
+      "group": "insertion-flank-order",
+      "priorFailureReproduced": true,
+      "mismatchesByField": {
+        "HGVSp": 16
+      },
+      "examples": 16
+    }
+  ],
+  "vepSourceFiles": [
+    {
+      "path": "Bio/EnsEMBL/Transcript.pm",
+      "sha256": "441814c57324151d3ef0bf0bc267eb87b12975463ddae15a2dea06272b110db2"
+    },
+    {
+      "path": "Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm",
+      "sha256": "b53c0743d1fac7df5b2a5d69a1df2fb294d3b69cb132a60390e0f0c93fc0f0c4"
+    },
+    {
+      "path": "Bio/EnsEMBL/Variation/Utils/Sequence.pm",
+      "sha256": "2fcb8a73c2cbb57bc9cd68a1e4e210b9a26bbb4575b5ce0b5f0a261d63a145d2"
+    },
+    {
+      "path": "Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm",
+      "sha256": "e03bbe1329516b7452d850877ad7d972f1f02120ad86819b0ac92bd5476b3fe8"
+    }
+  ]
+}

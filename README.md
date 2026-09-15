@@ -1,288 +1,214 @@
-# fastVEP
+# fastVEP for AnnoCat
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE.md)
-[![Upstream](https://img.shields.io/badge/upstream-Huang--lab%2FfastVEP-4057d6.svg)](https://github.com/Huang-lab/fastVEP)
-[![Used by AnnoCAT](https://img.shields.io/badge/used%20by-AnnoCAT-4057d6.svg)](https://github.com/annocat-project/AnnoCAT)
+This fork of [Huang-lab/fastVEP](https://github.com/Huang-lab/fastVEP) is maintained
+for [AnnoCat](https://github.com/annocat-project/AnnoCAT). It extends the annotation
+engine, transcript-cache builder, supplementary-source handling and library
+interfaces used by the application. It also includes performance and memory-use
+changes for large local annotation jobs. Ensembl VEP 115.2 concordance under
+the Ensembl human GRCh38 configuration described below is one part of that work.
 
-fastVEP is a Rust implementation of the Ensembl Variant Effect Predictor model.
-It predicts transcript and protein consequences for VCF variants and can attach
-clinical, population, conservation, splicing, and prediction annotations from
-local supplementary databases.
+The standalone fastVEP CLI and AnnoCat's embedded annotation engine use the same
+Rust source. AnnoCat owns the application, Parquet writer and viewer.
 
-The upstream engine handles small variants and structural variants, reports 49
-[Sequence Ontology](http://www.sequenceontology.org/) consequence terms,
-generates HGVS descriptions, parses multi-sample genotypes, and writes VCF, tab,
-or JSON output. It supports merged Ensembl and RefSeq gene models, custom VCF or
-BED annotations, expression-based filtering, and non-human genomes with matching
-GFF3 and reference data.
+## Differences from upstream
 
-This repository is the fastVEP fork maintained for AnnoCAT. It is based on
-[Huang-lab/fastVEP](https://github.com/Huang-lab/fastVEP) and remains licensed
-under Apache-2.0. Use the upstream repository for the original project and the
-AnnoCAT fork for the exact engine bundled with AnnoCAT.
+The comparison is against recorded upstream base `0e13c5bdb92f22a5f780cf314699f8402fb8383e`
+(v0.3.0). It does not cover every later upstream change.
 
-## AnnoCAT fork
+- Additional consequence and HGVS repairs for allele minimization, transcript
+  membership, splice boundaries, incomplete CDS, start/stop codons and repeats.
+- A public Ensembl Core transcript-cache builder with source metadata and
+  declared sequence edits. FSTVEP02 reading is retained alongside ANNOCATC1.
+- Supplementary-source builders and OSA1/OSA2 readers, verified chromosome
+  shards, multiple records per allele key and transcript-aligned dbNSFP fields.
+- Shared CLI/library annotation paths and output interfaces for AnnoCat's
+  direct-Parquet worker. The Parquet writer and viewer schemas live in AnnoCat.
+- Memory-mapped reference and supplementary data, bounded decoded caches,
+  packed supplementary records, reduced parsing and cloning, and deterministic
+  parallel source loading and querying.
 
-AnnoCAT processes large local VCF files, installs annotation sources as verified
-chromosome shards, and stores complete structured evidence for its result viewer.
-This fork adds the interfaces and correctness rules needed for that workflow.
+The [concordance inventory](tests/concordance/FIX-INVENTORY.md) describes 113
+review families with source and related test links. They include supporting
+cache and caller changes; they are not 113 independent bugs or isolated patches.
 
-The maintained engine is on `codex/vep115-concordance`. AnnoCAT pins an exact
-commit and builds both its library integration and the standalone `fastvep`
-companion from that source. The branch name and upstream version alone do not
-identify a qualified build.
+## AnnoCat integration
 
-### VEP 115 compatibility
+AnnoCat manages source downloads and installation. fastVEP builds and verifies
+the transcript and supplementary caches, then supplies annotations through its
+library or standalone commands. The transcript builder combines matching GFF3,
+reference FASTA and Ensembl Core inputs; older FSTVEP02 caches remain readable,
+but do not gain metadata that their files lack.
 
-Consequence and HGVS work targets Ensembl VEP 115 with the pinned GRCh38
-reference, transcript sources and annotation options. Regression corpora and
-source-path audits cover allele normalization, splice boundaries, partial CDS,
-mitochondrial translation, transcript coordinates and protein HGVS. This is not
-a claim of exhaustive agreement for every possible input or VEP configuration.
+Supplementary-source changes preserve multiple exact-key records and
+transcript-specific evidence. Source lookup keys remain distinct from HGVS
+strings: providers use uploaded allele mappings, positions or normalized
+reference alleles according to their own contracts. Supplementary lookup and
+output parity need separate checks from VEP consequence agreement.
 
-Reviewed exceptions intentionally avoid reproducing VEP crashes, reversed HGVS
-coordinate order at coding/UTR boundaries, and intronic offsets beyond a
-transcript's final exon. Qualification must distinguish those exact exceptions
-from unexplained differences. Passing Rust tests alone does not establish
-whole-genome annotation concordance.
+The library exposes annotations and CSQ field projection in memory for AnnoCat's
+direct-Parquet worker. AnnoCat handles Parquet writing, result schemas, displayed
+transcript selection, task recovery and the viewer. The standalone CLI retains
+VCF and structured text output; it does not provide an AnnoCat direct-Parquet
+command.
 
-### Public transcript caches
+The performance changes address data loading, decoding and output preparation.
+Their effect depends on the input, enabled sources and hardware. This README
+does not claim a general speed or memory advantage over current upstream.
 
-The public Ensembl builder combines matching GFF3, reference sequence and
-Ensembl core enrichment inputs into an `ANNOCATC1` transcript cache. It retains
-complete transcript membership, VEP 115 core metadata, mature miRNA ranges and
-translation sequence edits. Legacy `FSTVEP02` caches remain readable; their
-capabilities differ, so merely opening an older cache does not qualify it as
-equivalent to a newly enriched cache.
+## ANNOCATC1 transcript caches
 
-AnnoCAT manages source downloads, verifies their manifests and publishes the
-built cache after verification. Existing caches remain read-only during
-annotation. Basic GFF3/FASTA cache construction below is separate from the
-enriched public-builder path.
+ANNOCATC1 is this fork's versioned transcript-cache format. GFF3 alone does not
+provide all the transcript metadata and sequence adjustments needed to reproduce
+the tested VEP 115.2 / Ensembl GRCh38 configuration. The public builder combines GFF3 and indexed reference
+FASTA with six Ensembl Core tables: `gene`, `transcript`, `translation`,
+`attrib_type`, `transcript_attrib` and `translation_attrib`. Input sizes and
+SHA-256 hashes are checked against the build manifest.
 
-### Supplementary annotation caches
+The cache contains transcript and gene identifiers, exon structure, coding
+coordinates, transcript/CDS/peptide sequences, and annotations such as MANE,
+canonical status, APPRIS, TSL, CCDS and completeness flags where available.
+An enrichment map adds gene versions, mature-miRNA ranges and declared sequence
+edits. The current public builder supports translation edits and rejects RNA
+edits it cannot apply; storing an edit field does not imply support for every
+edit type.
 
-- Read OSA1 and OSA2 caches through one verified provider interface.
-- Build chromosome-sharded databases from plain, gzip, BGZF, or streamed input.
-- Read indexed BGZF chromosome ranges without dropping complete boundary records.
-- Compose chromosome shards from strict manifests, with deterministic fallback to
-  an all-chromosome shard when a source provides one.
-- Retain selected source fields for ClinVar, dbSNP, gnomAD, dbNSFP, CADD,
-  SpliceAI, REVEL, and conservation sources. Preserve dbNSFP transcript-aligned
-  fields instead of collapsing them during cache construction.
-- Preserve multiple exact-key records for sources such as dbNSFP, SpliceAI, and
-  REVEL when their evidence is transcript- or gene-scoped.
-- Preserve ambiguous-reference allele keys without changing the compact path for
-  ordinary A, C, G, and T alleles.
-- Verify archive structure, checksums, metadata, JSON records, key ordering, and
-  lookup parity before a cache is promoted.
-- Convert verified CADD and SpliceAI OSA1 shards to OSA2 without replacing the
-  source cache.
+The file has an `ANNOCATC` signature, a version number and an inspectable JSON
+header, followed by a Zstandard-compressed bincode payload. The header records
+species, assembly, Ensembl/VEP releases, capabilities, source and builder
+provenance, transcript counts and two hashes: one for the compressed payload and
+one for its serialized content before compression. Loading checks those hashes,
+file length, transcript/contig counts and enrichment references. The serialized
+field layout is frozen for this format version.
 
-### Annotation output
+FSTVEP02 remains readable through the compatibility loader. It does not acquire
+ANNOCATC1 provenance or enrichment merely by being opened. ANNOCATC1 is also
+separate from Ensembl's own VEP cache format and from AnnoCat result files.
+Successful decoding and checksum verification establish file integrity;
+annotation concordance still requires comparison with the reference, cache and
+options under test.
 
-- Expose an in-memory output interface for AnnoCAT's direct-Parquet worker,
-  avoiding mandatory intermediate VCF and NDJSON files. AnnoCAT owns Parquet
-  writing, result schemas, representative-transcript display and recovery;
-  the standalone `fastvep` CLI does not provide a direct-Parquet command.
-- Write newline-delimited structured annotations beside VCF output in the same
-  annotation pass.
-- Store supplementary evidence once per allele instead of once per transcript.
-- Optionally omit duplicate supplementary VCF INFO fields while retaining the
-  complete structured evidence used by AnnoCAT.
-- Keep annotated VCF output complete when that output is requested.
+See the [format reader/writer](crates/fastvep-cache/src/annocat_cache.rs),
+[frozen payload layout](crates/fastvep-cache/src/transcript_wire.rs) and
+[public builder](crates/fastvep-cache/src/ensembl_core.rs).
 
-### Consequences and HGVS
+## OSA2 supplementary caches
 
-- Incorporate upstream fastVEP v0.3.0 correctness and mitochondrial updates.
-- Normalize each alternate allele independently, including complex and
-  reverse-strand alleles.
-- Preserve transcript metadata needed for deterministic consequence selection.
-- Correct consequence and HGVS handling for multiallelic records, noncoding
-  genes, splice-boundary deletions, protein versions, and mitochondrial start
-  uncertainty.
-- Resolve in-frame HGVSp changes against either end of the affected residue
-  span and report start-codon deletions as uncertain.
-- Preserve annotated selenocysteine residues when translating complete nuclear
-  coding sequences.
+OSA2 is the upstream ZIP-based supplementary-annotation format. It groups
+records into genomic chunks with encoded allele keys, field arrays, string
+tables and optional structured JSON values. This fork extends its handling for
+AnnoCat's sources and large local workloads.
 
-### Performance and safety
+- **Record preservation:** lookup retains multiple records with the same allele
+  key. The `record_list` metadata flag distinguishes a list of source records
+  from an array-valued annotation. Source readers also preserve transcript-aligned
+  fields, such as dbNSFP evidence, through result projection.
+- **Alleles outside the compact encoding:** an optional `raw-alleles.enc` entry
+  retains exact allele strings that cannot use the compact A/C/G/T encoding,
+  rather than dropping those source records.
+- **Chromosome shards:** a separate `.osa-shards.json` manifest presents multiple
+  cache files as one source. The reader checks source metadata and format
+  consistency, chromosome mappings and relative file paths. Sharding does not
+  replace the OSA2 container format.
+- **Loading and memory:** the reader parses the ZIP directory from a memory map
+  and resolves entry offsets on demand. Readers share a byte-budgeted decoded
+  chunk cache. Packed JSON storage reduces per-record allocations, and decoding
+  limits bound individual structured-value columns.
 
-- Memory-map indexed FASTA and OSA2 archives instead of loading complete files.
-- Stream dbNSFP, CADD, and REVEL records into cache writers without staging full
-  source tables.
-- Reuse parser buffers, serialize selected fields directly, and avoid redundant
-  JSON parsing, record cloning, and sorting.
-- Parse configurable supplementary sources in bounded ordered batches.
-- Limit source parsing to one to four workers and overlap ordered OSA compression
-  with parsing.
-- Query independent sources in parallel while preserving deterministic output.
-- Open sharded supplementary providers in deterministic parallel order.
-- Share byte-bounded OSA caches across readers and keep decoded records in
-  contiguous storage.
-- Read OSA2 chunks directly from mapped archives.
-- Read OSA2 ZIP central directories sequentially and defer local-header reads
-  until the corresponding chunk is queried.
-- Keep installed transcript caches read-only during annotation and fully verify
-  newly built transcript caches before installation.
-- Publish rebuilt transcript caches atomically with frame checksums, reject an
-  unusable explicit cache, and never reuse a region-limited GFF3 load as a
-  whole-file cache.
-- Summarize repeated missing-contig warnings instead of emitting one warning per
-  transcript.
-- Report aggregate phase timings, source lookups, cache hits and misses, decoded
-  bytes, ZIP inflation, JSON decoding, serialization, and blocked output time
-  without recording variant values.
+The fork continues to read OSA1 and OSA2. Runtime improvements such as shared
+decoded caches do not require rewriting installed files. The `record_list` and
+raw-allele extensions do require reader support; compatibility with an older
+upstream reader must not be assumed simply because the file is named `.osa2`.
+OSA2 JSON values still use inner Zstandard compression within the ZIP container;
+the runtime work does not remove that on-disk compression layer.
 
-The executable keeps the upstream fastVEP version. AnnoCAT identifies a tested
-fork build by Git commit, Cargo lockfile hash, and binary checksum. The current
-pin and ordered change ledger are in
-[`config/fastvep-pin.json`](https://github.com/annocat-project/AnnoCAT/blob/main/config/fastvep-pin.json).
+See the [OSA2 reader](crates/fastvep-sa/src/reader_v2.rs),
+[writer](crates/fastvep-sa/src/writer_v2.rs) and
+[shard reader](crates/fastvep-sa/src/sharded.rs). These storage and lookup changes
+have their own correctness checks; the VEP concordance totals below do not
+qualify every supplementary source or score.
+
+## VEP concordance testing and limits
+
+### Concordance target
+
+The target was to reproduce **Ensembl VEP 115.2's per-allele, per-transcript
+annotations for human GRCh38**, using the official Ensembl release-115 indexed
+cache and a reference FASTA pinned by checksum. VEP ran offline with HGVS
+enabled and a 5,000-base upstream/downstream distance. MANE, canonical status,
+TSL, CCDS, gene symbols, biotypes, protein identifiers and exon/intron numbers
+were requested as output metadata. All applicable transcript annotations were
+retained; MANE and canonical labels did not restrict which transcripts were
+compared.
+
+Concordance covers transcript identities and their multiplicity as well as the
+declared consequence, impact, HGVSc/HGVSp, cDNA/CDS/protein position, amino-acid,
+codon, allele and transcript-metadata fields. Missing or extra transcript
+annotations count as differences. The target is agreement under each test's
+comparison contract, including its explicit normalizers and narrowly documented
+exceptions for VEP behavior we intentionally do not reproduce. It is not a
+claim of byte-identical VCF files or agreement with every VEP option, plugin or
+database configuration.
+
+The [recorded VEP configuration](tests/concordance/data-manifest.json) supplies
+the exact image and cache fingerprints, command-line options and output field
+list used by the runnable comparison workflow. Supplementary-source scores and
+AnnoCat's displayed transcript selection are separate from this VEP target.
+
+### Evidence and limits
+
+Start with the [four regression groups](tests/concordance/UPSTREAM-REVIEW.md):
+13 input records, frozen VEP outputs and one test command. Each group reproduces
+a failure in a retained pre-fix fork build and passes with the tested fork.
+These tests do not establish that current upstream still has those defects.
+
+The collection contains 216 inputs and 2,531,230 record observations:
+2,451,891 distinct exact record keys and 2,180,583 distinct exact split-ALT keys.
+Inputs include public ClinVar/GIAB selections and generated cases on autosomes,
+X, Y and mitochondrial sequence. They cover coding and noncoding transcripts,
+both strands, splice boundaries, UTRs, partial CDS, repeats and multiallelic
+representations.
+
+These totals mix oracle comparisons, historical output-preservation checks and
+completion controls for inputs on which VEP fails. They are not 2.5 million
+independent exact matches or a population-wide accuracy estimate. Contracts
+specify fields, normalizers and narrowly defined exceptions. Normalized or
+exception-qualified equality is not raw byte equality.
+
+The tested configuration does not qualify every inherited option, structural
+variants, RefSeq configuration or non-human dataset. Record the fork commit,
+cache, reference and options when reproducing a result.
+
+See the [testing guide](tests/concordance/FULL-SUITE.md) for methods, counts,
+accepted differences and commands. Inputs and generators are provided; the
+larger frozen VEP outputs are optional downloads. Full fastVEP output baselines
+and internal audit ledgers are not included.
 
 ## Build
 
-Install a current Rust toolchain, clone this repository, and build the CLI:
+With a current Rust toolchain, run from the repository root:
 
-```bash
+```sh
 cargo build --release --locked -p fastvep-cli
 target/release/fastvep --version
 ```
 
-On Windows, the binary is `target\release\fastvep.exe`.
+On Windows, the executable is `target/release/fastvep.exe`.
 
-## Usage
+## Run the regression examples
 
-Build and verify a basic transcript cache:
+Provide the matching indexed reference FASTA and transcript cache:
 
-```bash
-fastvep cache \
-  --gff3 Homo_sapiens.GRCh38.115.gff3 \
-  --fasta Homo_sapiens.GRCh38.dna.primary_assembly.fa \
-  --output grch38.fastvep.cache
-
-fastvep cache-verify \
-  --input grch38.fastvep.cache \
-  --require-primary-coding-sequences
+```sh
+python scripts/concordance/run.py --data tests/concordance/focused --binary ./target/release/fastvep --cache ./transcripts.cache --fasta ./reference.fa --output ./focused-results
 ```
 
-For enriched public construction, `fastvep cache` also accepts
-`--ensembl-core-manifest` and `--ensembl-core-dir` together. Use the versioned
-manifest and matching downloaded inputs managed by AnnoCAT; do not mix Ensembl
-releases. Run `fastvep cache --help` for the complete options.
+Python 3.11 or later is required. The focused fixture includes VEP outputs;
+the FASTA and transcript cache are not bundled.
 
-Annotate a VCF with a transcript cache and supplementary databases:
+## Citation and license
 
-```bash
-fastvep annotate \
-  --input variants.vcf.gz \
-  --output annotated.vcf \
-  --transcript-cache grch38.fastvep.cache \
-  --sa-dir annotation-databases \
-  --hgvs --symbol --canonical
-```
-
-Write the structured annotations used by AnnoCAT without duplicating
-supplementary evidence in the temporary VCF:
-
-```bash
-fastvep annotate \
-  --input variants.vcf.gz \
-  --output annotated.vcf \
-  --transcript-cache grch38.fastvep.cache \
-  --sa-dir annotation-databases \
-  --structured-output annotations.ndjson \
-  --omit-supplementary-vcf \
-  --hgvs --symbol --canonical
-```
-
-## Supplementary databases
-
-`sa-build --format auto` selects OSA2 for supported sources and OSA1 for the
-remaining sources. Use `--format osa` or `--format osa2` only when a specific
-format is required.
-
-```bash
-fastvep sa-build \
-  --source clinvar \
-  --input clinvar.vcf.gz \
-  --output clinvar \
-  --assembly GRCh38
-
-fastvep sa-verify --input clinvar.osa2 --assembly GRCh38
-```
-
-For chromosome-sharded sources, build one cache per chromosome and place the
-verified shards and manifest in the same source directory. `--sa-dir` loads
-compatible OSA1, OSA2, interval, and gene-level providers from that directory.
-Repeat `--sa-dir` to load verified providers from separate directories without
-copying or linking them into a shared staging directory.
-
-The `sa-convert` command converts verified CADD or SpliceAI OSA1 shards to OSA2.
-It never overwrites its input:
-
-```bash
-fastvep sa-convert --input chr1.osa --output chr1.osa2
-fastvep sa-verify --input chr1.osa2 --chromosome 1 --assembly GRCh38
-```
-
-See [Supplementary annotations](docs/SUPPLEMENTARY_ANNOTATIONS.md) for source
-schemas and output fields. See [ACMG](docs/ACMG.md) and
-[ACMG setup](docs/ACMG_SETUP.md) for the upstream experimental classification
-workflow.
-
-## Commands
-
-| Command | Purpose |
-|---|---|
-| `annotate` | Predict consequences and attach supplementary annotations |
-| `cache` | Build a basic or Ensembl-core-enriched transcript cache |
-| `cache-verify` | Fully decode and validate a transcript cache |
-| `sa-build` | Build an OSA or interval annotation database |
-| `sa-convert` | Convert a verified CADD or SpliceAI OSA1 shard to OSA2 |
-| `sa-verify` | Fully validate an OSA1 or OSA2 database |
-| `filter` | Filter VEP-compatible annotated VCF output |
-| `web` | Launch the upstream interactive web interface |
-
-Run `fastvep <command> --help` for the complete command reference.
-
-## Development
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-Changes to consequence prediction, HGVS, cache encoding, or source parsing must
-keep the existing compatibility and parity tests passing. AnnoCAT release builds
-also verify the pinned history, dependency lock, complete test suite, and binary
-checksum before packaging.
-
-The [engine synchronization record](docs/annocat-engine-sync-2026-09-14.md)
-describes the source comparison and its validation limits. Historical receipts
-retain their original commit IDs. The tag
-`archive/annocat-2026-09-14-before-message-amend` preserves the engine used by
-the September 14 local releases before two commit messages were expanded;
-the amended commits have identical source trees.
-
-## Citation
-
-If you use fastVEP in research, cite the upstream project:
-
-> Kuan-lin Huang. **fastVEP: A Fast, Comprehensive Variant Effect Predictor
-> Written in Rust.** bioRxiv (2026).
-> [doi:10.64898/2026.04.14.718452](https://doi.org/10.64898/2026.04.14.718452)
-
-When reproducibility matters, also record the AnnoCAT fork commit and the source
-database releases used for annotation.
-
-## License
-
-fastVEP and this fork are licensed under the [Apache License 2.0](LICENSE.md).
-fastVEP is inspired by
-[Ensembl VEP](https://www.ensembl.org/info/docs/tools/vep/index.html) and
-[Illumina Nirvana](https://github.com/Illumina/Nirvana). The OSA2 format uses
-encoding techniques derived from [echtvar](https://github.com/brentp/echtvar).
-
+Cite the [upstream fastVEP paper](https://doi.org/10.64898/2026.04.14.718452)
+and record the fork commit and source database releases used for annotation.
+This fork retains the [Apache License 2.0](LICENSE.md).
 Report fork-specific problems through
-[annocat-project/fastVEP issues](https://github.com/annocat-project/fastVEP/issues).
+[the fork's issue tracker](https://github.com/annocat-project/fastVEP/issues).

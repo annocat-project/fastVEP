@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "suite": "vep115-concordance-2026-09-14",
+  "status": "review draft; not published",
+  "scope": "Three sample-free public/generated regression and confirmation banks, not the entire development inventory.",
+  "oracle": {
+    "version": "115.2",
+    "image": "ensemblorg/ensembl-vep@sha256:ed6b660e278458109afc00d5e730aee240a3bf77e817796386033e1a18963152",
+    "cacheUrl": "https://ftp.ensembl.org/pub/release-115/variation/vep/homo_sapiens_vep_115_GRCh38.tar.gz",
+    "cacheSha256": "5871a5e34527cce76f7ac75399c33e306bf3be8083c63fe7d3459c56338f98de",
+    "fields": [
+      "Allele",
+      "Consequence",
+      "IMPACT",
+      "SYMBOL",
+      "Gene",
+      "Feature_type",
+      "Feature",
+      "BIOTYPE",
+      "EXON",
+      "INTRON",
+      "HGVSc",
+      "HGVSp",
+      "cDNA_position",
+      "CDS_position",
+      "Protein_position",
+      "Amino_acids",
+      "Codons",
+      "REF_ALLELE",
+      "UPLOADED_ALLELE",
+      "DISTANCE",
+      "STRAND",
+      "FLAGS",
+      "CANONICAL",
+      "MANE",
+      "MANE_SELECT",
+      "MANE_PLUS_CLINICAL",
+      "TSL",
+      "CCDS",
+      "ENSP",
+      "SOURCE",
+      "HGVS_OFFSET"
+    ],
+    "args": [
+      "--vcf",
+      "--no_stats",
+      "--quiet",
+      "--cache",
+      "--offline",
+      "--cache_version",
+      "115",
+      "--assembly",
+      "GRCh38",
+      "--distance",
+      "5000",
+      "--hgvs",
+      "--symbol",
+      "--canonical",
+      "--numbers",
+      "--protein",
+      "--biotype",
+      "--tsl",
+      "--mane",
+      "--ccds",
+      "--show_ref_allele",
+      "--uploaded_allele",
+      "--no_check_variants_order"
+    ]
+  },
+  "testedCacheSha256": "93abfbf2f57e63648e52a16b0411238587f08cf91efeae208e0eb0d15d55ccc2",
+  "annotationArgs": [
+    "--distance",
+    "5000",
+    "--everything",
+    "--hgvs",
+    "--no-progress"
+  ],
+  "corpora": [
+    {
+      "name": "path-regressions",
+      "records": 10901,
+      "input": "path-regressions/input.vcf",
+      "oracle": "path-regressions/oracle.vcf",
+      "contract": "path-regressions/comparison-contract.json",
+      "inputProvenance": {
+        "records": 10901,
+        "originalSha256": "bf66adb506371f3a383f54f3c0698f09d46363e8a676a4bdb68e4312edc92872",
+        "publishedSha256": "96e8d83f4410df7f9aaa64c3108f1ddb2e0ffe5970d8878b308f73b6198e895c",
+        "recordBodySha256": "193e1b5d13370567fa5d9e57d7fa220ae12e7e2d400450c4f1c413b88324d2ff",
+        "omittedMetadataLines": 2
+      },
+      "oracleProvenance": {
+        "records": 10901,
+        "originalSha256": "7d231797b94563a79914d289111ac45f1aafd7da6bf1860bbd0503ccf6b7fb1d",
+        "publishedSha256": "f5b6e4661c7f233518f5588a90af5b4d09e9fe089f3487bb751fde9340ccf3d5",
+        "recordBodySha256": "32695262101c930a130cddabc191a9e235f7e42a8230ff7b737cd996e320a809",
+        "omittedMetadataLines": 4
+      },
+      "contractSha256": "48086326658dba43d1b2036eff4ed38c074d1964a17ac424104063a2767074fc"
+    },
+    {
+      "name": "single-allele-controls",
+      "records": 11858,
+      "input": "single-allele-controls/input.vcf",
+      "oracle": "single-allele-controls/oracle.vcf",
+      "contract": "single-allele-controls/comparison-contract.json",
+      "inputProvenance": {
+        "records": 11858,
+        "originalSha256": "a5ccc3607f6f82410702a5cb49f5de9933458b07009020a8606dec4b91377648",
+        "publishedSha256": "00967e268ee4eb37afc49cd127219c44186220cab729446c6546b600b83b9af2",
+        "recordBodySha256": "3f2b7417e9ec1eec2e108b85413ca5f629b8e1041778aed528d9b10998774358",
+        "omittedMetadataLines": 0
+      },
+      "oracleProvenance": {
+        "records": 11858,
+        "originalSha256": "83f6242caaa32c1aa4f3dc46355b6789e3b151849e4ff7f467e57a50c85166de",
+        "publishedSha256": "9d512d048051713f01e7bf23bfdee74b50849e7e73b1f035f4dd532edc2b859c",
+        "recordBodySha256": "f4e9c7f06781649db55f66b91c47c1f657549018b06554f65dc40bcf6c5a3bb8",
+        "omittedMetadataLines": 2
+      },
+      "contractSha256": "48086326658dba43d1b2036eff4ed38c074d1964a17ac424104063a2767074fc"
+    },
+    {
+      "name": "fresh-boundary-cases",
+      "records": 15259,
+      "input": "fresh-boundary-cases/input.vcf",
+      "oracle": "fresh-boundary-cases/oracle.vcf",
+      "contract": "fresh-boundary-cases/comparison-contract.json",
+      "inputProvenance": {
+        "records": 15259,
+        "originalSha256": "44ce706d5eec9164e28cdc71493786af68409bdc98bdaae6f80af72a8da73e2c",
+        "publishedSha256": "aa3f816ff19f0a7919238ae75f33a00a380f1c0dda90618f62ff7d6c6cd9240d",
+        "recordBodySha256": "ebbcb792f22a101f5e9cb0568aaf88e20290886481cd0eab22b7e4c51c0e4edb",
+        "omittedMetadataLines": 0
+      },
+      "oracleProvenance": {
+        "records": 15259,
+        "originalSha256": "39236b641b07ff0a496e3cca604ebf1efbfc7086ae7d58b75c07c5efef0c19f8",
+        "publishedSha256": "7c53ad764880796646ff568143e769c5cb9e92196fe76552c577ff0246c51bff",
+        "recordBodySha256": "95a33196c59bee4d4f40e058dccad7b5f2843f7cea81a02cec529eae4e9f112a",
+        "omittedMetadataLines": 2
+      },
+      "contractSha256": "48086326658dba43d1b2036eff4ed38c074d1964a17ac424104063a2767074fc"
+    }
+  ]
+}

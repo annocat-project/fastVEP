@@ -1,0 +1,168 @@
+{
+  "schemaVersion": 1,
+  "suite": "focused-upstream-regressions",
+  "status": "review draft; not published",
+  "scope": "Four small regression groups selected from retained, previously repaired cases. Not a holdout or an exhaustive suite.",
+  "oracle": {
+    "version": "115.2",
+    "image": "ensemblorg/ensembl-vep@sha256:ed6b660e278458109afc00d5e730aee240a3bf77e817796386033e1a18963152",
+    "cacheUrl": "https://ftp.ensembl.org/pub/release-115/variation/vep/homo_sapiens_vep_115_GRCh38.tar.gz",
+    "cacheSha256": "5871a5e34527cce76f7ac75399c33e306bf3be8083c63fe7d3459c56338f98de",
+    "fields": [
+      "Allele",
+      "Consequence",
+      "IMPACT",
+      "SYMBOL",
+      "Gene",
+      "Feature_type",
+      "Feature",
+      "BIOTYPE",
+      "EXON",
+      "INTRON",
+      "HGVSc",
+      "HGVSp",
+      "cDNA_position",
+      "CDS_position",
+      "Protein_position",
+      "Amino_acids",
+      "Codons",
+      "REF_ALLELE",
+      "UPLOADED_ALLELE",
+      "DISTANCE",
+      "STRAND",
+      "FLAGS",
+      "CANONICAL",
+      "MANE",
+      "MANE_SELECT",
+      "MANE_PLUS_CLINICAL",
+      "TSL",
+      "CCDS",
+      "ENSP",
+      "SOURCE",
+      "HGVS_OFFSET"
+    ],
+    "args": [
+      "--vcf",
+      "--no_stats",
+      "--quiet",
+      "--cache",
+      "--offline",
+      "--cache_version",
+      "115",
+      "--assembly",
+      "GRCh38",
+      "--distance",
+      "5000",
+      "--hgvs",
+      "--symbol",
+      "--canonical",
+      "--numbers",
+      "--protein",
+      "--biotype",
+      "--tsl",
+      "--mane",
+      "--ccds",
+      "--show_ref_allele",
+      "--uploaded_allele",
+      "--no_check_variants_order"
+    ]
+  },
+  "testedCacheSha256": "93abfbf2f57e63648e52a16b0411238587f08cf91efeae208e0eb0d15d55ccc2",
+  "annotationArgs": [
+    "--distance",
+    "5000",
+    "--everything",
+    "--hgvs",
+    "--no-progress"
+  ],
+  "corpora": [
+    {
+      "name": "mitochondrial-initiator",
+      "records": 4,
+      "input": "mitochondrial-initiator/input.vcf",
+      "oracle": "mitochondrial-initiator/oracle.vcf",
+      "contract": "mitochondrial-initiator/comparison-contract.json",
+      "inputProvenance": {
+        "records": 4,
+        "originalSha256": "1fea7a3c5c4ac03589d126c3edf304cf8b4b247f0dc8b363847937094176a7a8",
+        "publishedSha256": "078c93467121ad91b6ae8e17dd7f853e46b247a4b5407a417d3830064936846e",
+        "recordBodySha256": "fe606f1b021821b0fb88c9b2ab5fe0dc531b943242ec59a5cd5735426870cf7d",
+        "omittedMetadataLines": 2
+      },
+      "oracleProvenance": {
+        "records": 4,
+        "originalSha256": "3f9637779acb9667385135819cd05c01fa5a1b92217750e6fef704a61d999fa1",
+        "publishedSha256": "d475a67e96fa31c8e37e3ae6c06f95101b61ee65a71113ad21094840526cacc2",
+        "recordBodySha256": "2e66414451dab3819cd05d8d371fe4aa2887ab32f7a0eb62512c716ea9043b33",
+        "omittedMetadataLines": 4
+      },
+      "contractSha256": "80271d799e2ed1a94a8ec458f25b7e71d9dfa328d8bf53921958f436d826f8b3"
+    },
+    {
+      "name": "recreated-stop-clipping",
+      "records": 1,
+      "input": "recreated-stop-clipping/input.vcf",
+      "oracle": "recreated-stop-clipping/oracle.vcf",
+      "contract": "recreated-stop-clipping/comparison-contract.json",
+      "inputProvenance": {
+        "records": 1,
+        "originalSha256": "1fea7a3c5c4ac03589d126c3edf304cf8b4b247f0dc8b363847937094176a7a8",
+        "publishedSha256": "69c6bade868ab93dcd071e30c6320edd10e7ca2ded5043316e59a48f1bf4edaf",
+        "recordBodySha256": "9e2f1a912b262e668e1354a2c35aa1fa65cb192ad92f71aa67c0c36ca16eb404",
+        "omittedMetadataLines": 2
+      },
+      "oracleProvenance": {
+        "records": 1,
+        "originalSha256": "3f9637779acb9667385135819cd05c01fa5a1b92217750e6fef704a61d999fa1",
+        "publishedSha256": "fae742c882c1b54e124ae0ae3956082b678df5b3e318a2a9948edcb6a548df6f",
+        "recordBodySha256": "34cfb8fbffe6508683d9563a461751a4f51bd3da565460205505075babf02d41",
+        "omittedMetadataLines": 4
+      },
+      "contractSha256": "80271d799e2ed1a94a8ec458f25b7e71d9dfa328d8bf53921958f436d826f8b3"
+    },
+    {
+      "name": "inversion-before-clipping",
+      "records": 4,
+      "input": "inversion-before-clipping/input.vcf",
+      "oracle": "inversion-before-clipping/oracle.vcf",
+      "contract": "inversion-before-clipping/comparison-contract.json",
+      "inputProvenance": {
+        "records": 4,
+        "originalSha256": "76188ecbf0b8002d7c3acc4bb79a8c32c3ba8a04ef775dbb5ec8007499b15c5b",
+        "publishedSha256": "5b5c89ff73cd54bf1955c091f1641245cd3e0c3e541fcb74b2961bac9bfc63f3",
+        "recordBodySha256": "085f0c85a905202a0f2c68dd5d6c191c98ad2762ac3b6083fbd05c32ced3a24f",
+        "omittedMetadataLines": 2
+      },
+      "oracleProvenance": {
+        "records": 4,
+        "originalSha256": "92093a0e128b781e5773daf6ef362174898728d01297128e235960c4f364062f",
+        "publishedSha256": "d356598c1b2095d2b4c0f5a08696ddf7ef55ef88cfa39ac99207cc5bd83d0d05",
+        "recordBodySha256": "7dc9666aa8f190121a9d93971ab4dcaff429791d2996e3c7e6133e940b90d2b5",
+        "omittedMetadataLines": 4
+      },
+      "contractSha256": "80271d799e2ed1a94a8ec458f25b7e71d9dfa328d8bf53921958f436d826f8b3"
+    },
+    {
+      "name": "insertion-flank-order",
+      "records": 4,
+      "input": "insertion-flank-order/input.vcf",
+      "oracle": "insertion-flank-order/oracle.vcf",
+      "contract": "insertion-flank-order/comparison-contract.json",
+      "inputProvenance": {
+        "records": 4,
+        "originalSha256": "bf66adb506371f3a383f54f3c0698f09d46363e8a676a4bdb68e4312edc92872",
+        "publishedSha256": "7c1e891edcee7d2b06008004fcb68c2e27c1ec90e1c5362381cfae2084ac70f3",
+        "recordBodySha256": "a1bce2ac8c0cbe9436ff6b5a301a4cde570a48d12de4318aabe1d6635a42e78b",
+        "omittedMetadataLines": 2
+      },
+      "oracleProvenance": {
+        "records": 4,
+        "originalSha256": "7d231797b94563a79914d289111ac45f1aafd7da6bf1860bbd0503ccf6b7fb1d",
+        "publishedSha256": "989e9d04f73a150c043953f7c06c12f14d733339be57c91be71aa6dee76599ff",
+        "recordBodySha256": "0e008225e9f9bcbd8951080688f5be429a622c5837bf38e5719d4fb1cf61d4d9",
+        "omittedMetadataLines": 4
+      },
+      "contractSha256": "80271d799e2ed1a94a8ec458f25b7e71d9dfa328d8bf53921958f436d826f8b3"
+    }
+  ]
+}

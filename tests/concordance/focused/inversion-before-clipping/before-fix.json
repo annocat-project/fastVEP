@@ -1,0 +1,79 @@
+{
+  "scope": "Targeted field differences from a retained pre-fix fork build, not a claim about current upstream.",
+  "preFixBinarySha256": "bef3b274426818b878b21a073647cbc32de56184977561464dd5af08cbbd35ab",
+  "sourceRegressionManifestSha256": "97d733a57dd9d5a11f1961c906a94ac47320060d7de43f92aac7049f016c77ad",
+  "mismatchesByField": {
+    "HGVSc": 76
+  },
+  "examples": [
+    {
+      "variant": [
+        "chr11",
+        "66335182",
+        "AGCT",
+        "AAGC"
+      ],
+      "allele": "AAGC",
+      "featureType": "Transcript",
+      "feature": "ENST00000311320",
+      "fields": {
+        "HGVSc": {
+          "before": "ENST00000311320.9:c.614_616inv",
+          "vepExpected": "ENST00000311320.9:c.614_616delinsGCT"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chr11",
+        "66335182",
+        "AGCTG",
+        "ACAGC"
+      ],
+      "allele": "ACAGC",
+      "featureType": "Transcript",
+      "feature": "ENST00000311320",
+      "fields": {
+        "HGVSc": {
+          "before": "ENST00000311320.9:c.613_616inv",
+          "vepExpected": "ENST00000311320.9:c.613_616delinsGCTG"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chr17",
+        "75243221",
+        "TCCTC",
+        "TCAGC"
+      ],
+      "allele": "TCAGC",
+      "featureType": "Transcript",
+      "feature": "ENST00000537686",
+      "fields": {
+        "HGVSc": {
+          "before": "ENST00000537686.6:c.425-58_425-57inv",
+          "vepExpected": "ENST00000537686.6:c.425-58_425-57delinsCT"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chr17",
+        "75243222",
+        "CCTC",
+        "CAGC"
+      ],
+      "allele": "CAGC",
+      "featureType": "Transcript",
+      "feature": "ENST00000537686",
+      "fields": {
+        "HGVSc": {
+          "before": "ENST00000537686.6:c.425-58_425-57inv",
+          "vepExpected": "ENST00000537686.6:c.425-58_425-57delinsCT"
+        }
+      }
+    }
+  ],
+  "affectedIdentityExamplesBeforeReduction": 76
+}

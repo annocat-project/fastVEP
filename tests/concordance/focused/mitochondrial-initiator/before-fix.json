@@ -1,0 +1,98 @@
+{
+  "scope": "Targeted field differences from a retained pre-fix fork build, not a claim about current upstream.",
+  "preFixBinarySha256": "fe889d4746cfc3eba2de95edc228b32adfbb542144cad74d2796d750131ab6b5",
+  "sourceRegressionManifestSha256": "a7540f6022a934aea266614552acebe46273d2f1b68fdcfb29e0ff8918751881",
+  "mismatchesByField": {
+    "Amino_acids": 4,
+    "Consequence": 2,
+    "HGVSp": 1,
+    "IMPACT": 1
+  },
+  "examples": [
+    {
+      "variant": [
+        "chrM",
+        "4470",
+        "A",
+        "AT"
+      ],
+      "allele": "T",
+      "featureType": "Transcript",
+      "feature": "ENST00000361453",
+      "fields": {
+        "Amino_acids": {
+          "before": "M/MX",
+          "vepExpected": "M/IX"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chrM",
+        "4470",
+        "A",
+        "ATT"
+      ],
+      "allele": "TT",
+      "featureType": "Transcript",
+      "feature": "ENST00000361453",
+      "fields": {
+        "Amino_acids": {
+          "before": "M/MX",
+          "vepExpected": "M/IX"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chrM",
+        "4470",
+        "A",
+        "ATTA"
+      ],
+      "allele": "TTA",
+      "featureType": "Transcript",
+      "feature": "ENST00000361453",
+      "fields": {
+        "Consequence": {
+          "before": "inframe_insertion&start_retained_variant",
+          "vepExpected": "start_lost&start_retained_variant"
+        },
+        "IMPACT": {
+          "before": "MODERATE",
+          "vepExpected": "HIGH"
+        },
+        "Amino_acids": {
+          "before": "M/MI",
+          "vepExpected": "M/II"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chrM",
+        "4470",
+        "A",
+        "ATTAA"
+      ],
+      "allele": "TTAA",
+      "featureType": "Transcript",
+      "feature": "ENST00000361453",
+      "fields": {
+        "Consequence": {
+          "before": "frameshift_variant&start_retained_variant",
+          "vepExpected": "frameshift_variant&start_lost&start_retained_variant"
+        },
+        "HGVSp": {
+          "before": "ENSP00000355046.4:p.Pro3Ter",
+          "vepExpected": "ENSP00000355046.4:p.Pro3_?2"
+        },
+        "Amino_acids": {
+          "before": "M/MNX",
+          "vepExpected": "M/INX"
+        }
+      }
+    }
+  ],
+  "affectedIdentityExamplesBeforeReduction": 4
+}

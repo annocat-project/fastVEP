@@ -1,0 +1,28 @@
+{
+  "scope": "Targeted field differences from a retained pre-fix fork build, not a claim about current upstream.",
+  "preFixBinarySha256": "fe889d4746cfc3eba2de95edc228b32adfbb542144cad74d2796d750131ab6b5",
+  "sourceRegressionManifestSha256": "a7540f6022a934aea266614552acebe46273d2f1b68fdcfb29e0ff8918751881",
+  "mismatchesByField": {
+    "HGVSp": 41
+  },
+  "examples": [
+    {
+      "variant": [
+        "chr11",
+        "57407793",
+        "TAT",
+        "TTAA"
+      ],
+      "allele": "TAA",
+      "featureType": "Transcript",
+      "feature": "ENST00000352187",
+      "fields": {
+        "HGVSp": {
+          "before": "",
+          "vepExpected": "ENSP00000337561.1:p.Ala491_Ter492delinsAlaTer"
+        }
+      }
+    }
+  ],
+  "affectedIdentityExamplesBeforeReduction": 41
+}

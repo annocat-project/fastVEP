@@ -1,0 +1,79 @@
+{
+  "scope": "Targeted field differences from a retained pre-fix fork build, not a claim about current upstream.",
+  "preFixBinarySha256": "4eaee6ecc6107aa8439de4b6be97794ebf7e5906af394abe9ef94a394a4aec6c",
+  "sourceRegressionManifestSha256": "3cede0999709fe2ddb3ceac6ec5b68f44ad86f7f0195ced00e01cd1398b5da89",
+  "mismatchesByField": {
+    "HGVSp": 16
+  },
+  "examples": [
+    {
+      "variant": [
+        "chr1",
+        "151767150",
+        "C",
+        "CTTTCCCAACCAGCAT"
+      ],
+      "allele": "TTTCCCAACCAGCAT",
+      "featureType": "Transcript",
+      "feature": "ENST00000321531",
+      "fields": {
+        "HGVSp": {
+          "before": "",
+          "vepExpected": "ENSP00000313922.5:p.Ile12_Thr13insPheProThrSerIle"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chr1",
+        "151768045",
+        "A",
+        "ACTCCTTTTCCAGGCT"
+      ],
+      "allele": "CTCCTTTTCCAGGCT",
+      "featureType": "Transcript",
+      "feature": "ENST00000321531",
+      "fields": {
+        "HGVSp": {
+          "before": "",
+          "vepExpected": "ENSP00000313922.5:p.Ala57_Gly58insLeuLeuPheGlnAla"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chr1",
+        "151770159",
+        "C",
+        "CTGTGGCTCCTAGTTT"
+      ],
+      "allele": "TGTGGCTCCTAGTTT",
+      "featureType": "Transcript",
+      "feature": "ENST00000321531",
+      "fields": {
+        "HGVSp": {
+          "before": "",
+          "vepExpected": "ENSP00000313922.5:p.Ser115_Leu116insPheValAlaProSer"
+        }
+      }
+    },
+    {
+      "variant": [
+        "chr1",
+        "41381603",
+        "T",
+        "TCTCTGGCCACAGAAC"
+      ],
+      "allele": "CTCTGGCCACAGAAC",
+      "featureType": "Transcript",
+      "feature": "ENST00000641094",
+      "fields": {
+        "HGVSp": {
+          "before": "",
+          "vepExpected": "ENSP00000493184.1:p.Asn139_Ser140insLeuTrpProGlnAsn"
+        }
+      }
+    }
+  ],
+  "affectedIdentityExamplesBeforeReduction": 16
+}

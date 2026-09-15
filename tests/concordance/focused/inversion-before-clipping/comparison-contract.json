@@ -1,0 +1,232 @@
+{
+  "schemaVersion": 2,
+  "oracle": "Ensembl VEP 115.2 with the official Homo sapiens 115_GRCh38 indexed cache",
+  "purpose": "All-transcript comparison of a small source-guided regression group; no field exceptions.",
+  "fields": [
+    {
+      "name": "Allele",
+      "disposition": "exact"
+    },
+    {
+      "name": "Consequence",
+      "disposition": "exact"
+    },
+    {
+      "name": "IMPACT",
+      "disposition": "exact"
+    },
+    {
+      "name": "SYMBOL",
+      "disposition": "exact"
+    },
+    {
+      "name": "Gene",
+      "disposition": "exact"
+    },
+    {
+      "name": "Feature_type",
+      "disposition": "exact"
+    },
+    {
+      "name": "Feature",
+      "disposition": "exact"
+    },
+    {
+      "name": "BIOTYPE",
+      "disposition": "exact"
+    },
+    {
+      "name": "EXON",
+      "disposition": "exact"
+    },
+    {
+      "name": "INTRON",
+      "disposition": "exact"
+    },
+    {
+      "name": "HGVSc",
+      "disposition": "exact"
+    },
+    {
+      "name": "HGVSp",
+      "disposition": "exact"
+    },
+    {
+      "name": "cDNA_position",
+      "disposition": "exact"
+    },
+    {
+      "name": "CDS_position",
+      "disposition": "exact"
+    },
+    {
+      "name": "Protein_position",
+      "disposition": "exact"
+    },
+    {
+      "name": "Amino_acids",
+      "disposition": "exact"
+    },
+    {
+      "name": "Codons",
+      "disposition": "exact"
+    },
+    {
+      "name": "Existing_variation",
+      "disposition": "excluded",
+      "reason": "Co-located variation data is outside the consequence comparison."
+    },
+    {
+      "name": "REF_ALLELE",
+      "disposition": "input-derived",
+      "normalizer": "empty-allele-dash",
+      "reason": "fastVEP renders an empty minimized insertion reference as '-' while VEP renders it empty."
+    },
+    {
+      "name": "UPLOADED_ALLELE",
+      "disposition": "input-derived",
+      "normalizer": "uploaded-allele-delimiter",
+      "reason": "fastVEP escapes additional multiallelic separators as '&' while VEP retains '/'."
+    },
+    {
+      "name": "DISTANCE",
+      "disposition": "exact"
+    },
+    {
+      "name": "STRAND",
+      "disposition": "exact"
+    },
+    {
+      "name": "FLAGS",
+      "disposition": "exact",
+      "normalizer": "unordered-flags",
+      "reason": "User-approved FLAGS multiset comparison: VEP 115 OutputFactory preserves attribute order, AttributeAdaptor has no ORDER BY, and public dump order differs from the official cache. Values and multiplicity must match; raw reports remain available."
+    },
+    {
+      "name": "CANONICAL",
+      "disposition": "exact"
+    },
+    {
+      "name": "SYMBOL_SOURCE",
+      "disposition": "source-derived",
+      "reason": "The frozen VEP CLI oracle did not request this cache metadata; parity is measured against the official transcript inventory."
+    },
+    {
+      "name": "HGNC_ID",
+      "disposition": "source-derived",
+      "reason": "The frozen VEP CLI oracle did not request this cache metadata; parity is measured against the official transcript inventory."
+    },
+    {
+      "name": "MANE",
+      "disposition": "exact"
+    },
+    {
+      "name": "MANE_SELECT",
+      "disposition": "source-derived",
+      "reason": "The candidate does not supply the official cache's paired RefSeq accession."
+    },
+    {
+      "name": "MANE_PLUS_CLINICAL",
+      "disposition": "source-derived",
+      "reason": "The candidate does not supply the official cache's paired RefSeq accession."
+    },
+    {
+      "name": "TSL",
+      "disposition": "exact"
+    },
+    {
+      "name": "APPRIS",
+      "disposition": "source-derived",
+      "reason": "The frozen VEP CLI oracle did not request this cache metadata; parity is measured against the official transcript inventory."
+    },
+    {
+      "name": "CCDS",
+      "disposition": "exact"
+    },
+    {
+      "name": "ENSP",
+      "disposition": "exact"
+    },
+    {
+      "name": "SOURCE",
+      "disposition": "source-derived",
+      "reason": "fastVEP retains its explicit logical GFF source label while official indexed-cache VEP leaves this field empty."
+    },
+    {
+      "name": "HGVS_OFFSET",
+      "disposition": "exact"
+    },
+    {
+      "name": "SIFT",
+      "disposition": "excluded",
+      "reason": "Protein predictors are outside the consequence comparison."
+    },
+    {
+      "name": "PolyPhen",
+      "disposition": "excluded",
+      "reason": "Protein predictors are outside the consequence comparison."
+    },
+    {
+      "name": "AF",
+      "disposition": "excluded",
+      "reason": "Population frequencies are outside the consequence comparison."
+    },
+    {
+      "name": "CLIN_SIG",
+      "disposition": "excluded",
+      "reason": "Clinical variant annotations are outside the consequence comparison."
+    },
+    {
+      "name": "SOMATIC",
+      "disposition": "excluded",
+      "reason": "Co-located somatic annotations are outside the consequence comparison."
+    },
+    {
+      "name": "PHENO",
+      "disposition": "excluded",
+      "reason": "Co-located phenotype annotations are outside the consequence comparison."
+    },
+    {
+      "name": "PUBMED",
+      "disposition": "excluded",
+      "reason": "Co-located publication annotations are outside the consequence comparison."
+    },
+    {
+      "name": "MOTIF_NAME",
+      "disposition": "excluded",
+      "reason": "Regulatory annotation is not enabled in this comparison."
+    },
+    {
+      "name": "MOTIF_POS",
+      "disposition": "excluded",
+      "reason": "Regulatory annotation is not enabled in this comparison."
+    },
+    {
+      "name": "HIGH_INF_POS",
+      "disposition": "excluded",
+      "reason": "Regulatory annotation is not enabled in this comparison."
+    },
+    {
+      "name": "MOTIF_SCORE_CHANGE",
+      "disposition": "excluded",
+      "reason": "Regulatory annotation is not enabled in this comparison."
+    },
+    {
+      "name": "TRANSCRIPTION_FACTORS",
+      "disposition": "excluded",
+      "reason": "Regulatory annotation is not enabled in this comparison."
+    },
+    {
+      "name": "ACMG",
+      "disposition": "excluded",
+      "reason": "fastVEP classification is disabled for consequence concordance."
+    },
+    {
+      "name": "ACMG_CRITERIA",
+      "disposition": "excluded",
+      "reason": "fastVEP classification is disabled for consequence concordance."
+    }
+  ],
+  "allowedFieldDifferences": [],
+  "allowedExtraIdentities": []
+}
